@@ -13,13 +13,15 @@ import threading
 import time
 from types import SimpleNamespace
 
+import numpy as np
 import pytest
+import soundfile as sf
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 from PIL import Image
 from pytest_mock import MockerFixture
 
-from vllm_omni.entrypoints.openai import api_server
+from vllm_omni.entrypoints.openai import api_server, video_api_utils
 from vllm_omni.entrypoints.openai.api_server import router
 from vllm_omni.entrypoints.openai.protocol.videos import (
     VideoGenerationRequest,
@@ -34,17 +36,30 @@ pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
 
 class MockVideoResult:
-    def __init__(self, videos, audios=None, sample_rate=None, stage_durations=None, peak_memory_mb=0.0):
+    """Minimal engine result object used by the video-serving tests."""
+
+    def __init__(
+        self,
+        videos,
+        audios=None,
+        sample_rate=None,
+        stage_durations=None,
+        peak_memory_mb=0.0,
+        custom_output=None,
+    ):
         self.multimodal_output = {"video": videos}
         if audios is not None:
             self.multimodal_output["audio"] = audios
         if sample_rate is not None:
             self.multimodal_output["audio_sample_rate"] = sample_rate
+        self.custom_output = custom_output or {}
         self.stage_durations = stage_durations or {}
         self.peak_memory_mb = peak_memory_mb
 
 
 class FakeAsyncOmni:
+    """Async engine stub that records prompts and sampling params."""
+
     def __init__(self):
         self.stage_configs = [SimpleNamespace(stage_type="diffusion")]
         self.captured_prompt = None
@@ -59,6 +74,8 @@ class FakeAsyncOmni:
 
 
 class BlockingVideoHandler:
+    """Handler stub whose generation coroutine blocks until cancelled."""
+
     def __init__(self):
         self.model_name = "Wan-AI/Wan2.2-T2V-A14B-Diffusers"
         self.stage_configs = None
@@ -69,7 +86,7 @@ class BlockingVideoHandler:
         if self.stage_configs is None:
             self.stage_configs = stage_configs
 
-    async def generate_videos(self, request, reference_id, *, reference_image=None):
+    async def generate_videos(self, request, reference_id, *, reference_image=None, reference_audio=None, tts_prompt_audio=None):
         self.started.set()
         try:
             await asyncio.Future()
@@ -92,6 +109,7 @@ def isolated_video_backends(tmp_path, monkeypatch):
 
 @pytest.fixture
 def test_client():
+    """Create an isolated FastAPI test client with a fake diffusion engine."""
     app = FastAPI()
     app.include_router(router)
     app.state.openai_serving_video = OmniOpenAIServingVideo.for_diffusion(
@@ -102,7 +120,19 @@ def test_client():
         yield client
 
 
+def _configure_s2v_handler(test_client: TestClient):
+    """Reconfigure the default handler so tests exercise Wan2.2 S2V logic."""
+    handler = test_client.app.state.openai_serving_video
+    handler._model_name = "Wan-AI/Wan2.2-S2V-14B"
+    handler._engine_client.model_config = SimpleNamespace(
+        model="Wan-AI/Wan2.2-S2V-14B",
+        hf_config=SimpleNamespace(model_type="s2v", architectures=["WanModel_S2V"]),
+    )
+    return handler._engine_client
+
+
 def _make_test_image_bytes(size=(64, 64)) -> bytes:
+    """Create an in-memory PNG image for multipart upload tests."""
     image = Image.new("RGB", size, color="blue")
     buf = io.BytesIO()
     image.save(buf, format="PNG")
@@ -110,12 +140,31 @@ def _make_test_image_bytes(size=(64, 64)) -> bytes:
 
 
 def _make_test_image_data_url(size=(64, 64)) -> str:
+    """Create a data-URL image reference for API request tests."""
     image_bytes = _make_test_image_bytes(size)
     encoded = base64.b64encode(image_bytes).decode("utf-8")
     return f"data:image/png;base64,{encoded}"
 
 
+def _make_test_audio_bytes(sample_rate: int = 16000, seconds: float = 0.25) -> bytes:
+    """Create a synthetic WAV payload for multipart audio tests."""
+    num_samples = max(1, int(sample_rate * seconds))
+    time_axis = np.linspace(0.0, seconds, num_samples, endpoint=False, dtype=np.float32)
+    waveform = 0.1 * np.sin(2.0 * np.pi * 440.0 * time_axis)
+    buffer = io.BytesIO()
+    sf.write(buffer, waveform, sample_rate, format="WAV")
+    return buffer.getvalue()
+
+
+def _make_test_audio_data_url(sample_rate: int = 16000, seconds: float = 0.25) -> str:
+    """Create a data-URL audio reference for API request tests."""
+    audio_bytes = _make_test_audio_bytes(sample_rate=sample_rate, seconds=seconds)
+    encoded = base64.b64encode(audio_bytes).decode("utf-8")
+    return f"data:audio/wav;base64,{encoded}"
+
+
 def _wait_for_status(client: TestClient, video_id: str, status: str, timeout_s: float = 2.0):
+    """Poll the async video endpoint until a job reaches the desired state."""
     deadline = time.time() + timeout_s
     last_payload = None
     while time.time() < deadline:
@@ -129,6 +178,7 @@ def _wait_for_status(client: TestClient, video_id: str, status: str, timeout_s: 
 
 
 def _wait_until(predicate, timeout_s: float = 2.0, interval_s: float = 0.02):
+    """Poll a predicate until it succeeds or the timeout elapses."""
     deadline = time.time() + timeout_s
     while time.time() < deadline:
         if predicate():
@@ -249,6 +299,224 @@ def test_i2v_video_generation_with_image_reference_form(test_client, mocker: Moc
     input_image = prompt["multi_modal_data"]["image"]
     assert isinstance(input_image, Image.Image)
     assert input_image.size == (40, 24)
+
+
+def test_s2v_video_generation_with_uploaded_audio_reference(test_client, mocker: MockerFixture):
+    """Verify that uploaded driving audio is forwarded and muxed for Wan2.2 S2V requests."""
+    _configure_s2v_handler(test_client)
+    captured = {}
+
+    def _fake_encode(video, fps, audio=None, audio_sample_rate=None):
+        del video
+        captured["fps"] = fps
+        captured["audio"] = audio
+        captured["audio_sample_rate"] = audio_sample_rate
+        return "Zg=="
+
+    audio_bytes = _make_test_audio_bytes(sample_rate=16000)
+    mocker.patch(
+        "vllm_omni.entrypoints.openai.serving_video.encode_video_base64",
+        side_effect=_fake_encode,
+    )
+    response = test_client.post(
+        "/v1/videos",
+        data={"prompt": "A singer performs to camera."},
+        files={
+            "input_reference": ("input.png", _make_test_image_bytes((48, 32)), "image/png"),
+            "input_audio_reference": ("input.wav", audio_bytes, "audio/wav"),
+        },
+    )
+
+    assert response.status_code == 200
+    video_id = response.json()["id"]
+    _wait_for_status(test_client, video_id, VideoGenerationStatus.COMPLETED.value)
+
+    engine = test_client.app.state.openai_serving_video._engine_client
+    prompt = engine.captured_prompt
+    assert prompt["multi_modal_data"]["audio"][1] == 16000
+    assert isinstance(prompt["multi_modal_data"]["audio"][0], np.ndarray)
+    assert captured["fps"] == 16
+    assert isinstance(captured["audio"], np.ndarray)
+    assert captured["audio_sample_rate"] == 16000
+
+
+def test_s2v_video_generation_with_audio_reference_form(test_client, mocker: MockerFixture):
+    """Verify that URL/data-URL driving audio references are decoded for Wan2.2 S2V requests."""
+    _configure_s2v_handler(test_client)
+    captured = {}
+
+    def _fake_encode(video, fps, audio=None, audio_sample_rate=None):
+        del video
+        captured["fps"] = fps
+        captured["audio"] = audio
+        captured["audio_sample_rate"] = audio_sample_rate
+        return "Zg=="
+
+    mocker.patch(
+        "vllm_omni.entrypoints.openai.serving_video.encode_video_base64",
+        side_effect=_fake_encode,
+    )
+    response = test_client.post(
+        "/v1/videos",
+        data={
+            "prompt": "A speaker faces the audience.",
+            "audio_reference": _make_test_audio_data_url(sample_rate=22050),
+        },
+        files={"input_reference": ("input.png", _make_test_image_bytes((40, 24)), "image/png")},
+    )
+
+    assert response.status_code == 200
+    video_id = response.json()["id"]
+    _wait_for_status(test_client, video_id, VideoGenerationStatus.COMPLETED.value)
+
+    engine = test_client.app.state.openai_serving_video._engine_client
+    prompt = engine.captured_prompt
+    assert prompt["multi_modal_data"]["audio"][1] == 22050
+    assert captured["fps"] == 16
+    assert captured["audio_sample_rate"] == 22050
+    assert isinstance(captured["audio"], np.ndarray)
+
+
+def test_decode_audio_url_reuses_media_connector_cache(monkeypatch):
+    """Verify that repeated audio URL decodes reuse the same connector instance."""
+    created = []
+
+    class FakeConnector:
+        def __init__(self, *, allowed_local_media_path=None, allowed_media_domains=None):
+            created.append((allowed_local_media_path, tuple(allowed_media_domains) if allowed_media_domains else None))
+
+        async def fetch_audio_async(self, audio_url):
+            del audio_url
+            return np.zeros((16,), dtype=np.float32), 16000
+
+    video_api_utils._get_media_connector.cache_clear()
+    monkeypatch.setattr(video_api_utils, "MediaConnector", FakeConnector)
+
+    asyncio.run(
+        video_api_utils.decode_audio_url(
+            "file:///tmp/a.wav",
+            source="audio_reference",
+            allowed_local_media_path="/tmp",
+            allowed_media_domains=["example.com"],
+        )
+    )
+    asyncio.run(
+        video_api_utils.decode_audio_url(
+            "file:///tmp/b.wav",
+            source="audio_reference",
+            allowed_local_media_path="/tmp",
+            allowed_media_domains=["example.com"],
+        )
+    )
+
+    assert created == [("/tmp", ("example.com",))]
+    video_api_utils._get_media_connector.cache_clear()
+
+
+def test_s2v_seconds_default_to_native_fps_and_frames(test_client, mocker: MockerFixture):
+    """Verify that Wan2.2 S2V defaults ``seconds`` expansion to the model's native 16 FPS."""
+    fps_values = []
+
+    def _fake_encode(video, fps, audio=None, audio_sample_rate=None):
+        del video, audio, audio_sample_rate
+        fps_values.append(fps)
+        return "Zg=="
+
+    mocker.patch(
+        "vllm_omni.entrypoints.openai.serving_video.encode_video_base64",
+        side_effect=_fake_encode,
+    )
+    engine = _configure_s2v_handler(test_client)
+    response = test_client.post(
+        "/v1/videos",
+        data={
+            "prompt": "A speaker counts to two.",
+            "seconds": "2",
+        },
+        files={
+            "input_reference": ("input.png", _make_test_image_bytes((48, 32)), "image/png"),
+            "input_audio_reference": ("input.wav", _make_test_audio_bytes(), "audio/wav"),
+        },
+    )
+
+    assert response.status_code == 200
+    video_id = response.json()["id"]
+    _wait_for_status(test_client, video_id, VideoGenerationStatus.COMPLETED.value)
+
+    captured = engine.captured_sampling_params_list[0]
+    assert captured.num_frames == 32
+    assert captured.fps == 16
+    assert captured.frame_rate == 16.0
+    assert fps_values == [16]
+
+
+def test_s2v_tts_fields_are_forwarded_to_extra_args(test_client, mocker: MockerFixture):
+    """Verify that TTS-specific fields are forwarded into ``extra_args`` for Wan2.2 S2V."""
+    mocker.patch(
+        "vllm_omni.entrypoints.openai.serving_video.encode_video_base64",
+        return_value="Zg==",
+    )
+    response = test_client.post(
+        "/v1/videos",
+        data={
+            "prompt": "A cheerful person is speaking to the camera.",
+            "tts_prompt_text": "prompt transcript",
+            "tts_text": "target speech",
+        },
+        files={
+            "input_reference": ("input.png", _make_test_image_bytes((64, 64)), "image/png"),
+            "input_tts_prompt_audio": ("prompt.wav", _make_test_audio_bytes(sample_rate=24000), "audio/wav"),
+        },
+    )
+
+    assert response.status_code == 200
+    video_id = response.json()["id"]
+    _wait_for_status(test_client, video_id, VideoGenerationStatus.COMPLETED.value)
+
+    engine = test_client.app.state.openai_serving_video._engine_client
+    captured = engine.captured_sampling_params_list[0]
+    assert captured.extra_args["enable_tts"] is True
+    assert captured.extra_args["tts_prompt_text"] == "prompt transcript"
+    assert captured.extra_args["tts_text"] == "target speech"
+    assert captured.extra_args["tts_prompt_audio"][1] == 24000
+    assert isinstance(captured.extra_args["tts_prompt_audio"][0], np.ndarray)
+    assert "audio" not in engine.captured_prompt.get("multi_modal_data", {})
+
+
+def test_custom_output_audio_path_is_muxed_for_async_video_response(test_client, mocker: MockerFixture, tmp_path):
+    """Verify that async responses mux generated audio files exposed through ``custom_output``."""
+    captured = {}
+
+    def _fake_encode(video, fps, audio=None, audio_sample_rate=None):
+        del video
+        captured["fps"] = fps
+        captured["audio"] = audio
+        captured["audio_sample_rate"] = audio_sample_rate
+        return "Zg=="
+
+    audio_path = tmp_path / "generated.wav"
+    sf.write(str(audio_path), np.linspace(-0.1, 0.1, 1600, dtype=np.float32), 16000)
+
+    engine = test_client.app.state.openai_serving_video._engine_client
+
+    async def _generate(prompt, request_id, sampling_params_list):
+        del prompt, request_id, sampling_params_list
+        yield MockVideoResult([object()], custom_output={"audio_path": str(audio_path), "cleanup_audio_path": True})
+
+    engine.generate = _generate
+    mocker.patch(
+        "vllm_omni.entrypoints.openai.serving_video.encode_video_base64",
+        side_effect=_fake_encode,
+    )
+
+    response = test_client.post("/v1/videos", data={"prompt": "video with generated audio"})
+
+    assert response.status_code == 200
+    video_id = response.json()["id"]
+    _wait_for_status(test_client, video_id, VideoGenerationStatus.COMPLETED.value)
+    assert isinstance(captured["audio"], np.ndarray)
+    assert captured["audio_sample_rate"] == 16000
+    assert not audio_path.exists()
 
 
 def test_seconds_defaults_fps_and_frames(test_client, mocker: MockerFixture):
@@ -445,6 +713,87 @@ def test_rejects_input_reference_and_image_reference_together(test_client):
     )
     assert response.status_code == 400
     assert "either input_reference or image_reference" in response.json()["detail"].lower()
+
+
+def test_rejects_input_audio_reference_and_audio_reference_together(test_client):
+    response = test_client.post(
+        "/v1/videos",
+        data={
+            "prompt": "bad audio refs",
+            "audio_reference": _make_test_audio_data_url(),
+        },
+        files={
+            "input_reference": ("input.png", _make_test_image_bytes(), "image/png"),
+            "input_audio_reference": ("input.wav", _make_test_audio_bytes(), "audio/wav"),
+        },
+    )
+    assert response.status_code == 400
+    assert "either input_audio_reference or audio_reference" in response.json()["detail"].lower()
+
+
+def test_rejects_input_tts_prompt_audio_and_tts_prompt_audio_together(test_client):
+    response = test_client.post(
+        "/v1/videos",
+        data={
+            "prompt": "bad tts refs",
+            "tts_prompt_audio": _make_test_audio_data_url(),
+            "tts_text": "hello",
+        },
+        files={
+            "input_reference": ("input.png", _make_test_image_bytes(), "image/png"),
+            "input_tts_prompt_audio": ("prompt.wav", _make_test_audio_bytes(), "audio/wav"),
+        },
+    )
+    assert response.status_code == 400
+    assert "either input_tts_prompt_audio or tts_prompt_audio" in response.json()["detail"].lower()
+
+
+def test_enable_tts_requires_prompt_audio_returns_400(test_client):
+    """Verify that incomplete TTS requests are rejected before they reach the backend queue."""
+    response = test_client.post(
+        "/v1/videos",
+        data={
+            "prompt": "missing prompt audio",
+            "enable_tts": "true",
+            "tts_text": "hello",
+        },
+        files={"input_reference": ("input.png", _make_test_image_bytes(), "image/png")},
+    )
+    assert response.status_code == 400
+    assert "requires either input_tts_prompt_audio or tts_prompt_audio" in response.json()["detail"].lower()
+
+
+def test_enable_tts_requires_non_empty_tts_text_returns_400(test_client):
+    """Verify that TTS requests require non-empty synthesized text."""
+    response = test_client.post(
+        "/v1/videos",
+        data={
+            "prompt": "missing tts text",
+            "enable_tts": "true",
+            "tts_text": "   ",
+        },
+        files={
+            "input_reference": ("input.png", _make_test_image_bytes(), "image/png"),
+            "input_tts_prompt_audio": ("prompt.wav", _make_test_audio_bytes(), "audio/wav"),
+        },
+    )
+    assert response.status_code == 400
+    assert "requires a non-empty tts_text" in response.json()["detail"].lower()
+
+
+def test_invalid_tts_fields_with_enable_tts_false_returns_400(test_client):
+    """Verify that TTS-only fields cannot be combined with ``enable_tts=false``."""
+    response = test_client.post(
+        "/v1/videos",
+        data={
+            "prompt": "bad tts enable flag",
+            "enable_tts": "false",
+            "tts_text": "hello",
+        },
+        files={"input_reference": ("input.png", _make_test_image_bytes(), "image/png")},
+    )
+    assert response.status_code == 400
+    assert "tts-specific fields require enable_tts=true" in response.json()["detail"].lower()
 
 
 def test_invalid_seconds_returns_422(test_client):
@@ -855,6 +1204,41 @@ def test_sync_i2v_with_image_reference(test_client, mocker: MockerFixture):
 
     assert response.status_code == 200
     assert response.content == b"ref-video"
+
+
+def test_sync_custom_output_audio_path_is_muxed(test_client, mocker: MockerFixture, tmp_path):
+    """Verify that sync responses also mux generated audio files exposed through ``custom_output``."""
+    captured = {}
+
+    def _fake_encode(video, fps, audio=None, audio_sample_rate=None):
+        del video, fps
+        captured["audio"] = audio
+        captured["audio_sample_rate"] = audio_sample_rate
+        return b"sync-video"
+
+    audio_path = tmp_path / "sync_generated.wav"
+    sf.write(str(audio_path), np.linspace(-0.1, 0.1, 3200, dtype=np.float32), 22050)
+
+    engine = test_client.app.state.openai_serving_video._engine_client
+
+    async def _generate(prompt, request_id, sampling_params_list):
+        engine.captured_prompt = prompt
+        engine.captured_sampling_params_list = sampling_params_list
+        yield MockVideoResult([object()], custom_output={"audio_path": str(audio_path), "cleanup_audio_path": True})
+
+    engine.generate = _generate
+    mocker.patch(
+        "vllm_omni.entrypoints.openai.serving_video._encode_video_bytes",
+        side_effect=_fake_encode,
+    )
+
+    response = test_client.post("/v1/videos/sync", data={"prompt": "sync generated audio"})
+
+    assert response.status_code == 200
+    assert response.content == b"sync-video"
+    assert isinstance(captured["audio"], np.ndarray)
+    assert captured["audio_sample_rate"] == 22050
+    assert not audio_path.exists()
 
 
 def test_sync_missing_handler_returns_503():

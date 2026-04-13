@@ -34,6 +34,17 @@ DEFAULT_FPS = 24
 
 @lru_cache
 def file_extension(media_type: str):
+    """Resolve a stable file extension for a MIME type.
+
+    Args:
+        media_type: MIME type that may include parameters.
+
+    Returns:
+        File extension without the leading dot.
+
+    Raises:
+        ValueError: If the MIME type is unknown to ``mimetypes``.
+    """
     media_type = str(media_type).split(";", 1)[0].strip().lower()
     ext = mimetypes.guess_extension(media_type, strict=False)
 
@@ -61,11 +72,15 @@ class VideoParams(BaseModel):
 
 
 class FileImageReference(BaseModel):
+    """Reference to a previously uploaded image file."""
+
     model_config = ConfigDict(extra="forbid")
     file_id: str
 
 
 class UrlImageReference(BaseModel):
+    """Reference to an image accessible through a URL or data URL."""
+
     model_config = ConfigDict(extra="forbid")
     image_url: str
 
@@ -98,6 +113,26 @@ class VideoGenerationRequest(BaseModel):
     image_reference: ImageReference | None = Field(
         default=None,
         description="Optional JSON-safe image reference that guides generation. Provide either image_url or file_id.",
+    )
+    audio_reference: str | None = Field(
+        default=None,
+        description="Optional audio reference used as the driving audio. Accepts http(s), data URLs, or file URLs.",
+    )
+    enable_tts: bool | None = Field(
+        default=None,
+        description="Enable TTS-driven S2V mode. If omitted, the server may infer it from TTS-specific fields.",
+    )
+    tts_prompt_audio: str | None = Field(
+        default=None,
+        description="Optional TTS prompt audio reference. Accepts http(s), data URLs, or file URLs.",
+    )
+    tts_prompt_text: str | None = Field(
+        default=None,
+        description="Optional transcript for the TTS prompt audio.",
+    )
+    tts_text: str | None = Field(
+        default=None,
+        description="Target text synthesized in TTS-driven S2V mode.",
     )
 
     # Video params block for extensibility
@@ -167,7 +202,17 @@ class VideoGenerationRequest(BaseModel):
         description=("Optional model-specific parameters passed directly to the model's extra_args. "),
     )
 
-    def resolve_video_params(self) -> VideoParams:
+    def resolve_video_params(self, *, default_fps: int = DEFAULT_FPS) -> VideoParams:
+        """Resolve effective video parameters from all request fields.
+
+        Args:
+            default_fps: Default FPS to apply when the request omits one.
+
+        Returns:
+            A normalized :class:`VideoParams` object with width, height, FPS,
+            and frame count resolved from top-level fields, ``video_params``,
+            and ``seconds``.
+        """
         vp = VideoParams(width=self.width, height=self.height, fps=self.fps, num_frames=self.num_frames)
 
         if self.video_params is not None:
@@ -180,7 +225,7 @@ class VideoGenerationRequest(BaseModel):
             vp.width, vp.height = parse_size(self.size)
 
         if vp.fps is None:
-            vp.fps = DEFAULT_FPS
+            vp.fps = default_fps
 
         if vp.num_frames is None and self.seconds is not None:
             vp.num_frames = int(self.seconds) * int(vp.fps)
@@ -212,6 +257,8 @@ class VideoGenerationResponse(BaseModel):
 
 
 class VideoError(BaseModel):
+    """Structured error payload stored for failed async video jobs."""
+
     code: str = Field(..., description="A machine-readable error code that was returned.")
     message: str = Field(..., description="A human-readable description of the error that was returned.")
 

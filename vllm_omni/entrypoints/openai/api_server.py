@@ -14,6 +14,7 @@ import time
 from argparse import Namespace
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
+from dataclasses import dataclass
 from http import HTTPStatus
 from typing import Annotated, Any, Literal, cast
 
@@ -110,11 +111,11 @@ from vllm_omni.entrypoints.openai.protocol.videos import (
 from vllm_omni.entrypoints.openai.serving_chat import OmniOpenAIServingChat
 from vllm_omni.entrypoints.openai.serving_speech import OmniOpenAIServingSpeech
 from vllm_omni.entrypoints.openai.serving_speech_stream import OmniStreamingSpeechHandler
-from vllm_omni.entrypoints.openai.serving_video import OmniOpenAIServingVideo, ReferenceImage
+from vllm_omni.entrypoints.openai.serving_video import OmniOpenAIServingVideo, ReferenceAudio, ReferenceImage
 from vllm_omni.entrypoints.openai.storage import STORAGE_MANAGER
 from vllm_omni.entrypoints.openai.stores import VIDEO_STORE, VIDEO_TASKS
 from vllm_omni.entrypoints.openai.utils import get_stage_type, parse_lora_request
-from vllm_omni.entrypoints.openai.video_api_utils import decode_input_reference
+from vllm_omni.entrypoints.openai.video_api_utils import decode_audio_input, decode_input_reference
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams, OmniSamplingParams, OmniTextPrompt
 
 logger = init_logger(__name__)
@@ -1980,6 +1981,8 @@ async def _run_video_generation_job(
     request: VideoGenerationRequest,
     video_id: str,
     reference_image: ReferenceImage | None = None,
+    reference_audio: ReferenceAudio | None = None,
+    tts_prompt_audio: ReferenceAudio | None = None,
 ) -> None:
     job = await VIDEO_STORE.get(video_id)
     if job is None:
@@ -1990,7 +1993,13 @@ async def _run_video_generation_job(
     started_at = time.perf_counter()
     output_path = None
     try:
-        response = await handler.generate_videos(request, video_id, reference_image=reference_image)
+        response = await handler.generate_videos(
+            request,
+            video_id,
+            reference_image=reference_image,
+            reference_audio=reference_audio,
+            tts_prompt_audio=tts_prompt_audio,
+        )
         if not response.data:
             raise RuntimeError("Video generation completed but returned no outputs.")
 
@@ -2036,11 +2045,28 @@ async def _run_video_generation_job(
 VIDEO_SYNC_TIMEOUT_S = 600.0
 
 
+@dataclass(frozen=True)
+class VideoFormContext:
+    request: VideoGenerationRequest
+    handler: OmniOpenAIServingVideo
+    effective_model_name: str
+    reference_image: ReferenceImage | None
+    reference_audio: ReferenceAudio | None
+    tts_prompt_audio: ReferenceAudio | None
+
+
 async def _parse_video_form(
     raw_request: Request,
     prompt: str = Form(...),
     input_reference: UploadFile | None = File(default=None),
     image_reference: str | None = Form(default=None),
+    input_audio_reference: UploadFile | None = File(default=None),
+    audio_reference: str | None = Form(default=None),
+    enable_tts: bool | None = Form(default=None),
+    input_tts_prompt_audio: UploadFile | None = File(default=None),
+    tts_prompt_audio: str | None = Form(default=None),
+    tts_prompt_text: str | None = Form(default=None),
+    tts_text: str | None = Form(default=None),
     model: str | None = Form(default=None),
     seconds: SecondStr | None = Form(default=None),
     size: SizeStr | None = Form(default=None),
@@ -2059,13 +2085,10 @@ async def _parse_video_form(
     negative_prompt: str | None = Form(default=None),
     lora: str | None = Form(default=None),
     extra_params: str | None = Form(default=None),
-) -> tuple[VideoGenerationRequest, "OmniOpenAIServingVideo", str, ReferenceImage | None]:
-    """FastAPI dependency that parses video form data, validates inputs,
-    resolves the handler, and decodes any reference image.
-
-    Used by both ``POST /v1/videos`` (async) and ``POST /v1/videos/sync``.
-    """
+) -> VideoFormContext:
     input_reference_bytes = await input_reference.read() if input_reference is not None else None
+    input_audio_reference_bytes = await input_audio_reference.read() if input_audio_reference is not None else None
+    input_tts_prompt_audio_bytes = await input_tts_prompt_audio.read() if input_tts_prompt_audio is not None else None
     parsed_image_reference = _parse_form_json(image_reference)
 
     if parsed_image_reference is not None and input_reference_bytes is not None:
@@ -2074,12 +2097,49 @@ async def _parse_video_form(
             detail="Provide either input_reference or image_reference, not both.",
         )
 
+    normalized_audio_reference = audio_reference or None
+    normalized_tts_prompt_audio = tts_prompt_audio or None
+    normalized_tts_prompt_text = tts_prompt_text or None
+    normalized_tts_text = tts_text or None
+
+    tts_mode_requested = any(
+        value is not None
+        for value in (
+            normalized_tts_prompt_audio,
+            input_tts_prompt_audio_bytes,
+            normalized_tts_prompt_text,
+            normalized_tts_text,
+        )
+    )
+    if enable_tts is False and tts_mode_requested:
+        raise HTTPException(
+            status_code=HTTPStatus.BAD_REQUEST.value,
+            detail="TTS-specific fields require enable_tts=true or omitting enable_tts.",
+        )
+    effective_enable_tts = enable_tts if enable_tts is not None else tts_mode_requested
+    if effective_enable_tts:
+        if input_tts_prompt_audio_bytes is None and normalized_tts_prompt_audio is None:
+            raise HTTPException(
+                status_code=HTTPStatus.BAD_REQUEST.value,
+                detail="TTS mode requires either input_tts_prompt_audio or tts_prompt_audio.",
+            )
+        if not isinstance(normalized_tts_text, str) or not normalized_tts_text.strip():
+            raise HTTPException(
+                status_code=HTTPStatus.BAD_REQUEST.value,
+                detail="TTS mode requires a non-empty tts_text.",
+            )
+
     request_data: dict[str, Any] = {
         "prompt": prompt,
         "model": model,
         "seconds": seconds,
         "size": size,
         "image_reference": parsed_image_reference,
+        "audio_reference": normalized_audio_reference,
+        "enable_tts": effective_enable_tts,
+        "tts_prompt_audio": normalized_tts_prompt_audio,
+        "tts_prompt_text": normalized_tts_prompt_text,
+        "tts_text": normalized_tts_text,
         "user": user,
         "width": width,
         "height": height,
@@ -2125,13 +2185,47 @@ async def _parse_video_form(
             detail=f"Video generation setup failed: {str(e)}",
         )
 
+    engine_client = getattr(handler, "_engine_client", None)
+    model_config = getattr(engine_client, "model_config", None)
+    allowed_local_media_path = getattr(model_config, "allowed_local_media_path", None)
+    allowed_media_domains = getattr(model_config, "allowed_media_domains", None)
+
     try:
         image_data = await decode_input_reference(request.image_reference, input_reference_bytes)
+        audio_data = await decode_audio_input(
+            request.audio_reference,
+            input_audio_reference_bytes,
+            source="audio_reference",
+            upload_field="input_audio_reference",
+            allowed_local_media_path=allowed_local_media_path,
+            allowed_media_domains=allowed_media_domains,
+        )
+        tts_prompt_audio_data = await decode_audio_input(
+            request.tts_prompt_audio,
+            input_tts_prompt_audio_bytes,
+            source="tts_prompt_audio",
+            upload_field="input_tts_prompt_audio",
+            allowed_local_media_path=allowed_local_media_path,
+            allowed_media_domains=allowed_media_domains,
+        )
     except InvalidInputReferenceError as exc:
         raise HTTPException(400, detail=str(exc) or "Invalid input reference.") from exc
 
     reference_image = ReferenceImage(data=image_data) if image_data is not None else None
-    return request, handler, effective_model_name, reference_image
+    reference_audio = ReferenceAudio(data=audio_data[0], sample_rate=audio_data[1]) if audio_data is not None else None
+    reference_tts_prompt_audio = (
+        ReferenceAudio(data=tts_prompt_audio_data[0], sample_rate=tts_prompt_audio_data[1])
+        if tts_prompt_audio_data is not None
+        else None
+    )
+    return VideoFormContext(
+        request=request,
+        handler=handler,
+        effective_model_name=effective_model_name,
+        reference_image=reference_image,
+        reference_audio=reference_audio,
+        tts_prompt_audio=reference_tts_prompt_audio,
+    )
 
 
 @router.post(
@@ -2144,17 +2238,25 @@ async def _parse_video_form(
     },
 )
 async def create_video(
-    ctx: tuple[VideoGenerationRequest, OmniOpenAIServingVideo, str, ReferenceImage | None] = Depends(_parse_video_form),
+    ctx: VideoFormContext = Depends(_parse_video_form),
 ) -> VideoResponse:
     """Create an asynchronous video generation job.
 
     Accepts multipart form-data (see ``_parse_video_form`` for parameters),
     persists a queued job record, and starts generation in the background.
     """
-    request, handler, effective_model_name, reference_image = ctx
-    ref = video_response_from_request(effective_model_name, request)
+    ref = video_response_from_request(ctx.effective_model_name, ctx.request)
     await VIDEO_STORE.upsert(ref.id, ref)
-    task = asyncio.create_task(_run_video_generation_job(handler, request, ref.id, reference_image))
+    task = asyncio.create_task(
+        _run_video_generation_job(
+            ctx.handler,
+            ctx.request,
+            ref.id,
+            reference_image=ctx.reference_image,
+            reference_audio=ctx.reference_audio,
+            tts_prompt_audio=ctx.tts_prompt_audio,
+        )
+    )
     await VIDEO_TASKS.upsert(ref.id, task)
     return ref
 
@@ -2169,7 +2271,7 @@ async def create_video(
     },
 )
 async def create_video_sync(
-    ctx: tuple[VideoGenerationRequest, OmniOpenAIServingVideo, str, ReferenceImage | None] = Depends(_parse_video_form),
+    ctx: VideoFormContext = Depends(_parse_video_form),
 ) -> Response:
     """Synchronous video generation endpoint.
 
@@ -2180,12 +2282,17 @@ async def create_video_sync(
     Metadata is returned via response headers ``X-Request-Id``,
     ``X-Model``, and ``X-Inference-Time-S``.
     """
-    request, handler, effective_model_name, reference_image = ctx
     request_id = f"video_sync-{random_uuid()}"
     started_at = time.perf_counter()
     try:
         video_bytes, stage_durations, peak_memory_mb = await asyncio.wait_for(
-            handler.generate_video_bytes(request, request_id, reference_image=reference_image),
+            ctx.handler.generate_video_bytes(
+                ctx.request,
+                request_id,
+                reference_image=ctx.reference_image,
+                reference_audio=ctx.reference_audio,
+                tts_prompt_audio=ctx.tts_prompt_audio,
+            ),
             timeout=VIDEO_SYNC_TIMEOUT_S,
         )
     except asyncio.TimeoutError:
@@ -2208,7 +2315,7 @@ async def create_video_sync(
         media_type="video/mp4",
         headers={
             "X-Request-Id": request_id,
-            "X-Model": effective_model_name,
+            "X-Model": ctx.effective_model_name,
             "X-Inference-Time-S": f"{inference_time_s:.3f}",
             "X-Stage-Durations": json.dumps(stage_durations, separators=(",", ":")),
             "X-Peak-Memory-MB": f"{peak_memory_mb:.3f}",

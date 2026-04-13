@@ -1,13 +1,15 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-
 from __future__ import annotations
 
+import os
 import time
 from dataclasses import dataclass
 from http import HTTPStatus
 from typing import Any, cast
 
+import numpy as np
+import soundfile as sf
 from fastapi import HTTPException
 from PIL import Image
 from vllm.engine.protocol import EngineClient
@@ -15,6 +17,7 @@ from vllm.logger import init_logger
 
 from vllm_omni.entrypoints.async_omni import AsyncOmni
 from vllm_omni.entrypoints.openai.protocol.videos import (
+    DEFAULT_FPS,
     VideoData,
     VideoGenerationRequest,
     VideoGenerationResponse,
@@ -28,15 +31,21 @@ logger = init_logger(__name__)
 
 @dataclass
 class ReferenceImage:
-    """Reference class for tracking additional metadata if needed"""
-
     data: Image.Image
 
 
 @dataclass
-class VideoGenerationArtifacts:
-    """Normalized outputs and profiler metadata extracted from one request."""
+class ReferenceAudio:
+    data: np.ndarray
+    sample_rate: int
 
+    @property
+    def payload(self) -> tuple[np.ndarray, int]:
+        return self.data, self.sample_rate
+
+
+@dataclass
+class VideoGenerationArtifacts:
     videos: list[Any]
     audios: list[Any | None]
     audio_sample_rate: int
@@ -46,8 +55,6 @@ class VideoGenerationArtifacts:
 
 
 class OmniOpenAIServingVideo:
-    """OpenAI-style video generation handler for omni diffusion models."""
-
     def __init__(
         self,
         engine_client: EngineClient,
@@ -89,8 +96,9 @@ class OmniOpenAIServingVideo:
         reference_id: str,
         *,
         reference_image: ReferenceImage | None = None,
+        reference_audio: ReferenceAudio | None = None,
+        tts_prompt_audio: ReferenceAudio | None = None,
     ) -> VideoGenerationArtifacts:
-        """Run the generation pipeline and extract video/audio/profiler outputs."""
         prompt: OmniTextPrompt = OmniTextPrompt(prompt=request.prompt)
         if request.negative_prompt is not None:
             prompt["negative_prompt"] = request.negative_prompt
@@ -98,13 +106,21 @@ class OmniOpenAIServingVideo:
         gen_params = OmniDiffusionSamplingParams()
 
         input_image = None if reference_image is None else reference_image.data
-        vp = request.resolve_video_params()
+        default_request_fps = self._resolve_default_request_fps(request)
+        vp = request.resolve_video_params(default_fps=default_request_fps)
         if input_image is not None and vp.width is not None and vp.height is not None:
             target_size = (vp.width, vp.height)
             if input_image.size != target_size:
                 input_image = input_image.resize(target_size, Image.Resampling.LANCZOS)
+
+        multi_modal_data: dict[str, Any] = {}
         if input_image is not None:
-            prompt["multi_modal_data"] = {"image": input_image}
+            multi_modal_data["image"] = input_image
+        if reference_audio is not None:
+            multi_modal_data["audio"] = reference_audio.payload
+        if multi_modal_data:
+            prompt["multi_modal_data"] = multi_modal_data
+
         if vp.width is not None and vp.height is not None:
             gen_params.width = vp.width
             gen_params.height = vp.height
@@ -135,31 +151,48 @@ class OmniOpenAIServingVideo:
         if request.flow_shift is not None:
             gen_params.extra_args["flow_shift"] = request.flow_shift
 
-        # Apply model-specific extra parameters
         if request.extra_params is not None:
             if not isinstance(request.extra_params, dict):
                 raise HTTPException(
                     status_code=HTTPStatus.BAD_REQUEST.value,
                     detail="extra_params must be a JSON object/dict.",
                 )
-            # Merge extra_params into extra_args
             gen_params.extra_args.update(request.extra_params)
             logger.info("Applied extra_params: %s", request.extra_params)
+
+        enable_tts = self._resolve_enable_tts(request)
+        if enable_tts:
+            gen_params.extra_args["enable_tts"] = True
+        if tts_prompt_audio is not None:
+            gen_params.extra_args["tts_prompt_audio"] = tts_prompt_audio.payload
+        elif request.tts_prompt_audio is not None:
+            gen_params.extra_args["tts_prompt_audio"] = request.tts_prompt_audio
+        if request.tts_prompt_text is not None:
+            gen_params.extra_args["tts_prompt_text"] = request.tts_prompt_text
+        if request.tts_text is not None:
+            gen_params.extra_args["tts_text"] = request.tts_text
 
         self._apply_lora(request.lora, gen_params)
 
         logger.info(
-            "Video sampling params: steps=%s guidance=%s guidance_2=%s seed=%s",
+            "Video sampling params: steps=%s guidance=%s guidance_2=%s seed=%s enable_tts=%s",
             gen_params.num_inference_steps,
             gen_params.guidance_scale,
             gen_params.guidance_scale_2,
             gen_params.seed,
+            enable_tts,
         )
 
         result = await self._run_generation(prompt, gen_params, reference_id)
         videos = self._extract_video_outputs(result)
-        audios = self._extract_audio_outputs(result, expected_count=len(videos))
-        audio_sample_rate = self._resolve_audio_sample_rate(result)
+        audios, extracted_audio_sample_rate = self._extract_audio_outputs(result, expected_count=len(videos))
+
+        if reference_audio is not None and not enable_tts:
+            audios = [audio if audio is not None else reference_audio.data for audio in audios]
+            if extracted_audio_sample_rate is None:
+                extracted_audio_sample_rate = reference_audio.sample_rate
+
+        audio_sample_rate = extracted_audio_sample_rate or self._resolve_audio_sample_rate(result)
         output_fps = vp.fps or self._resolve_fps(result) or 24
         return VideoGenerationArtifacts(
             videos=videos,
@@ -176,8 +209,16 @@ class OmniOpenAIServingVideo:
         reference_id: str,
         *,
         reference_image: ReferenceImage | None = None,
+        reference_audio: ReferenceAudio | None = None,
+        tts_prompt_audio: ReferenceAudio | None = None,
     ) -> VideoGenerationResponse:
-        artifacts = await self._run_and_extract(request, reference_id, reference_image=reference_image)
+        artifacts = await self._run_and_extract(
+            request,
+            reference_id,
+            reference_image=reference_image,
+            reference_audio=reference_audio,
+            tts_prompt_audio=tts_prompt_audio,
+        )
         _t_encode_start = time.perf_counter()
         video_data = [
             VideoData(
@@ -209,9 +250,16 @@ class OmniOpenAIServingVideo:
         reference_id: str,
         *,
         reference_image: ReferenceImage | None = None,
+        reference_audio: ReferenceAudio | None = None,
+        tts_prompt_audio: ReferenceAudio | None = None,
     ) -> tuple[bytes, dict[str, float], float]:
-        """Generate a video and return raw MP4 bytes, bypassing base64 encoding."""
-        artifacts = await self._run_and_extract(request, reference_id, reference_image=reference_image)
+        artifacts = await self._run_and_extract(
+            request,
+            reference_id,
+            reference_image=reference_image,
+            reference_audio=reference_audio,
+            tts_prompt_audio=tts_prompt_audio,
+        )
         if len(artifacts.videos) > 1:
             logger.warning(
                 "Video request %s generated %d outputs; returning only the first.",
@@ -228,6 +276,46 @@ class OmniOpenAIServingVideo:
         _t_encode_ms = (time.perf_counter() - _t_encode_start) * 1000
         logger.info("Video response encoding (MP4 bytes): %.2f ms", _t_encode_ms)
         return video_bytes, artifacts.stage_durations, artifacts.peak_memory_mb
+
+    @staticmethod
+    def _resolve_enable_tts(request: VideoGenerationRequest) -> bool:
+        if request.enable_tts is not None:
+            return bool(request.enable_tts)
+        return any(
+            value is not None
+            for value in (
+                request.tts_prompt_audio,
+                request.tts_prompt_text,
+                request.tts_text,
+            )
+        )
+
+    def _resolve_default_request_fps(self, request: VideoGenerationRequest) -> int:
+        if self._is_wan22_s2v_model(request):
+            return 16
+        return DEFAULT_FPS
+
+    def _is_wan22_s2v_model(self, request: VideoGenerationRequest) -> bool:
+        engine_model_config = getattr(self._engine_client, "model_config", None)
+        hf_config = getattr(engine_model_config, "hf_config", None)
+
+        model_type = getattr(hf_config, "model_type", None)
+        if isinstance(model_type, str) and model_type.lower() == "s2v":
+            return True
+
+        architectures = getattr(hf_config, "architectures", None)
+        if isinstance(architectures, (list, tuple)) and any(
+            isinstance(arch, str) and arch in {"WanS2VPipeline", "WanModel_S2V"}
+            for arch in architectures
+        ):
+            return True
+
+        model_candidates = [request.model, self._model_name, getattr(engine_model_config, "model", None)]
+        for candidate in model_candidates:
+            if isinstance(candidate, str) and "wan2.2-s2v" in candidate.lower():
+                return True
+
+        return False
 
     @staticmethod
     def _apply_lora(lora_body: Any, gen_params: OmniDiffusionSamplingParams) -> None:
@@ -260,7 +348,6 @@ class OmniOpenAIServingVideo:
                 detail="Stage configs not found. Start server with an omni diffusion model.",
             )
 
-        # Video generation endpoint only supports diffusion stages.
         for stage in stage_configs:
             stage_type = get_stage_type(stage)
             if stage_type != "diffusion":
@@ -269,7 +356,6 @@ class OmniOpenAIServingVideo:
                     detail=f"Video generation only supports diffusion stages, found '{stage_type}' stage.",
                 )
 
-        # Common generation logic for both paths
         engine_client = cast(AsyncOmni, self._engine_client)
         sampling_params_list: list[OmniSamplingParams] = [gen_params for _ in stage_configs]
 
@@ -338,8 +424,8 @@ class OmniOpenAIServingVideo:
             )
         return normalized
 
-    @staticmethod
-    def _extract_audio_outputs(result: Any, expected_count: int) -> list[Any | None]:
+    @classmethod
+    def _extract_audio_outputs(cls, result: Any, expected_count: int) -> tuple[list[Any | None], int | None]:
         audio = None
         if hasattr(result, "multimodal_output") and result.multimodal_output:
             audio = result.multimodal_output.get("audio")
@@ -351,9 +437,23 @@ class OmniOpenAIServingVideo:
             elif hasattr(request_output, "multimodal_output") and request_output.multimodal_output:
                 audio = request_output.multimodal_output.get("audio")
 
-        if audio is None:
-            return [None] * expected_count
+        sample_rate = cls._extract_audio_sample_rate_from_result(result)
+        if audio is not None:
+            return cls._normalize_audio_outputs(audio, expected_count), sample_rate
 
+        custom_output = cls._extract_custom_output(result)
+        audio_path = custom_output.get("audio_path") if isinstance(custom_output, dict) else None
+        if audio_path is None:
+            return [None] * expected_count, sample_rate
+
+        cleanup_audio_path = bool(custom_output.get("cleanup_audio_path")) if isinstance(custom_output, dict) else False
+        audio_payload, path_sample_rate = cls._load_audio_from_path(audio_path, cleanup_path=cleanup_audio_path)
+        if expected_count == 1:
+            return [audio_payload], path_sample_rate
+        return [audio_payload for _ in range(expected_count)], path_sample_rate
+
+    @staticmethod
+    def _normalize_audio_outputs(audio: Any, expected_count: int) -> list[Any | None]:
         if isinstance(audio, (list, tuple)):
             if len(audio) == expected_count and any(hasattr(item, "shape") or hasattr(item, "ndim") for item in audio):
                 return list(audio)
@@ -370,6 +470,52 @@ class OmniOpenAIServingVideo:
 
         return [audio] + [None] * max(expected_count - 1, 0)
 
+    @staticmethod
+    def _extract_custom_output(result: Any) -> dict[str, Any]:
+        custom_output = getattr(result, "custom_output", None)
+        if isinstance(custom_output, dict):
+            return custom_output
+
+        request_output = getattr(result, "request_output", None)
+        if isinstance(request_output, dict):
+            maybe_custom = request_output.get("custom_output") or {}
+            if isinstance(maybe_custom, dict):
+                return maybe_custom
+        elif hasattr(request_output, "custom_output"):
+            maybe_custom = getattr(request_output, "custom_output", None)
+            if isinstance(maybe_custom, dict):
+                return maybe_custom
+
+        return {}
+
+    @staticmethod
+    def _load_audio_from_path(audio_path: str, *, cleanup_path: bool = False) -> tuple[np.ndarray, int]:
+        try:
+            audio_np, sample_rate = sf.read(audio_path, dtype="float32", always_2d=False)
+        except (RuntimeError, OSError, TypeError, ValueError) as exc:
+            raise HTTPException(
+                status_code=HTTPStatus.INTERNAL_SERVER_ERROR.value,
+                detail=f"Failed to read generated audio file: {audio_path}",
+            ) from exc
+
+        audio_np = np.asarray(audio_np, dtype=np.float32)
+        if audio_np.ndim > 1:
+            audio_np = np.mean(audio_np, axis=-1)
+        audio_np = np.squeeze(audio_np)
+        if audio_np.ndim == 0 or audio_np.size == 0:
+            raise HTTPException(
+                status_code=HTTPStatus.INTERNAL_SERVER_ERROR.value,
+                detail=f"Generated audio file is empty: {audio_path}",
+            )
+        if cleanup_path:
+            try:
+                os.remove(audio_path)
+            except FileNotFoundError:
+                pass
+            except OSError as exc:
+                logger.warning("Failed to remove temporary generated audio file %s: %s", audio_path, exc)
+        return audio_np.astype(np.float32, copy=False), int(sample_rate)
+
     def _resolve_audio_sample_rate(self, result: Any) -> int:
         result_sample_rate = self._extract_audio_sample_rate_from_result(result)
         if result_sample_rate is not None:
@@ -385,7 +531,6 @@ class OmniOpenAIServingVideo:
 
     @staticmethod
     def _resolve_fps(result: Any) -> int | None:
-        """Extract fps from multimodal_output if the model reported it."""
         multimodal_output = getattr(result, "multimodal_output", None)
         if isinstance(multimodal_output, dict):
             fps = multimodal_output.get("fps")

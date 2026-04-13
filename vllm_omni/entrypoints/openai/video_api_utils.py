@@ -8,13 +8,16 @@ from __future__ import annotations
 
 import base64
 import binascii
+from functools import lru_cache
 from io import BytesIO
 from typing import Any
 
 import httpx
 import numpy as np
+import soundfile as sf
 import torch
 from PIL import Image, UnidentifiedImageError
+from vllm.multimodal.media import MediaConnector
 
 from vllm_omni.entrypoints.openai.errors import InvalidInputReferenceError
 from vllm_omni.entrypoints.openai.protocol.videos import (
@@ -40,7 +43,7 @@ def _decode_base64_image(input_reference: str, *, source: str) -> Image.Image:
 
         try:
             image_bytes = base64.b64decode(b64_data)
-        except (binascii.Error, ValueError) as exc:  # pragma: no cover - malformed base64
+        except (binascii.Error, ValueError) as exc:
             raise InvalidInputReferenceError(f"Invalid {source}: image data is not valid base64.") from exc
         return _decode_image_bytes(image_bytes, source=source)
     raise InvalidInputReferenceError(f"Invalid {source}: image data is empty.")
@@ -84,13 +87,88 @@ async def decode_input_reference(
     return None
 
 
+def _normalize_audio_array(audio_array: np.ndarray, *, source: str) -> np.ndarray:
+    audio_np = np.asarray(audio_array, dtype=np.float32)
+    if audio_np.ndim > 1:
+        audio_np = np.mean(audio_np, axis=-1)
+    audio_np = np.squeeze(audio_np)
+    if audio_np.ndim == 0 or audio_np.size == 0:
+        raise InvalidInputReferenceError(f"Invalid {source}: provided audio is empty.")
+    return audio_np.astype(np.float32, copy=False)
+
+
+def _decode_audio_bytes(audio_bytes: bytes, *, source: str) -> tuple[np.ndarray, int]:
+    try:
+        audio_np, sample_rate = sf.read(BytesIO(audio_bytes), dtype="float32", always_2d=False)
+    except (RuntimeError, ValueError, TypeError) as exc:
+        raise InvalidInputReferenceError(f"Invalid {source}: provided content is not a valid audio file.") from exc
+
+    return _normalize_audio_array(audio_np, source=source), int(sample_rate)
+
+
+async def decode_audio_url(
+    audio_url: str,
+    *,
+    source: str,
+    allowed_local_media_path: str | None = None,
+    allowed_media_domains: list[str] | None = None,
+) -> tuple[np.ndarray, int]:
+    if not audio_url or not audio_url.strip():
+        raise InvalidInputReferenceError(f"Invalid {source}: audio reference is empty.")
+
+    domains_key = tuple(sorted(allowed_media_domains)) if allowed_media_domains is not None else None
+    connector = _get_media_connector(allowed_local_media_path, domains_key)
+    try:
+        audio_np, sample_rate = await connector.fetch_audio_async(audio_url)
+    except Exception as exc:
+        raise InvalidInputReferenceError(f"Invalid {source}: failed to resolve audio reference.") from exc
+
+    return _normalize_audio_array(audio_np, source=source), int(sample_rate)
+
+
+@lru_cache(maxsize=8)
+def _get_media_connector(
+    allowed_local_media_path: str | None,
+    allowed_media_domains: tuple[str, ...] | None,
+) -> MediaConnector:
+    return MediaConnector(
+        allowed_local_media_path=allowed_local_media_path,
+        allowed_media_domains=list(allowed_media_domains) if allowed_media_domains is not None else None,
+    )
+
+
+async def decode_audio_input(
+    audio_reference: str | None,
+    input_audio_bytes: bytes | None,
+    *,
+    source: str,
+    upload_field: str,
+    allowed_local_media_path: str | None = None,
+    allowed_media_domains: list[str] | None = None,
+) -> tuple[np.ndarray, int] | None:
+    if input_audio_bytes is not None and audio_reference is not None:
+        raise InvalidInputReferenceError(f"Provide either {upload_field} or {source}, not both.")
+
+    if isinstance(input_audio_bytes, bytes):
+        return _decode_audio_bytes(input_audio_bytes, source=upload_field)
+
+    if audio_reference is None:
+        return None
+
+    return await decode_audio_url(
+        audio_reference,
+        source=source,
+        allowed_local_media_path=allowed_local_media_path,
+        allowed_media_domains=allowed_media_domains,
+    )
+
+
 def _normalize_video_tensor(video_tensor: torch.Tensor) -> np.ndarray:
     """Normalize a torch video tensor into a numpy array of frames (F, H, W, C)."""
     video_tensor = video_tensor.detach().cpu()
     if video_tensor.dim() == 5:
         raise ValueError("Batched video tensors are not supported for single-video encoding.")
     elif video_tensor.dim() == 4 and video_tensor.shape[0] in (3, 4):
-        # [C, F, H, W] -> [F, H, W, C]
         video_tensor = video_tensor.permute(1, 2, 3, 0)
 
     if video_tensor.is_floating_point():
@@ -107,7 +185,6 @@ def _normalize_single_video_array(video_array: np.ndarray) -> np.ndarray:
         raise ValueError("Batched video arrays are not supported for single-video encoding.")
 
     if video_array.ndim == 4:
-        # Convert channel-first layouts to channel-last
         if video_array.shape[0] in (3, 4) and video_array.shape[-1] not in (3, 4):
             video_array = np.transpose(video_array, (1, 2, 3, 0))
         elif video_array.shape[1] in (3, 4) and video_array.shape[-1] not in (3, 4):
@@ -174,9 +251,7 @@ def _coerce_video_to_frames(video: Any) -> list[np.ndarray]:
     if isinstance(video, list):
         if not video:
             return []
-        # If this looks like a list of frames, normalize directly.
         if all(isinstance(item, (np.ndarray, torch.Tensor, Image.Image)) for item in video):
-            # If each item is itself a video (ndim==4), handle elsewhere.
             if all(hasattr(item, "ndim") and item.ndim >= 4 for item in video):
                 raise ValueError("Expected a single video, got a list of video tensors/arrays.")
             return _normalize_frames(video)

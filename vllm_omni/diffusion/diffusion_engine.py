@@ -384,6 +384,9 @@ class DiffusionEngine:
 
     def _dummy_run(self):
         """A dummy run to warm up the model."""
+        if self.od_config.model_class_name == "WanS2VPipeline":
+            logger.info("Skipping dummy run for Wan2.2 S2V; upstream audio warmup is not compatible with the generic diffusion warmup path.")
+            return
         num_inference_steps = 1
         height = 512
         width = 512
