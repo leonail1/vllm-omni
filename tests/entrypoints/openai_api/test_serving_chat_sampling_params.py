@@ -587,6 +587,39 @@ class TestResolveHeightWidth:
         assert w is None
 
 
+class TestResolveTrueCfgScale:
+    def test_preserves_explicit_zero_true_cfg_scale(self):
+        from vllm_omni.entrypoints.openai.serving_chat import OmniOpenAIServingChat
+
+        scale = OmniOpenAIServingChat._resolve_true_cfg_scale_from_extra_body(
+            {
+                "true_cfg_scale": 0.0,
+                "cfg_scale": 4.0,
+            }
+        )
+
+        assert scale == 0.0
+
+    def test_falls_back_to_cfg_scale_only_when_true_cfg_scale_absent(self):
+        from vllm_omni.entrypoints.openai.serving_chat import OmniOpenAIServingChat
+
+        scale = OmniOpenAIServingChat._resolve_true_cfg_scale_from_extra_body({"cfg_scale": 4.0})
+
+        assert scale == 4.0
+
+    def test_none_true_cfg_scale_does_not_fall_back_to_cfg_scale(self):
+        from vllm_omni.entrypoints.openai.serving_chat import OmniOpenAIServingChat
+
+        scale = OmniOpenAIServingChat._resolve_true_cfg_scale_from_extra_body(
+            {
+                "true_cfg_scale": None,
+                "cfg_scale": 4.0,
+            }
+        )
+
+        assert scale is None
+
+
 # =============================================================================
 # Tests for _apply_request_overrides with GLM-Image (target_h/w injection)
 # =============================================================================

@@ -1,0 +1,142 @@
+{
+  "model_a_tokens_only": {
+    "available": true,
+    "formula": "latency_ms = c0 + c1*tokens + c2*batch_eff + c3*tokens*batch_eff",
+    "coefficients": [
+      319.2540279144418,
+      -273.1596222776404,
+      -56.48172613257722,
+      425.73404028406935
+    ],
+    "mape_pct": 6.286353026097235,
+    "p90_ape_pct": 14.272909015386281,
+    "max_ape_pct": 48.10290368247497
+  },
+  "model_b_tokens_plus_aspect": {
+    "available": true,
+    "formula": "latency_ms = c0 + c1*tokens + c2*batch_eff + c3*tokens*batch_eff + c4*log(aspect) + c5*log(aspect)*tokens + c6*log(aspect)*tokens*batch_eff",
+    "coefficients": [
+      358.034867168945,
+      -335.1866587299048,
+      -56.47964676381096,
+      425.71755372899383,
+      -72.80542640964956,
+      108.15557338302506,
+      0.018406031341169315
+    ],
+    "mape_pct": 5.5905448493800955,
+    "p90_ape_pct": 14.199861050895962,
+    "max_ape_pct": 38.18632349415327
+  },
+  "mape_improvement_pct_points": 0.6958081767171391,
+  "cross_validation": {
+    "model_a_tokens_only": {
+      "available": true,
+      "holdout": "shape_key",
+      "mape_pct": 7.057766313487784,
+      "p90_ape_pct": 14.702589844144356,
+      "max_ape_pct": 59.10004465718952,
+      "num_predictions": 92
+    },
+    "model_b_tokens_plus_aspect": {
+      "available": true,
+      "holdout": "shape_key",
+      "mape_pct": 7.186309019331273,
+      "p90_ape_pct": 14.953248057207098,
+      "max_ape_pct": 53.38033804256449,
+      "num_predictions": 92
+    },
+    "mape_improvement_pct_points": -0.12854270584348892
+  },
+  "decision_rule": "aspect_needed when same-token deltas exceed thresholds or leave-one-shape-out MAPE improves by >= 2 pct-points",
+  "aspect_needed": true,
+  "preferred_key": "shape_key",
+  "fallback_features": [
+    "latent_tokens",
+    "effective_batch_size",
+    "aspect_ratio"
+  ],
+  "risk_shapes": [
+    {
+      "latent_tokens": 3136,
+      "shape_key": "1024x784x1",
+      "batch_size": 1,
+      "aspect_ratio": 1.3061224489795917,
+      "delta_vs_square_pct": 0.2982191618202677,
+      "p95_delta_vs_square_pct": 10.285796318751643
+    },
+    {
+      "latent_tokens": 3136,
+      "shape_key": "1024x784x1",
+      "batch_size": 2,
+      "aspect_ratio": 1.3061224489795917,
+      "delta_vs_square_pct": -0.12138161211559463,
+      "p95_delta_vs_square_pct": -79.60162248436298
+    },
+    {
+      "latent_tokens": 3136,
+      "shape_key": "1024x784x1",
+      "batch_size": 3,
+      "aspect_ratio": 1.3061224489795917,
+      "delta_vs_square_pct": -0.3355959323631194,
+      "p95_delta_vs_square_pct": -12.105317218132097
+    },
+    {
+      "latent_tokens": 3136,
+      "shape_key": "1792x448x1",
+      "batch_size": 2,
+      "aspect_ratio": 4.0,
+      "delta_vs_square_pct": -0.09003858912992331,
+      "p95_delta_vs_square_pct": -79.61319944971036
+    },
+    {
+      "latent_tokens": 3136,
+      "shape_key": "1792x448x1",
+      "batch_size": 3,
+      "aspect_ratio": 4.0,
+      "delta_vs_square_pct": -0.060088914079605815,
+      "p95_delta_vs_square_pct": -12.312333688511647
+    },
+    {
+      "latent_tokens": 3136,
+      "shape_key": "448x1792x1",
+      "batch_size": 2,
+      "aspect_ratio": 4.0,
+      "delta_vs_square_pct": -0.18286268882161927,
+      "p95_delta_vs_square_pct": -79.62791008818104
+    },
+    {
+      "latent_tokens": 3136,
+      "shape_key": "448x1792x1",
+      "batch_size": 3,
+      "aspect_ratio": 4.0,
+      "delta_vs_square_pct": -0.09379729946594416,
+      "p95_delta_vs_square_pct": -12.076238754869854
+    },
+    {
+      "latent_tokens": 3136,
+      "shape_key": "784x1024x1",
+      "batch_size": 2,
+      "aspect_ratio": 1.3061224489795917,
+      "delta_vs_square_pct": -0.07760850111302323,
+      "p95_delta_vs_square_pct": -79.61161932614125
+    },
+    {
+      "latent_tokens": 3136,
+      "shape_key": "784x1024x1",
+      "batch_size": 3,
+      "aspect_ratio": 1.3061224489795917,
+      "delta_vs_square_pct": -0.04178043214036531,
+      "p95_delta_vs_square_pct": -12.121261003014894
+    },
+    {
+      "latent_tokens": 1600,
+      "shape_key": "800x512x1",
+      "batch_size": 1,
+      "aspect_ratio": 1.5625,
+      "delta_vs_square_pct": 4.872865807832142,
+      "p95_delta_vs_square_pct": 15.535293103845122
+    }
+  ],
+  "excluded_failed_combo_ids": []
+}

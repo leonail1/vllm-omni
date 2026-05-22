@@ -1,0 +1,280 @@
+[2026-05-22 21:55:48] latent/aspect profile 输出目录：/home/lzg/vllm-omni/benchmark_outputs/latent_token_aspect_profile_20260522_215548
+[2026-05-22 21:55:48] 启动 latent/aspect profile 服务：devices=0,1, tp=2, max_num_seqs=4, port=18130
+[2026-05-22 21:57:34] 服务已健康：port=18130
+[2026-05-22 21:57:34] 开始 latent/aspect matrix：batch_sizes=1,2,3,4, steps=50
+[latent-aspect] warmup 512x512_b1
+[latent-aspect] measure 512x512_b1 repeat=0/3
+[latent-aspect] measure 512x512_b1 repeat=1/3
+[latent-aspect] measure 512x512_b1 repeat=2/3
+[latent-aspect] warmup 512x512_b2
+[latent-aspect] measure 512x512_b2 repeat=0/3
+[latent-aspect] measure 512x512_b2 repeat=1/3
+[latent-aspect] measure 512x512_b2 repeat=2/3
+[latent-aspect] warmup 512x512_b3
+[latent-aspect] measure 512x512_b3 repeat=0/3
+[latent-aspect] measure 512x512_b3 repeat=1/3
+[latent-aspect] measure 512x512_b3 repeat=2/3
+[latent-aspect] warmup 512x512_b4
+[latent-aspect] measure 512x512_b4 repeat=0/3
+[latent-aspect] measure 512x512_b4 repeat=1/3
+[latent-aspect] measure 512x512_b4 repeat=2/3
+[latent-aspect] warmup 256x1024_b1
+[latent-aspect] measure 256x1024_b1 repeat=0/1
+[latent-aspect] warmup 256x1024_b2
+[latent-aspect] measure 256x1024_b2 repeat=0/1
+[latent-aspect] warmup 256x1024_b3
+[latent-aspect] measure 256x1024_b3 repeat=0/1
+[latent-aspect] warmup 256x1024_b4
+[latent-aspect] measure 256x1024_b4 repeat=0/1
+[latent-aspect] warmup 1024x256_b1
+[latent-aspect] measure 1024x256_b1 repeat=0/1
+[latent-aspect] warmup 1024x256_b2
+[latent-aspect] measure 1024x256_b2 repeat=0/1
+[latent-aspect] warmup 1024x256_b3
+[latent-aspect] measure 1024x256_b3 repeat=0/1
+[latent-aspect] warmup 1024x256_b4
+[latent-aspect] measure 1024x256_b4 repeat=0/1
+[latent-aspect] warmup 640x640_b1
+[latent-aspect] measure 640x640_b1 repeat=0/3
+[latent-aspect] measure 640x640_b1 repeat=1/3
+[latent-aspect] measure 640x640_b1 repeat=2/3
+[latent-aspect] warmup 640x640_b2
+[latent-aspect] measure 640x640_b2 repeat=0/3
+[latent-aspect] measure 640x640_b2 repeat=1/3
+[latent-aspect] measure 640x640_b2 repeat=2/3
+[latent-aspect] warmup 640x640_b3
+[latent-aspect] measure 640x640_b3 repeat=0/3
+[latent-aspect] measure 640x640_b3 repeat=1/3
+[latent-aspect] measure 640x640_b3 repeat=2/3
+[latent-aspect] warmup 640x640_b4
+[latent-aspect] measure 640x640_b4 repeat=0/3
+[latent-aspect] measure 640x640_b4 repeat=1/3
+[latent-aspect] measure 640x640_b4 repeat=2/3
+[latent-aspect] warmup 512x800_b1
+[latent-aspect] measure 512x800_b1 repeat=0/1
+[latent-aspect] warmup 512x800_b2
+[latent-aspect] measure 512x800_b2 repeat=0/1
+[latent-aspect] warmup 512x800_b3
+[latent-aspect] measure 512x800_b3 repeat=0/1
+[latent-aspect] warmup 512x800_b4
+[latent-aspect] measure 512x800_b4 repeat=0/1
+[latent-aspect] warmup 800x512_b1
+[latent-aspect] measure 800x512_b1 repeat=0/1
+[latent-aspect] warmup 800x512_b2
+[latent-aspect] measure 800x512_b2 repeat=0/1
+[latent-aspect] warmup 800x512_b3
+[latent-aspect] measure 800x512_b3 repeat=0/1
+[latent-aspect] warmup 800x512_b4
+[latent-aspect] measure 800x512_b4 repeat=0/1
+[latent-aspect] warmup 400x1024_b1
+[latent-aspect] measure 400x1024_b1 repeat=0/1
+[latent-aspect] warmup 400x1024_b2
+[latent-aspect] measure 400x1024_b2 repeat=0/1
+[latent-aspect] warmup 400x1024_b3
+[latent-aspect] measure 400x1024_b3 repeat=0/1
+[latent-aspect] warmup 400x1024_b4
+[latent-aspect] measure 400x1024_b4 repeat=0/1
+[latent-aspect] warmup 1024x400_b1
+[latent-aspect] measure 1024x400_b1 repeat=0/1
+[latent-aspect] warmup 1024x400_b2
+[latent-aspect] measure 1024x400_b2 repeat=0/1
+[latent-aspect] warmup 1024x400_b3
+[latent-aspect] measure 1024x400_b3 repeat=0/1
+[latent-aspect] warmup 1024x400_b4
+[latent-aspect] measure 1024x400_b4 repeat=0/1
+[latent-aspect] warmup 768x768_b1
+[latent-aspect] measure 768x768_b1 repeat=0/3
+[latent-aspect] measure 768x768_b1 repeat=1/3
+[latent-aspect] measure 768x768_b1 repeat=2/3
+[latent-aspect] warmup 768x768_b2
+[latent-aspect] measure 768x768_b2 repeat=0/3
+[latent-aspect] measure 768x768_b2 repeat=1/3
+[latent-aspect] measure 768x768_b2 repeat=2/3
+[latent-aspect] warmup 768x768_b3
+[latent-aspect] measure 768x768_b3 repeat=0/3
+[latent-aspect] measure 768x768_b3 repeat=1/3
+[latent-aspect] measure 768x768_b3 repeat=2/3
+[latent-aspect] warmup 768x768_b4
+[latent-aspect] measure 768x768_b4 repeat=0/3
+[latent-aspect] measure 768x768_b4 repeat=1/3
+[latent-aspect] measure 768x768_b4 repeat=2/3
+[latent-aspect] warmup 512x1152_b1
+[latent-aspect] measure 512x1152_b1 repeat=0/1
+[latent-aspect] warmup 512x1152_b2
+[latent-aspect] measure 512x1152_b2 repeat=0/1
+[latent-aspect] warmup 512x1152_b3
+[latent-aspect] measure 512x1152_b3 repeat=0/1
+[latent-aspect] warmup 512x1152_b4
+[latent-aspect] measure 512x1152_b4 repeat=0/1
+[latent-aspect] warmup 1152x512_b1
+[latent-aspect] measure 1152x512_b1 repeat=0/1
+[latent-aspect] warmup 1152x512_b2
+[latent-aspect] measure 1152x512_b2 repeat=0/1
+[latent-aspect] warmup 1152x512_b3
+[latent-aspect] measure 1152x512_b3 repeat=0/1
+[latent-aspect] warmup 1152x512_b4
+[latent-aspect] measure 1152x512_b4 repeat=0/1
+[latent-aspect] warmup 576x1024_b1
+[latent-aspect] measure 576x1024_b1 repeat=0/1
+[latent-aspect] warmup 576x1024_b2
+[latent-aspect] measure 576x1024_b2 repeat=0/1
+[latent-aspect] warmup 576x1024_b3
+[latent-aspect] measure 576x1024_b3 repeat=0/1
+[latent-aspect] warmup 576x1024_b4
+[latent-aspect] measure 576x1024_b4 repeat=0/1
+[latent-aspect] warmup 1024x576_b1
+[latent-aspect] measure 1024x576_b1 repeat=0/1
+[latent-aspect] warmup 1024x576_b2
+[latent-aspect] measure 1024x576_b2 repeat=0/1
+[latent-aspect] warmup 1024x576_b3
+[latent-aspect] measure 1024x576_b3 repeat=0/1
+[latent-aspect] warmup 1024x576_b4
+[latent-aspect] measure 1024x576_b4 repeat=0/1
+[latent-aspect] warmup 896x896_b1
+[latent-aspect] measure 896x896_b1 repeat=0/3
+[latent-aspect] measure 896x896_b1 repeat=1/3
+[latent-aspect] measure 896x896_b1 repeat=2/3
+[latent-aspect] warmup 896x896_b2
+[latent-aspect] measure 896x896_b2 repeat=0/3
+[latent-aspect] measure 896x896_b2 repeat=1/3
+[latent-aspect] measure 896x896_b2 repeat=2/3
+[latent-aspect] warmup 896x896_b3
+[latent-aspect] measure 896x896_b3 repeat=0/3
+[latent-aspect] measure 896x896_b3 repeat=1/3
+[latent-aspect] measure 896x896_b3 repeat=2/3
+[latent-aspect] warmup 896x896_b4
+[latent-aspect] measure 896x896_b4 repeat=0/3
+[latent-aspect] measure 896x896_b4 repeat=1/3
+[latent-aspect] measure 896x896_b4 repeat=2/3
+[latent-aspect] warmup 784x1024_b1
+[latent-aspect] measure 784x1024_b1 repeat=0/1
+[latent-aspect] warmup 784x1024_b2
+[latent-aspect] measure 784x1024_b2 repeat=0/1
+[latent-aspect] warmup 784x1024_b3
+[latent-aspect] measure 784x1024_b3 repeat=0/1
+[latent-aspect] warmup 784x1024_b4
+[latent-aspect] measure 784x1024_b4 repeat=0/1
+[latent-aspect] warmup 1024x784_b1
+[latent-aspect] measure 1024x784_b1 repeat=0/1
+[latent-aspect] warmup 1024x784_b2
+[latent-aspect] measure 1024x784_b2 repeat=0/1
+[latent-aspect] warmup 1024x784_b3
+[latent-aspect] measure 1024x784_b3 repeat=0/1
+[latent-aspect] warmup 1024x784_b4
+[latent-aspect] measure 1024x784_b4 repeat=0/1
+[latent-aspect] warmup 448x1792_b1
+[latent-aspect] measure 448x1792_b1 repeat=0/1
+[latent-aspect] warmup 448x1792_b2
+[latent-aspect] measure 448x1792_b2 repeat=0/1
+[latent-aspect] warmup 448x1792_b3
+[latent-aspect] measure 448x1792_b3 repeat=0/1
+[latent-aspect] warmup 448x1792_b4
+[latent-aspect] measure 448x1792_b4 repeat=0/1
+[latent-aspect] warmup 1792x448_b1
+[latent-aspect] measure 1792x448_b1 repeat=0/1
+[latent-aspect] warmup 1792x448_b2
+[latent-aspect] measure 1792x448_b2 repeat=0/1
+[latent-aspect] warmup 1792x448_b3
+[latent-aspect] measure 1792x448_b3 repeat=0/1
+[latent-aspect] warmup 1792x448_b4
+[latent-aspect] measure 1792x448_b4 repeat=0/1
+[latent-aspect] warmup 1024x1024_b1
+[latent-aspect] measure 1024x1024_b1 repeat=0/3
+[latent-aspect] measure 1024x1024_b1 repeat=1/3
+[latent-aspect] measure 1024x1024_b1 repeat=2/3
+[latent-aspect] warmup 1024x1024_b2
+[latent-aspect] measure 1024x1024_b2 repeat=0/3
+[latent-aspect] measure 1024x1024_b2 repeat=1/3
+[latent-aspect] measure 1024x1024_b2 repeat=2/3
+[latent-aspect] warmup 1024x1024_b3
+[latent-aspect] measure 1024x1024_b3 repeat=0/3
+[latent-aspect] measure 1024x1024_b3 repeat=1/3
+[latent-aspect] measure 1024x1024_b3 repeat=2/3
+[latent-aspect] warmup 1024x1024_b4
+[latent-aspect] measure 1024x1024_b4 repeat=0/3
+[latent-aspect] measure 1024x1024_b4 repeat=1/3
+[latent-aspect] measure 1024x1024_b4 repeat=2/3
+[latent-aspect] warmup 512x2048_b1
+[latent-aspect] measure 512x2048_b1 repeat=0/1
+[latent-aspect] warmup 512x2048_b2
+[latent-aspect] measure 512x2048_b2 repeat=0/1
+[latent-aspect] warmup 512x2048_b3
+[latent-aspect] measure 512x2048_b3 repeat=0/1
+[latent-aspect] warmup 512x2048_b4
+[latent-aspect] measure 512x2048_b4 repeat=0/1
+[latent-aspect] warmup 2048x512_b1
+[latent-aspect] measure 2048x512_b1 repeat=0/1
+[latent-aspect] warmup 2048x512_b2
+[latent-aspect] measure 2048x512_b2 repeat=0/1
+[latent-aspect] warmup 2048x512_b3
+[latent-aspect] measure 2048x512_b3 repeat=0/1
+[latent-aspect] warmup 2048x512_b4
+[latent-aspect] measure 2048x512_b4 repeat=0/1
+[latent-aspect] warmup 256x256_b1
+[latent-aspect] measure 256x256_b1 repeat=0/3
+[latent-aspect] measure 256x256_b1 repeat=1/3
+[latent-aspect] measure 256x256_b1 repeat=2/3
+[latent-aspect] warmup 256x256_b2
+[latent-aspect] measure 256x256_b2 repeat=0/3
+[latent-aspect] measure 256x256_b2 repeat=1/3
+[latent-aspect] measure 256x256_b2 repeat=2/3
+[latent-aspect] warmup 256x256_b3
+[latent-aspect] measure 256x256_b3 repeat=0/3
+[latent-aspect] measure 256x256_b3 repeat=1/3
+[latent-aspect] measure 256x256_b3 repeat=2/3
+[latent-aspect] warmup 256x256_b4
+[latent-aspect] measure 256x256_b4 repeat=0/3
+[latent-aspect] measure 256x256_b4 repeat=1/3
+[latent-aspect] measure 256x256_b4 repeat=2/3
+[latent-aspect] warmup 384x384_b1
+[latent-aspect] measure 384x384_b1 repeat=0/3
+[latent-aspect] measure 384x384_b1 repeat=1/3
+[latent-aspect] measure 384x384_b1 repeat=2/3
+[latent-aspect] warmup 384x384_b2
+[latent-aspect] measure 384x384_b2 repeat=0/3
+[latent-aspect] measure 384x384_b2 repeat=1/3
+[latent-aspect] measure 384x384_b2 repeat=2/3
+[latent-aspect] warmup 384x384_b3
+[latent-aspect] measure 384x384_b3 repeat=0/3
+[latent-aspect] measure 384x384_b3 repeat=1/3
+[latent-aspect] measure 384x384_b3 repeat=2/3
+[latent-aspect] warmup 384x384_b4
+[latent-aspect] measure 384x384_b4 repeat=0/3
+[latent-aspect] measure 384x384_b4 repeat=1/3
+[latent-aspect] measure 384x384_b4 repeat=2/3
+[latent-aspect] supplement rectangles for unstable token groups: [256, 3136]
+[latent-aspect] measure 784x1024_b1 repeat=1/3
+[latent-aspect] measure 784x1024_b1 repeat=2/3
+[latent-aspect] measure 784x1024_b2 repeat=1/3
+[latent-aspect] measure 784x1024_b2 repeat=2/3
+[latent-aspect] measure 784x1024_b3 repeat=1/3
+[latent-aspect] measure 784x1024_b3 repeat=2/3
+[latent-aspect] measure 784x1024_b4 repeat=1/3
+[latent-aspect] measure 784x1024_b4 repeat=2/3
+[latent-aspect] measure 1024x784_b1 repeat=1/3
+[latent-aspect] measure 1024x784_b1 repeat=2/3
+[latent-aspect] measure 1024x784_b2 repeat=1/3
+[latent-aspect] measure 1024x784_b2 repeat=2/3
+[latent-aspect] measure 1024x784_b3 repeat=1/3
+[latent-aspect] measure 1024x784_b3 repeat=2/3
+[latent-aspect] measure 1024x784_b4 repeat=1/3
+[latent-aspect] measure 1024x784_b4 repeat=2/3
+[latent-aspect] measure 448x1792_b1 repeat=1/3
+[latent-aspect] measure 448x1792_b1 repeat=2/3
+[latent-aspect] measure 448x1792_b2 repeat=1/3
+[latent-aspect] measure 448x1792_b2 repeat=2/3
+[latent-aspect] measure 448x1792_b3 repeat=1/3
+[latent-aspect] measure 448x1792_b3 repeat=2/3
+[latent-aspect] measure 448x1792_b4 repeat=1/3
+[latent-aspect] measure 448x1792_b4 repeat=2/3
+[latent-aspect] measure 1792x448_b1 repeat=1/3
+[latent-aspect] measure 1792x448_b1 repeat=2/3
+[latent-aspect] measure 1792x448_b2 repeat=1/3
+[latent-aspect] measure 1792x448_b2 repeat=2/3
+[latent-aspect] measure 1792x448_b3 repeat=1/3
+[latent-aspect] measure 1792x448_b3 repeat=2/3
+[latent-aspect] measure 1792x448_b4 repeat=1/3
+[latent-aspect] measure 1792x448_b4 repeat=2/3
+[2026-05-23 00:25:50] 聚合基础 profile raw：/home/lzg/vllm-omni/benchmark_outputs/latent_token_aspect_profile_20260522_215548/step_cost_raw.jsonl
+[2026-05-23 00:25:51] 分析 latent_tokens 与 aspect_ratio：/home/lzg/vllm-omni/benchmark_outputs/latent_token_aspect_profile_20260522_215548/step_cost_raw.jsonl
+[2026-05-23 00:25:52] latent/aspect profile 完成：/home/lzg/vllm-omni/benchmark_outputs/latent_token_aspect_profile_20260522_215548

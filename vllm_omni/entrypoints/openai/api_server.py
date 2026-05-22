@@ -1535,6 +1535,10 @@ async def generate_images(request: ImageGenerationRequest, raw_request: Request)
                 # Keep /images validation semantics: invalid LoRA should fail with 400.
                 _parse_lora_request(request.lora)
                 extra_body["lora"] = request.lora
+            for key in ("reference_cost_ms", "slo_ms", "arrival_time_s", "deadline_time_s"):
+                value = getattr(request, key, None)
+                if value is not None:
+                    extra_body[key] = value
 
             generation_result = await chat_handler.generate_diffusion_images(
                 prompt=request.prompt,
@@ -1604,6 +1608,10 @@ async def generate_images(request: ImageGenerationRequest, raw_request: Request)
         )
         _update_if_not_none(gen_params, "generator_device", request.generator_device)
         _update_if_not_none(gen_params, "layers", request.layers)
+        _update_if_not_none(gen_params, "reference_cost_ms", request.reference_cost_ms)
+        _update_if_not_none(gen_params, "slo_ms", request.slo_ms)
+        _update_if_not_none(gen_params, "arrival_time_s", request.arrival_time_s)
+        _update_if_not_none(gen_params, "deadline_time_s", request.deadline_time_s)
 
         request_id = f"img_gen-{random_uuid()}"
         raw_request.state.request_metadata = RequestResponseMetadata(request_id=request_id)
@@ -1696,6 +1704,10 @@ async def edit_images(
     strength: float | None = Form(None),
     true_cfg_scale: float | None = Form(None),
     seed: int | None = Form(None),
+    reference_cost_ms: float | None = Form(None),
+    slo_ms: float | None = Form(None),
+    arrival_time_s: float | None = Form(None),
+    deadline_time_s: float | None = Form(None),
     generator_device: str | None = Form(None),
     # vllm-omni extension for per-request LoRA.
     lora: str | None = Form(None),  # Json string
@@ -1860,6 +1872,10 @@ async def edit_images(
         _update_if_not_none(gen_params, "generator_device", generator_device)
         _update_if_not_none(gen_params, "layers", layers)
         _update_if_not_none(gen_params, "resolution", resolution)
+        _update_if_not_none(gen_params, "reference_cost_ms", reference_cost_ms)
+        _update_if_not_none(gen_params, "slo_ms", slo_ms)
+        _update_if_not_none(gen_params, "arrival_time_s", arrival_time_s)
+        _update_if_not_none(gen_params, "deadline_time_s", deadline_time_s)
 
         # 4. Generate images
         request_id = f"img_edit-{random_uuid()}"
@@ -1924,6 +1940,14 @@ async def edit_images(
                 extra_body["sys_type"] = sys_type
             if system_prompt is not None:
                 extra_body["system_prompt"] = system_prompt
+            for key, value in {
+                "reference_cost_ms": reference_cost_ms,
+                "slo_ms": slo_ms,
+                "arrival_time_s": arrival_time_s,
+                "deadline_time_s": deadline_time_s,
+            }.items():
+                if value is not None:
+                    extra_body[key] = value
 
             prompt_text = prompt.get("prompt", "")
             generation_result = await chat_handler.generate_diffusion_images(
@@ -2531,6 +2555,10 @@ async def _parse_video_form(
     flow_shift: float | None = Form(default=None),
     true_cfg_scale: float | None = Form(default=None),
     seed: int | None = Form(default=None),
+    reference_cost_ms: float | None = Form(default=None),
+    slo_ms: float | None = Form(default=None),
+    arrival_time_s: float | None = Form(default=None),
+    deadline_time_s: float | None = Form(default=None),
     negative_prompt: str | None = Form(default=None),
     enable_frame_interpolation: bool | None = Form(default=None),
     frame_interpolation_exp: int | None = Form(default=None, ge=1),
@@ -2571,6 +2599,10 @@ async def _parse_video_form(
         "flow_shift": flow_shift,
         "true_cfg_scale": true_cfg_scale,
         "seed": seed,
+        "reference_cost_ms": reference_cost_ms,
+        "slo_ms": slo_ms,
+        "arrival_time_s": arrival_time_s,
+        "deadline_time_s": deadline_time_s,
         "negative_prompt": negative_prompt,
         "enable_frame_interpolation": enable_frame_interpolation,
         "frame_interpolation_exp": frame_interpolation_exp,

@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import time as _time
-from dataclasses import dataclass
+from dataclasses import dataclass, fields
 from typing import TYPE_CHECKING, Any, cast
 
 from vllm.logger import init_logger
@@ -17,6 +17,7 @@ from vllm_omni.distributed.omni_coordinator import (
     ReplicaStatus,
 )
 from vllm_omni.distributed.omni_coordinator.load_balancer import Task
+from vllm_omni.diffusion.sched.interface import SamplingParamsKey
 from vllm_omni.engine.stage_client import (
     StagePoolClient,
     StagePoolDiffusionClient,
@@ -30,6 +31,15 @@ if TYPE_CHECKING:
     from vllm_omni.engine.orchestrator import OrchestratorRequestState
 
 logger = init_logger(__name__)
+
+
+def _optional_float(value: Any) -> float | None:
+    if value is None:
+        return None
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
 
 
 @dataclass
@@ -69,6 +79,8 @@ class StagePool:
 
     DISPATCH_WAIT_TIMEOUT_S: float = 10.0
     DISPATCH_RETRY_INTERVAL_S: float = 0.1
+    SCHEDULER_SNAPSHOT_TTL_S: float = 0.5
+    SCHEDULER_SNAPSHOT_RPC_TIMEOUT_S: float = 0.05
 
     def __init__(
         self,
@@ -110,6 +122,8 @@ class StagePool:
         # Kept separate from the legacy ``_request_bindings`` so the two
         # binding shapes do not collide.
         self._affinity: dict[str, str] = {}
+        self._scheduler_snapshot_cache: dict[int, tuple[float, dict[str, Any]]] = {}
+        self._slo_tie_break_cursor = 0
 
     # ---- Stage-level properties ----
 
@@ -290,8 +304,9 @@ class StagePool:
         while True:
             candidates = self._collect_serviceable_replicas()
             if candidates:
+                slo_idx = await self._select_slo_aware_candidate_index(candidates, task)
                 # LB chose an index *into our candidates list*.
-                lb_idx = self._lb.select(task, [rep for rep, _ in candidates])
+                lb_idx = slo_idx if slo_idx is not None else self._lb.select(task, [rep for rep, _ in candidates])
                 replica_info, replica_id = candidates[lb_idx]
                 self._affinity[request_id] = replica_info.input_addr
                 return replica_id
@@ -535,8 +550,10 @@ class StagePool:
         params = params_override if params_override is not None else req_state.sampling_params_list[self.stage_id]
         submit_kwargs = dict(submit_kwargs or {})
         if self.stage_type == "diffusion":
+            task: Task = {"request_id": request_id, "sampling_params": params}
             replica_id = await self._pick_or_select(
                 request_id,
+                task=task,
                 affinity_request_id=affinity_request_id,
             )
             client = self._diffusion_client(replica_id)
@@ -621,12 +638,210 @@ class StagePool:
         self,
         request_id: str,
         *,
+        task: Task | None = None,
         affinity_request_id: str | None = None,
     ) -> int:
         """Bridge to ``pick`` in distributed mode or ``select_replica_id`` legacy."""
         if self.is_distributed:
-            return await self.pick(request_id, affinity_request_id=affinity_request_id)
+            return await self.pick(request_id, task=task, affinity_request_id=affinity_request_id)
+        if self.stage_type == "diffusion" and affinity_request_id is None and task is not None:
+            replica_id = await self._select_slo_aware_local_replica_id(task)
+            if replica_id is not None:
+                self._request_bindings[request_id] = replica_id
+                return replica_id
         return self.select_replica_id(request_id, affinity_request_id=affinity_request_id)
+
+    async def _select_slo_aware_candidate_index(
+        self,
+        candidates: list[tuple[ReplicaInfo, int]],
+        task: Task | None,
+    ) -> int | None:
+        if not self._task_has_deadline(task) or len(candidates) <= 1:
+            return None
+
+        snapshots = await asyncio.gather(
+            *(self._get_scheduler_snapshot(replica_id) for _, replica_id in candidates),
+            return_exceptions=True,
+        )
+        scored: list[tuple[float, int, int, int, int]] = []
+        cursor = self._slo_tie_break_cursor % len(candidates)
+        now_s = _time.time()
+        for idx, ((replica_info, _), snapshot) in enumerate(zip(candidates, snapshots, strict=False)):
+            if isinstance(snapshot, BaseException) or snapshot is None:
+                continue
+            predicted_laxity_ms = self._predict_task_laxity_ms(task, snapshot, now_s=now_s)
+            safe_capacity = int(snapshot.get("safe_admit_capacity", 0) or 0)
+            queue_length = int(snapshot.get("num_waiting", replica_info.queue_length) or 0) + int(
+                snapshot.get("num_running", 0) or 0
+            )
+            tie_rank = (idx - cursor) % len(candidates)
+            scored.append((-predicted_laxity_ms, -safe_capacity, queue_length, tie_rank, idx))
+
+        if not scored:
+            return None
+        selected_idx = min(scored)[-1]
+        self._slo_tie_break_cursor = (selected_idx + 1) % len(candidates)
+        return selected_idx
+
+    async def _select_slo_aware_local_replica_id(self, task: Task) -> int | None:
+        live = self.live_replica_ids()
+        if not self._task_has_deadline(task) or len(live) <= 1:
+            return None
+
+        snapshots = await asyncio.gather(
+            *(self._get_scheduler_snapshot(replica_id) for replica_id in live),
+            return_exceptions=True,
+        )
+        scored: list[tuple[float, int, int, int, int]] = []
+        cursor = self._slo_tie_break_cursor % len(live)
+        now_s = _time.time()
+        for idx, (replica_id, snapshot) in enumerate(zip(live, snapshots, strict=False)):
+            if isinstance(snapshot, BaseException) or snapshot is None:
+                continue
+            predicted_laxity_ms = self._predict_task_laxity_ms(task, snapshot, now_s=now_s)
+            safe_capacity = int(snapshot.get("safe_admit_capacity", 0) or 0)
+            queue_length = int(snapshot.get("num_waiting", 0) or 0) + int(snapshot.get("num_running", 0) or 0)
+            tie_rank = (idx - cursor) % len(live)
+            scored.append((-predicted_laxity_ms, -safe_capacity, queue_length, tie_rank, replica_id))
+
+        if not scored:
+            return None
+        selected_replica_id = min(scored)[-1]
+        selected_live_idx = live.index(selected_replica_id)
+        self._slo_tie_break_cursor = (selected_live_idx + 1) % len(live)
+        return selected_replica_id
+
+    async def _get_scheduler_snapshot(self, replica_id: int) -> dict[str, Any] | None:
+        now_s = _time.time()
+        cached = self._scheduler_snapshot_cache.get(replica_id)
+        if cached is not None:
+            cached_at_s, snapshot = cached
+            if now_s - cached_at_s <= self.SCHEDULER_SNAPSHOT_TTL_S:
+                return snapshot
+
+        if replica_id >= len(self.clients):
+            return None
+        client = self.clients[replica_id]
+        if client is None:
+            return None
+        rpc = getattr(client, "collective_rpc_async", None)
+        if not callable(rpc):
+            return None
+
+        try:
+            snapshot = await rpc(
+                "get_scheduler_load_snapshot",
+                timeout=self.SCHEDULER_SNAPSHOT_RPC_TIMEOUT_S,
+            )
+        except Exception:
+            return None
+
+        if not self._is_valid_scheduler_snapshot(snapshot):
+            return None
+        self._scheduler_snapshot_cache[replica_id] = (now_s, snapshot)
+        return snapshot
+
+    @staticmethod
+    def _is_valid_scheduler_snapshot(snapshot: Any) -> bool:
+        if not isinstance(snapshot, dict):
+            return False
+        if snapshot.get("supported") is False:
+            return False
+        if not isinstance(snapshot.get("timestamp_s"), (int, float)):
+            return False
+        if snapshot.get("policy") != "SloStepScheduler":
+            return False
+        buckets = snapshot.get("buckets", [])
+        if not isinstance(buckets, list):
+            return False
+        if not buckets:
+            return int(snapshot.get("safe_admit_capacity", 0) or 0) > 0
+        for bucket in buckets:
+            if not isinstance(bucket, dict):
+                return False
+            if not isinstance(bucket.get("estimated_step_ms"), (int, float)):
+                return False
+            if not isinstance(bucket.get("min_remaining_steps"), (int, float)):
+                return False
+        return True
+
+    def _predict_task_laxity_ms(
+        self,
+        task: Task | None,
+        snapshot: dict[str, Any],
+        *,
+        now_s: float | None = None,
+    ) -> float:
+        deadline_s = self._task_deadline_time_s(task)
+        if deadline_s is None:
+            return 0.0
+
+        now_s = _time.time() if now_s is None else now_s
+        sampling_params = None if task is None else task.get("sampling_params")
+        reference_cost_ms = _optional_float(getattr(sampling_params, "reference_cost_ms", None))
+        slo_ms = _optional_float(getattr(sampling_params, "slo_ms", None))
+        incoming_cost_ms = reference_cost_ms if reference_cost_ms is not None else (slo_ms / 3.0 if slo_ms else 0.0)
+        admit_delay_ms = self._estimate_admit_delay_ms(snapshot, self._sampling_key_dict(sampling_params))
+        return (deadline_s - now_s) * 1000.0 - admit_delay_ms - incoming_cost_ms
+
+    def _estimate_admit_delay_ms(
+        self,
+        snapshot: dict[str, Any],
+        incoming_key: dict[str, Any] | None,
+    ) -> float:
+        safe_capacity = int(snapshot.get("safe_admit_capacity", 0) or 0)
+        if safe_capacity > 0 and int(snapshot.get("num_waiting", 0) or 0) <= 0:
+            return 0.0
+
+        buckets = snapshot.get("buckets")
+        if not isinstance(buckets, list) or not buckets:
+            return float(snapshot.get("num_running", 0) or 0)
+
+        candidates: list[float] = []
+        for bucket in buckets:
+            if not isinstance(bucket, dict):
+                continue
+            estimated_step_ms = float(bucket.get("estimated_step_ms", 0.0) or 0.0)
+            min_remaining_steps = float(bucket.get("min_remaining_steps", 1.0) or 1.0)
+            delay_ms = max(estimated_step_ms * max(min_remaining_steps, 1.0), 0.0)
+            if bucket.get("key") == incoming_key:
+                delay_ms *= 0.95
+            candidates.append(delay_ms)
+        return min(candidates) if candidates else 0.0
+
+    def _task_has_deadline(self, task: Task | None) -> bool:
+        return self._task_deadline_time_s(task) is not None
+
+    def _task_deadline_time_s(self, task: Task | None) -> float | None:
+        if task is None:
+            return None
+        sampling_params = task.get("sampling_params")
+        if sampling_params is None:
+            return None
+        deadline_time_s = _optional_float(getattr(sampling_params, "deadline_time_s", None))
+        if deadline_time_s is not None:
+            return deadline_time_s
+        arrival_time_s = _optional_float(getattr(sampling_params, "arrival_time_s", None)) or _time.time()
+        slo_ms = _optional_float(getattr(sampling_params, "slo_ms", None))
+        if slo_ms is not None:
+            return arrival_time_s + slo_ms / 1000.0
+        reference_cost_ms = _optional_float(getattr(sampling_params, "reference_cost_ms", None))
+        if reference_cost_ms is not None:
+            return arrival_time_s + (3.0 * reference_cost_ms) / 1000.0
+        return None
+
+    @staticmethod
+    def _sampling_key_dict(sampling_params: Any) -> dict[str, Any] | None:
+        if sampling_params is None:
+            return None
+        lora_request = getattr(sampling_params, "lora_request", None)
+        out: dict[str, Any] = {}
+        for field in fields(SamplingParamsKey):
+            if field.name == "lora_int_id":
+                out[field.name] = None if lora_request is None else getattr(lora_request, "lora_int_id", None)
+            else:
+                out[field.name] = getattr(sampling_params, field.name)
+        return out
 
     # ---- Stage-local polling ----
 

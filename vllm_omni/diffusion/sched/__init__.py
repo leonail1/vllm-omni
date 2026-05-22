@@ -10,6 +10,7 @@ from vllm_omni.diffusion.sched.interface import (
     SchedulerInterface,
 )
 from vllm_omni.diffusion.sched.request_scheduler import RequestScheduler
+from vllm_omni.diffusion.sched.slo_step_scheduler import SloStepScheduler
 from vllm_omni.diffusion.sched.step_scheduler import StepScheduler
 
 Scheduler = RequestScheduler
@@ -22,6 +23,7 @@ __all__ = [
     "NewRequestData",
     "SchedulerInterface",
     "RequestScheduler",
+    "SloStepScheduler",
     "StepScheduler",
     "Scheduler",
 ]

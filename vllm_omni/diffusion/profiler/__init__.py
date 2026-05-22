@@ -4,5 +4,13 @@
 from vllm_omni.diffusion.profiler.diffusion_pipeline_profiler import (
     DiffusionPipelineProfilerMixin,
 )
+from vllm_omni.diffusion.profiler.step_cost_profiler import (
+    DiffusionStepCostProfiler,
+    DiffusionStepProfileConfig,
+)
 
-__all__ = ["DiffusionPipelineProfilerMixin"]
+__all__ = [
+    "DiffusionPipelineProfilerMixin",
+    "DiffusionStepCostProfiler",
+    "DiffusionStepProfileConfig",
+]

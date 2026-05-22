@@ -3,8 +3,10 @@
 
 from __future__ import annotations
 
+import time
 from collections import deque
 from dataclasses import fields
+from typing import Any
 
 from vllm.logger import init_logger
 
@@ -134,6 +136,15 @@ class _BaseScheduler(SchedulerInterface):
     def get_request_state(self, sched_req_id: str) -> DiffusionRequestState | None:
         return self._request_states.get(sched_req_id)
 
+    def get_load_snapshot(self) -> dict[str, Any]:
+        return {
+            "policy": self.__class__.__name__,
+            "timestamp_s": time.time(),
+            "num_waiting": len(self._waiting),
+            "num_running": len(self._running),
+            "max_num_running": self.max_num_running_reqs,
+        }
+
     def get_sched_req_id(self, request_id: str) -> str | None:
         return self._request_id_to_sched_req_id.get(request_id)
 
@@ -239,10 +250,29 @@ class _BaseScheduler(SchedulerInterface):
         """Remove subclass-owned per-request state before popping request state."""
 
     def _make_request_state(self, sched_req_id: str, request: OmniDiffusionRequest) -> DiffusionRequestState:
+        now_s = time.time()
+        sampling = request.sampling_params
+        arrival_time_s = _coerce_float(getattr(sampling, "arrival_time_s", None)) or now_s
+        reference_cost_ms = _coerce_float(getattr(sampling, "reference_cost_ms", None))
+        slo_ms = _coerce_float(getattr(sampling, "slo_ms", None))
+        deadline_time_s = _coerce_float(getattr(sampling, "deadline_time_s", None))
+        if deadline_time_s is None:
+            if slo_ms is not None:
+                deadline_time_s = arrival_time_s + slo_ms / 1000.0
+            elif reference_cost_ms is not None:
+                deadline_time_s = arrival_time_s + (3.0 * reference_cost_ms) / 1000.0
+        if hasattr(sampling, "arrival_time_s"):
+            sampling.arrival_time_s = arrival_time_s
+        if hasattr(sampling, "deadline_time_s"):
+            sampling.deadline_time_s = deadline_time_s
         return DiffusionRequestState(
             sched_req_id=sched_req_id,
             req=request,
             sampling_params_key=get_sampling_params_key(request),
+            arrival_time_s=arrival_time_s,
+            deadline_time_s=deadline_time_s,
+            reference_cost_ms=reference_cost_ms,
+            slo_ms=slo_ms,
         )
 
     def _can_schedule_waiting(self, state: DiffusionRequestState) -> bool:
@@ -279,3 +309,12 @@ class _BaseScheduler(SchedulerInterface):
         if request_id := getattr(request, "request_id", None):
             request_ids.append(request_id)
         return list(dict.fromkeys(request_ids))
+
+
+def _coerce_float(value: Any) -> float | None:
+    if value is None:
+        return None
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None

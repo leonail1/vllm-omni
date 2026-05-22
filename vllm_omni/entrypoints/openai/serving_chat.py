@@ -107,6 +107,15 @@ from vllm_omni.outputs import OmniRequestOutput
 logger = init_logger(__name__)
 
 
+def _optional_float(value: Any) -> float | None:
+    if value is None:
+        return None
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
 class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
     """OpenAI-compatible chat serving for both LLM and Diffusion models.
 
@@ -499,6 +508,12 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
                         sp.width = _image_gen_width
                     if hasattr(sp, "num_inference_steps") and num_inference_steps is not None:
                         sp.num_inference_steps = num_inference_steps
+                    if (
+                        hasattr(sp, "reference_cost_ms")
+                        and request.modalities
+                        and ("image" in request.modalities)
+                    ):
+                        self._apply_diffusion_slo_metadata(sp, extra_body)
                     if hasattr(sp, "extra_args") and sp.extra_args is not None:
                         if cfg_text_scale is not None:
                             sp.extra_args["cfg_text_scale"] = cfg_text_scale
@@ -2267,7 +2282,7 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
         num_outputs_per_prompt = gen_params.num_outputs_per_prompt
         num_inference_steps = extra_body.get("num_inference_steps")
         guidance_scale = extra_body.get("guidance_scale")
-        true_cfg_scale = extra_body.get("true_cfg_scale") or extra_body.get("cfg_scale")
+        true_cfg_scale = self._resolve_true_cfg_scale_from_extra_body(extra_body)
         negative_prompt = extra_body.get("negative_prompt")
         num_frames = extra_body.get("num_frames")
         guidance_scale_2 = extra_body.get("guidance_scale_2")
@@ -2451,12 +2466,13 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
             num_outputs_per_prompt=num_outputs_per_prompt,
             seed=seed,
         )
+        self._apply_diffusion_slo_metadata(gen_params, extra_body)
         self._set_if_supported(
             gen_params,
             generator_device=generator_device,
             num_inference_steps=extra_body.get("num_inference_steps"),
             guidance_scale=extra_body.get("guidance_scale"),
-            true_cfg_scale=extra_body.get("true_cfg_scale") or extra_body.get("cfg_scale"),
+            true_cfg_scale=self._resolve_true_cfg_scale_from_extra_body(extra_body),
             num_frames=extra_body.get("num_frames"),
             guidance_scale_2=extra_body.get("guidance_scale_2"),
             layers=extra_body.get("layers"),
@@ -2604,7 +2620,7 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
             # not provide a value.
             num_inference_steps = extra_body.get("num_inference_steps")
             guidance_scale = extra_body.get("guidance_scale")
-            true_cfg_scale = extra_body.get("true_cfg_scale") or extra_body.get("cfg_scale")
+            true_cfg_scale = self._resolve_true_cfg_scale_from_extra_body(extra_body)
             cfg_text_scale = extra_body.get("cfg_text_scale")
             cfg_img_scale = extra_body.get("cfg_img_scale")
             seed = extra_body.get("seed")
@@ -2655,6 +2671,7 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
                 num_outputs_per_prompt=num_outputs_per_prompt,
                 seed=seed,
             )
+            self._apply_diffusion_slo_metadata(gen_params, extra_body)
 
             # Only override defaults when the user explicitly provides values
             if num_inference_steps is not None:
@@ -3026,6 +3043,28 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
         return out
 
     @staticmethod
+    def _apply_diffusion_slo_metadata(
+        sampling_params: OmniDiffusionSamplingParams,
+        extra_body: dict[str, Any],
+    ) -> None:
+        """Attach request-level SLO metadata for diffusion-stage scheduling."""
+        reference_cost_ms = _optional_float(extra_body.get("reference_cost_ms"))
+        slo_ms = _optional_float(extra_body.get("slo_ms"))
+        arrival_time_s = _optional_float(extra_body.get("arrival_time_s"))
+        deadline_time_s = _optional_float(extra_body.get("deadline_time_s"))
+
+        if reference_cost_ms is not None:
+            sampling_params.reference_cost_ms = reference_cost_ms
+        if slo_ms is not None:
+            sampling_params.slo_ms = slo_ms
+        if arrival_time_s is None:
+            arrival_time_s = time.time()
+        sampling_params.arrival_time_s = arrival_time_s
+        if deadline_time_s is None and slo_ms is not None:
+            deadline_time_s = arrival_time_s + slo_ms / 1000.0
+        sampling_params.deadline_time_s = deadline_time_s
+
+    @staticmethod
     def _resolve_height_width_from_extra_body(extra_body: dict[str, Any]) -> tuple[Any, Any]:
         """Extract generation height/width with optional size string fallback."""
         height = extra_body.get("height")
@@ -3041,6 +3080,13 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
                 logger.warning("Invalid size format: %s", extra_body.get("size"))
 
         return height, width
+
+    @staticmethod
+    def _resolve_true_cfg_scale_from_extra_body(extra_body: dict[str, Any]) -> Any:
+        """Prefer explicit true_cfg_scale while preserving falsy values such as 0.0."""
+        if "true_cfg_scale" in extra_body:
+            return extra_body.get("true_cfg_scale")
+        return extra_body.get("cfg_scale")
 
     def _create_error_response(
         self,

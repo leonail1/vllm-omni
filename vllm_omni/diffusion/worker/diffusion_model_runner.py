@@ -30,6 +30,7 @@ from vllm_omni.diffusion.forward_context import set_forward_context
 from vllm_omni.diffusion.model_loader.diffusers_loader import DiffusersPipelineLoader
 from vllm_omni.diffusion.models.interface import supports_step_execution
 from vllm_omni.diffusion.offloader import get_offload_backend
+from vllm_omni.diffusion.profiler import DiffusionStepCostProfiler
 from vllm_omni.diffusion.registry import _NO_CACHE_ACCELERATION
 from vllm_omni.diffusion.request import OmniDiffusionRequest
 from vllm_omni.diffusion.sched.interface import DiffusionSchedulerOutput
@@ -74,6 +75,7 @@ class DiffusionModelRunner(OmniConnectorModelRunnerMixin):
 
         # Cache for per-request stepwise state.
         self.state_cache: dict[str, DiffusionRequestState] = {}
+        self.step_cost_profiler = DiffusionStepCostProfiler.from_od_config(od_config, device=device)
 
         # Initialize KV cache manager for connector management
         self.kv_transfer_manager = OmniKVTransferManager.from_od_config(od_config)
@@ -431,20 +433,31 @@ class DiffusionModelRunner(OmniConnectorModelRunnerMixin):
 
         use_hsdp = self.od_config.parallel_config.use_hsdp
         grad_context = torch.no_grad() if use_hsdp else torch.inference_mode()
+        profiler = getattr(self, "step_cost_profiler", None)
+        if profiler is not None and not profiler.enabled:
+            profiler = None
         with grad_context:
+            total_start_s = profiler.timer_start() if profiler is not None else 0.0
+            prepare_start_s = profiler.timer_start() if profiler is not None else 0.0
             states, new_request_ids = self._update_states(scheduler_output)
             input_batch = self._prepare_batch_inputs(states, new_request_ids)
             attn_metadata = self._prepare_attn_metadata(input_batch)
+            profile_step_indices = [int(state.step_index) for state in states]
+            prepare_batch_ms = profiler.timer_end_ms(prepare_start_s) if profiler is not None else 0.0
 
             with set_forward_context(
                 vllm_config=self.vllm_config,
                 omni_diffusion_config=self.od_config,
                 attn_metadata=attn_metadata,
             ):
+                denoise_start_s = profiler.timer_start() if profiler is not None else 0.0
                 noise_pred = self.pipeline.denoise_step(input_batch)
+                denoise_ms = profiler.timer_end_ms(denoise_start_s) if profiler is not None else 0.0
 
                 runner_output_list = []
                 pipeline_interrupted = getattr(self.pipeline, "interrupt", False)
+                step_scheduler_ms = 0.0
+                post_decode_ms = 0.0
                 if noise_pred is None and pipeline_interrupted:
                     for state in states:
                         runner_output_list.append(
@@ -460,12 +473,24 @@ class DiffusionModelRunner(OmniConnectorModelRunnerMixin):
                     offset = 0
                     for req in states:
                         row_num = req.latents.shape[0]
+                        step_scheduler_start_s = profiler.timer_start() if profiler is not None else 0.0
                         self.pipeline.step_scheduler(
                             req, noise_pred[offset : offset + row_num] if noise_pred is not None else None
                         )
+                        step_scheduler_ms += (
+                            profiler.timer_end_ms(step_scheduler_start_s)
+                            if profiler is not None
+                            else 0.0
+                        )
                         offset = offset + row_num
                         if req.denoise_completed:
+                            post_decode_start_s = profiler.timer_start() if profiler is not None else 0.0
                             result = self.pipeline.post_decode(req)
+                            post_decode_ms += (
+                                profiler.timer_end_ms(post_decode_start_s)
+                                if profiler is not None
+                                else 0.0
+                            )
                         else:
                             result = None
                         runner_output_list.append(
@@ -484,5 +509,20 @@ class DiffusionModelRunner(OmniConnectorModelRunnerMixin):
                         )
 
                 self._update_states_after(states, input_batch, pipeline_interrupted)
+                total_step_ms = profiler.timer_end_ms(total_start_s) if profiler is not None else 0.0
+                if profiler is not None:
+                    profiler.write_step_record(
+                        scheduler_output=scheduler_output,
+                        states=states,
+                        timings_ms={
+                            "prepare_batch_ms": prepare_batch_ms,
+                            "denoise_ms": denoise_ms,
+                            "step_scheduler_ms": step_scheduler_ms,
+                            "post_decode_ms": post_decode_ms,
+                            "total_step_ms": total_step_ms,
+                        },
+                        interrupted=bool(pipeline_interrupted),
+                        step_indices=profile_step_indices,
+                    )
 
                 return BatchRunnerOutput.from_list(runner_output_list)

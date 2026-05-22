@@ -526,7 +526,10 @@ class TraceDataset(BaseDataset):
         seed = self._coerce_int(row.get("seed"))
         fps = self._coerce_int(row.get("fps"))
         timestamp = self._coerce_float(row.get("timestamp"))
+        reference_cost_ms = self._coerce_float(row.get("reference_cost_ms"))
         slo_ms = self._coerce_float(row.get("slo_ms"))
+        arrival_time_s = self._coerce_float(row.get("arrival_time_s"))
+        deadline_time_s = self._coerce_float(row.get("deadline_time_s"))
         image_paths = row.get("image_paths")
         if not image_paths:
             single = row.get("image_path")
@@ -557,7 +560,10 @@ class TraceDataset(BaseDataset):
             seed=seed if seed is not None else self.args.seed,
             fps=fps if fps is not None else self.args.fps,
             timestamp=timestamp,
+            reference_cost_ms=reference_cost_ms,
             slo_ms=slo_ms,
+            arrival_time_s=arrival_time_s,
+            deadline_time_s=deadline_time_s,
             image_paths=image_paths,
             request_id=str(row.get("request_id")) if row.get("request_id") is not None else str(uuid.uuid4()),
         )
@@ -616,6 +622,12 @@ class RandomDataset(BaseDataset):
         if self._sampled_requests:
             profile = self._sampled_requests[idx]
             params.update(profile)
+        profile_extra_body = params.pop("extra_body", None)
+        if isinstance(profile_extra_body, dict):
+            extra_body.update(profile_extra_body)
+        for key in list(params.keys()):
+            if key not in RequestFuncInput.__dataclass_fields__:
+                extra_body[key] = params.pop(key)
         return RequestFuncInput(
             prompt=f"Random prompt {idx} for benchmarking diffusion models",
             api_url=self.api_url,
@@ -721,24 +733,45 @@ def _populate_slo_ms_from_warmups(
     Returns updated requests_list.
     """
 
-    if not any(req.slo_ms is None for req in requests_list):
-        return requests_list
-
-    base_time_ms = _infer_slo_base_time_ms_from_warmups(warmup_pairs, args)
-    if base_time_ms is None:
-        return requests_list
-
     slo_scale = float(getattr(args, "slo_scale", 3.0))
     if slo_scale <= 0:
         raise ValueError(f"slo_scale must be positive, got {slo_scale}.")
 
-    updated: list[RequestFuncInput] = []
+    normalized: list[RequestFuncInput] = []
+    need_warmup_estimate = False
     for req in requests_list:
+        if req.reference_cost_ms is not None and req.slo_ms is None:
+            # 第一阶段实验假设 reference cost 由 offline profile 得到；
+            # 此时直接按 SLO = scale * reference cost 生成，不再用 warmup 覆盖。
+            normalized.append(replace(req, slo_ms=req.reference_cost_ms * slo_scale))
+            continue
+        if req.reference_cost_ms is None and req.slo_ms is not None:
+            normalized.append(replace(req, reference_cost_ms=req.slo_ms / slo_scale))
+            continue
+        normalized.append(req)
+        if req.slo_ms is None:
+            need_warmup_estimate = True
+
+    if not need_warmup_estimate:
+        return normalized
+
+    base_time_ms = _infer_slo_base_time_ms_from_warmups(warmup_pairs, args)
+    if base_time_ms is None:
+        return normalized
+
+    updated: list[RequestFuncInput] = []
+    for req in normalized:
         if req.slo_ms is not None:
             updated.append(req)
             continue
         expected_ms = _compute_expected_latency_ms_from_base(req, args, base_time_ms)
-        updated.append(replace(req, slo_ms=(expected_ms * slo_scale) if expected_ms is not None else None))
+        updated.append(
+            replace(
+                req,
+                reference_cost_ms=expected_ms,
+                slo_ms=(expected_ms * slo_scale) if expected_ms is not None else None,
+            )
+        )
 
     return updated
 
@@ -757,11 +790,43 @@ async def iter_requests(
         if request_rate <= 0:
             raise ValueError(f"request_rate must be positive or inf, got {request_rate}.")
 
+    start_perf_s = time.perf_counter()
+    start_wall_s = time.time()
+    trace_timestamps = [req.timestamp for req in requests_list if req.timestamp is not None]
+    trace_base_ts = min(trace_timestamps) if trace_timestamps else None
+
     for i, req in enumerate(requests_list):
-        if request_rate != float("inf") and i > 0:
+        planned_perf_s: float
+        if trace_base_ts is not None and req.timestamp is not None:
+            planned_perf_s = start_perf_s + max(0.0, float(req.timestamp) - float(trace_base_ts))
+            sleep_s = planned_perf_s - time.perf_counter()
+            if sleep_s > 0:
+                await asyncio.sleep(sleep_s)
+        elif request_rate != float("inf") and i > 0:
             interval_s = random.expovariate(request_rate)
             await asyncio.sleep(interval_s)
-        yield req
+            planned_perf_s = time.perf_counter()
+        else:
+            planned_perf_s = time.perf_counter()
+
+        source_arrival_time_s = req.arrival_time_s
+        arrival_time_s = start_wall_s + (planned_perf_s - start_perf_s)
+        deadline_time_s = req.deadline_time_s
+        if deadline_time_s is not None and source_arrival_time_s is not None:
+            # 重放历史 trace 时，保留“deadline - arrival”的相对预算，
+            # 但把 arrival/deadline 映射到本次压测的 wall-clock。
+            deadline_time_s = arrival_time_s + (deadline_time_s - source_arrival_time_s)
+        elif deadline_time_s is not None and source_arrival_time_s is None:
+            raise ValueError("Trace rows with deadline_time_s must also provide arrival_time_s.")
+        elif deadline_time_s is None and req.slo_ms is not None:
+            deadline_time_s = arrival_time_s + req.slo_ms / 1000.0
+        yield replace(
+            req,
+            arrival_time_s=arrival_time_s,
+            deadline_time_s=deadline_time_s,
+            planned_arrival_perf_s=planned_perf_s,
+            task_created_perf_s=time.perf_counter(),
+        )
 
 
 def _make_warmup_request(
@@ -856,7 +921,7 @@ def calculate_metrics(
         slo_met_success = 0
 
         for req, out in zip(requests_list, outputs):
-            if req.slo_ms is None:
+            if req.slo_ms is None and req.deadline_time_s is None:
                 continue
             slo_defined_total += 1
             if out.slo_achieved is None:
@@ -875,6 +940,49 @@ def calculate_metrics(
         )
 
     return metrics
+
+
+def build_request_records(
+    requests_list: list[RequestFuncInput],
+    outputs: list[RequestFuncOutput],
+) -> list[dict[str, Any]]:
+    records: list[dict[str, Any]] = []
+    for req, out in zip(requests_list, outputs):
+        start_from_arrival_s = None
+        if req.planned_arrival_perf_s is not None and out.end_time > 0:
+            start_from_arrival_s = out.end_time - req.planned_arrival_perf_s
+        response_id = None
+        if isinstance(out.response_body, dict):
+            response_id = out.response_body.get("id")
+        records.append(
+            {
+                "request_id": req.request_id,
+                "response_id": response_id,
+                "prompt": req.prompt,
+                "width": req.width,
+                "height": req.height,
+                "num_frames": req.num_frames,
+                "num_inference_steps": req.num_inference_steps,
+                "fps": req.fps,
+                "timestamp": req.timestamp,
+                "reference_cost_ms": req.reference_cost_ms,
+                "slo_ms": req.slo_ms,
+                "arrival_time_s": req.arrival_time_s,
+                "deadline_time_s": req.deadline_time_s,
+                "planned_arrival_perf_s": req.planned_arrival_perf_s,
+                "task_created_perf_s": req.task_created_perf_s,
+                "send_start_perf_s": out.start_time,
+                "response_end_perf_s": out.end_time,
+                "latency_s": out.latency,
+                "arrival_to_completion_s": start_from_arrival_s,
+                "success": out.success,
+                "error": out.error,
+                "slo_achieved": out.slo_achieved,
+                "stage_durations": out.stage_durations,
+                "peak_memory_mb": out.peak_memory_mb,
+            }
+        )
+    return records
 
 
 def wait_for_service(base_url: str, timeout: int = 120) -> None:
@@ -995,7 +1103,9 @@ async def benchmark(args):
 
         start_time = time.perf_counter()
         tasks = []
+        scheduled_requests = []
         async for req in iter_requests(requests_list=requests_list, request_rate=args.request_rate):
+            scheduled_requests.append(req)
             task = asyncio.create_task(limited_request_func(req, session, pbar))
             tasks.append(task)
 
@@ -1003,6 +1113,7 @@ async def benchmark(args):
         total_duration = time.perf_counter() - start_time
 
     pbar.close()
+    requests_list = scheduled_requests
 
     # Calculate metrics
     metrics = calculate_metrics(outputs, total_duration, requests_list, args, args.slo)
@@ -1065,8 +1176,12 @@ async def benchmark(args):
     print("\n" + "=" * 60)
 
     if args.output_file:
+        output_payload = {
+            "metrics": metrics,
+            "requests": build_request_records(requests_list, outputs),
+        }
         with open(args.output_file, "w") as f:
-            json.dump(metrics, f, indent=2)
+            json.dump(output_payload, f, indent=2)
         print(f"Metrics saved to {args.output_file}")
 
 

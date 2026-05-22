@@ -145,6 +145,13 @@ class ImageGenerationRequest(BaseModel):
         description="Output image format: 'png', 'jpeg', or 'webp'. Defaults to 'png'.",
     )
 
+    # SLO-aware scheduler metadata. These fields are optional and ignored by
+    # non-SLO schedulers.
+    reference_cost_ms: float | None = Field(default=None, description="Offline-profiled reference execution cost.")
+    slo_ms: float | None = Field(default=None, description="Request SLO budget in milliseconds.")
+    arrival_time_s: float | None = Field(default=None, description="Client-side arrival timestamp in seconds.")
+    deadline_time_s: float | None = Field(default=None, description="Absolute request deadline timestamp in seconds.")
+
 
 class ImageData(BaseModel):
     """Single generated image data"""

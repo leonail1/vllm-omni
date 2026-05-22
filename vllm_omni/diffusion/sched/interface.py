@@ -8,7 +8,7 @@ import uuid
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from functools import cached_property
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 from vllm.logger import init_logger
 
@@ -83,6 +83,10 @@ class DiffusionRequestState:
     sampling_params_key: SamplingParamsKey | None = None
     status: DiffusionRequestStatus = DiffusionRequestStatus.WAITING
     error: str | None = None
+    arrival_time_s: float = 0.0
+    deadline_time_s: float | None = None
+    reference_cost_ms: float | None = None
+    slo_ms: float | None = None
 
     def is_finished(self) -> bool:
         return DiffusionRequestStatus.is_finished(self.status)
@@ -185,6 +189,10 @@ class SchedulerInterface(ABC):
     @abstractmethod
     def get_request_state(self, sched_req_id: str) -> DiffusionRequestState | None:
         """Return request state if present."""
+
+    def get_load_snapshot(self) -> dict[str, Any]:
+        """Return a best-effort scheduler load snapshot for StagePool routing."""
+        return {}
 
     @abstractmethod
     def has_requests(self) -> bool:

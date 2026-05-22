@@ -284,6 +284,13 @@ class OmniDiffusionSamplingParams:
     # Extra parameters that might be needed by specific pipeline implementations
     extra_args: dict[str, Any] = field(default_factory=dict)
 
+    # SLO-aware scheduling metadata. ``reference_cost_ms`` is produced by
+    # offline profiling, and ``slo_ms`` is normally set to 3x that cost.
+    reference_cost_ms: float | None = None
+    slo_ms: float | None = None
+    arrival_time_s: float | None = None
+    deadline_time_s: float | None = None
+
     # Misc
     save_output: bool = True
     return_frames: bool = False

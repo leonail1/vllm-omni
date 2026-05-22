@@ -756,7 +756,7 @@ class QwenImagePipeline(nn.Module, QwenImageCFGParallelMixin, DiffusionPipelineP
             guidance_scale=sampling.guidance_scale if sampling.guidance_scale_provided else 1.0,
             num_images_per_prompt=sampling.num_outputs_per_prompt if sampling.num_outputs_per_prompt > 0 else 1,
             generator=sampling.generator,
-            true_cfg_scale=sampling.true_cfg_scale or 4.0,
+            true_cfg_scale=sampling.true_cfg_scale if sampling.true_cfg_scale is not None else 4.0,
             max_sequence_length=sampling.max_sequence_length or self.tokenizer_max_length,
             attention_kwargs=kwargs.get("attention_kwargs"),
         )
@@ -994,7 +994,11 @@ class QwenImagePipeline(nn.Module, QwenImageCFGParallelMixin, DiffusionPipelineP
         sigmas = req.sampling_params.sigmas or sigmas
         max_sequence_length = req.sampling_params.max_sequence_length or max_sequence_length
         generator = req.sampling_params.generator or generator
-        true_cfg_scale = req.sampling_params.true_cfg_scale or true_cfg_scale
+        true_cfg_scale = (
+            req.sampling_params.true_cfg_scale
+            if req.sampling_params.true_cfg_scale is not None
+            else true_cfg_scale
+        )
         if req.sampling_params.guidance_scale_provided:
             guidance_scale = req.sampling_params.guidance_scale
         num_images_per_prompt = (

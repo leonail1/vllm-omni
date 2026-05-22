@@ -18,6 +18,7 @@ from vllm_omni.diffusion.sched import (
     RequestScheduler,
     Scheduler,
     SchedulerInterface,
+    SloStepScheduler,
     StepScheduler,
 )
 from vllm_omni.diffusion.sched.interface import CachedRequestData, NewRequestData
@@ -75,6 +76,23 @@ def _make_step_request(
         ),
         request_ids=[req_id],
     )
+
+
+def _make_slo_step_request(
+    req_id: str,
+    *,
+    reference_cost_ms: float,
+    slo_ms: float,
+    num_inference_steps: int = 4,
+    height: int | None = None,
+) -> OmniDiffusionRequest:
+    sampling_params = OmniDiffusionSamplingParams(
+        height=height,
+        num_inference_steps=num_inference_steps,
+        reference_cost_ms=reference_cost_ms,
+        slo_ms=slo_ms,
+    )
+    return _make_step_request(req_id, sampling_params=sampling_params)
 
 
 def _new_ids(sched_output) -> list[str]:
@@ -965,3 +983,178 @@ class TestStepScheduler:
 
         with pytest.raises(ValueError):
             self.scheduler.add_request(request)
+
+
+class TestSloStepScheduler:
+    def _make_scheduler(self, max_num_seqs: int = 1, slo_config: dict | None = None) -> SloStepScheduler:
+        config = {"batch_growth_alpha": 0.0}
+        if slo_config:
+            config.update(slo_config)
+        scheduler = SloStepScheduler()
+        scheduler.initialize(
+            SimpleNamespace(
+                max_num_seqs=max_num_seqs,
+                additional_config={"diffusion_slo_scheduler": config},
+            )
+        )
+        return scheduler
+
+    def test_skips_incompatible_fifo_head_to_form_urgent_bucket(self) -> None:
+        scheduler = self._make_scheduler(max_num_seqs=3)
+
+        req_a = scheduler.add_request(_make_slo_step_request("a", reference_cost_ms=300, slo_ms=1000))
+        scheduler.add_request(_make_slo_step_request("b", reference_cost_ms=100, slo_ms=10000, height=768))
+        req_c = scheduler.add_request(_make_slo_step_request("c", reference_cost_ms=300, slo_ms=1000))
+        req_d = scheduler.add_request(_make_slo_step_request("d", reference_cost_ms=300, slo_ms=1000))
+
+        sched_output = scheduler.schedule()
+
+        assert _new_ids(sched_output) == [req_a, req_c, req_d]
+        assert sched_output.num_running_reqs == 3
+        assert sched_output.num_waiting_reqs == 1
+
+    def test_uses_completion_aware_laxity_instead_of_earliest_deadline_only(self) -> None:
+        scheduler = self._make_scheduler(max_num_seqs=1)
+
+        scheduler.add_request(_make_slo_step_request("early-cheap", reference_cost_ms=100, slo_ms=2000))
+        later_expensive = scheduler.add_request(
+            _make_slo_step_request("later-expensive", reference_cost_ms=2900, slo_ms=3000, height=768)
+        )
+
+        sched_output = scheduler.schedule()
+
+        assert _new_ids(sched_output) == [later_expensive]
+        assert sched_output.num_waiting_reqs == 1
+
+    def test_can_skip_running_bucket_at_step_boundary(self) -> None:
+        scheduler = self._make_scheduler(max_num_seqs=2)
+
+        running = scheduler.add_request(_make_slo_step_request("running", reference_cost_ms=100, slo_ms=10000))
+        first = scheduler.schedule()
+        assert _new_ids(first) == [running]
+        assert scheduler.update_from_output(first, _make_step_output(running, step_index=1)) == set()
+
+        urgent = scheduler.add_request(_make_slo_step_request("urgent", reference_cost_ms=100, slo_ms=200, height=768))
+        second = scheduler.schedule()
+
+        assert _new_ids(second) == [urgent]
+        assert _cached_ids(second) == []
+        assert scheduler.get_request_state(running).status == DiffusionRequestStatus.PREEMPTED
+        assert running in list(scheduler._waiting)
+
+    def test_can_switch_to_urgent_waiting_bucket_when_running_is_full(self) -> None:
+        scheduler = self._make_scheduler(max_num_seqs=1)
+
+        running = scheduler.add_request(_make_slo_step_request("running", reference_cost_ms=100, slo_ms=10000))
+        first = scheduler.schedule()
+        assert _new_ids(first) == [running]
+        assert scheduler.update_from_output(first, _make_step_output(running, step_index=1)) == set()
+
+        urgent = scheduler.add_request(_make_slo_step_request("urgent", reference_cost_ms=100, slo_ms=200, height=768))
+        second = scheduler.schedule()
+
+        assert _new_ids(second) == [urgent]
+        assert _cached_ids(second) == []
+        assert scheduler.get_request_state(running).status == DiffusionRequestStatus.PREEMPTED
+        assert running in list(scheduler._waiting)
+
+    def test_none_sampling_key_requests_are_singleton_buckets(self) -> None:
+        scheduler = self._make_scheduler(max_num_seqs=2)
+
+        req_a = scheduler.add_request(
+            OmniDiffusionRequest(
+                prompts=["a0", "a1"],
+                sampling_params=OmniDiffusionSamplingParams(
+                    num_inference_steps=4,
+                    reference_cost_ms=100,
+                    slo_ms=1000,
+                ),
+                request_ids=["a0", "a1"],
+            )
+        )
+        req_b = scheduler.add_request(
+            OmniDiffusionRequest(
+                prompts=["b0", "b1"],
+                sampling_params=OmniDiffusionSamplingParams(
+                    num_inference_steps=4,
+                    reference_cost_ms=100,
+                    slo_ms=1000,
+                ),
+                request_ids=["b0", "b1"],
+            )
+        )
+
+        sched_output = scheduler.schedule()
+
+        assert len(_new_ids(sched_output)) == 1
+        assert _new_ids(sched_output)[0] in {req_a, req_b}
+        assert sched_output.num_waiting_reqs == 1
+
+    def test_same_bucket_admits_most_urgent_waiting_requests(self) -> None:
+        scheduler = self._make_scheduler(max_num_seqs=2)
+
+        loose_1 = scheduler.add_request(_make_slo_step_request("loose-1", reference_cost_ms=100, slo_ms=10000))
+        urgent = scheduler.add_request(_make_slo_step_request("urgent", reference_cost_ms=100, slo_ms=300))
+        loose_2 = scheduler.add_request(_make_slo_step_request("loose-2", reference_cost_ms=100, slo_ms=10000))
+
+        sched_output = scheduler.schedule()
+
+        assert urgent in _new_ids(sched_output)
+        assert len(_new_ids(sched_output)) == 2
+        assert {loose_1, loose_2}.intersection(_new_ids(sched_output))
+
+    def test_deadline_guard_skips_extra_requests_when_batch_would_miss(self) -> None:
+        scheduler = self._make_scheduler(
+            max_num_seqs=3,
+            slo_config={
+                "batch_growth_alpha": 5.0,
+                "min_laxity_guard_ms": 0.0,
+            },
+        )
+
+        urgent = scheduler.add_request(_make_slo_step_request("urgent", reference_cost_ms=300, slo_ms=350))
+        scheduler.add_request(_make_slo_step_request("loose-1", reference_cost_ms=300, slo_ms=10000))
+        scheduler.add_request(_make_slo_step_request("loose-2", reference_cost_ms=300, slo_ms=10000))
+
+        sched_output = scheduler.schedule()
+
+        assert _new_ids(sched_output) == [urgent]
+        assert sched_output.num_waiting_reqs == 2
+
+    def test_no_deadline_requests_preserve_step_scheduler_fifo(self) -> None:
+        scheduler = self._make_scheduler(max_num_seqs=3)
+
+        req_a = scheduler.add_request(_make_step_request("a"))
+        req_b = scheduler.add_request(
+            _make_step_request(
+                "b",
+                sampling_params=OmniDiffusionSamplingParams(
+                    height=768,
+                    num_inference_steps=4,
+                ),
+            )
+        )
+        scheduler.add_request(_make_step_request("c"))
+
+        first = scheduler.schedule()
+
+        assert _new_ids(first) == [req_a]
+        assert first.num_waiting_reqs == 2
+
+        scheduler.update_from_output(first, _make_step_output(req_a, step_index=4, finished=True))
+        second = scheduler.schedule()
+
+        assert _new_ids(second) == [req_b]
+        assert second.num_waiting_reqs == 1
+
+    def test_load_snapshot_exposes_bucket_cost_and_capacity(self) -> None:
+        scheduler = self._make_scheduler(max_num_seqs=2)
+        scheduler.add_request(_make_slo_step_request("a", reference_cost_ms=100, slo_ms=1000))
+        scheduler.add_request(_make_slo_step_request("b", reference_cost_ms=100, slo_ms=1000, height=768))
+
+        snapshot = scheduler.get_load_snapshot()
+
+        assert snapshot["policy"] == "SloStepScheduler"
+        assert snapshot["safe_admit_capacity"] == 2
+        assert len(snapshot["buckets"]) == 2
+        assert all(bucket["estimated_step_ms"] > 0 for bucket in snapshot["buckets"])

@@ -1,0 +1,13 @@
+{
+  "updated_at": "2026-05-23 00:25:52",
+  "phase": "completed",
+  "message": "latent/aspect profile 完成：/home/lzg/vllm-omni/benchmark_outputs/latent_token_aspect_profile_20260522_215548",
+  "outdir": "/home/lzg/vllm-omni/benchmark_outputs/latent_token_aspect_profile_20260522_215548",
+  "raw": "/home/lzg/vllm-omni/benchmark_outputs/latent_token_aspect_profile_20260522_215548/step_cost_raw.jsonl",
+  "server_pid": "3006408",
+  "raw_rows": 13757,
+  "manifest_rows": 272,
+  "has_aspect_equivalence_table.csv": true,
+  "has_model_comparison.json": true,
+  "has_latent_token_report.md": true
+}

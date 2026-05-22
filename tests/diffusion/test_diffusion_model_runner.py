@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import json
 from contextlib import contextmanager
 from types import SimpleNamespace
 
@@ -10,6 +11,7 @@ import torch
 import vllm_omni.diffusion.worker.diffusion_model_runner as model_runner_module
 from tests.helpers.mark import hardware_test
 from vllm_omni.diffusion.worker.diffusion_model_runner import DiffusionModelRunner
+from vllm_omni.diffusion.worker.utils import DiffusionRequestState
 
 pytestmark = [pytest.mark.diffusion]
 
@@ -63,6 +65,140 @@ def _make_runner(cache_backend, cache_backend_name: str, enable_cache_dit_summar
         receive_multi_kv_cache_distributed=lambda req, cfg_kv_collect_func=None, target_device=None: None,
     )
     return runner
+
+
+def _make_stepwise_runner(tmp_path):
+    class _StepPipeline:
+        interrupt = False
+
+        def denoise_step(self, input_batch):
+            return torch.ones(input_batch.num_reqs, 1)
+
+        def step_scheduler(self, req, noise_pred):
+            del noise_pred
+            req.step_index += 1
+
+        def post_decode(self, req):
+            return SimpleNamespace(decoded=req.req_id)
+
+    runner = object.__new__(DiffusionModelRunner)
+    runner.vllm_config = object()
+    runner.device = torch.device("cpu")
+    runner.pipeline = _StepPipeline()
+    runner.cache_backend = None
+    runner.offload_backend = None
+    runner.state_cache = {}
+    runner.od_config = SimpleNamespace(
+        model="Qwen/Qwen-Image",
+        stage_id=0,
+        cache_backend="none",
+        max_num_seqs=2,
+        omni_replica_id=0,
+        parallel_config=SimpleNamespace(use_hsdp=False, tensor_parallel_size=2),
+        additional_config={
+            "diffusion_step_profile": {
+                "enabled": True,
+                "output_path": str(tmp_path / "step_cost_raw.jsonl"),
+                "sync_device": False,
+            }
+        },
+    )
+    runner.step_cost_profiler = model_runner_module.DiffusionStepCostProfiler.from_od_config(
+        runner.od_config,
+        device=runner.device,
+    )
+    runner.supports_step_mode = lambda: True
+    return runner
+
+
+def test_execute_stepwise_emits_step_cost_profile_record(tmp_path, monkeypatch):
+    monkeypatch.setenv("RANK", "0")
+    runner = _make_stepwise_runner(tmp_path)
+    state = DiffusionRequestState(
+        req_id="req-0",
+        sampling=SimpleNamespace(
+            height=512,
+            width=512,
+            num_frames=1,
+            num_outputs_per_prompt=1,
+            do_classifier_free_guidance=False,
+            guidance_scale=0.0,
+            true_cfg_scale=None,
+            extra_args={"profile_combo_id": "512x512_b1", "profile_phase": "measure"},
+        ),
+        latents=torch.zeros(1, 1),
+        timesteps=torch.arange(1),
+        step_index=0,
+    )
+    scheduler_output = SimpleNamespace(
+        step_id=3,
+        scheduled_req_ids=["req-0"],
+    )
+
+    runner._update_states = lambda output: ([state], [])
+    runner._prepare_batch_inputs = lambda states, new_request_ids: SimpleNamespace(num_reqs=len(states))
+    runner._prepare_attn_metadata = lambda input_batch: {}
+    runner._update_states_after = lambda states, input_batch, interrupted: None
+    monkeypatch.setattr(model_runner_module, "set_forward_context", _noop_forward_context)
+
+    output = DiffusionModelRunner.execute_stepwise(runner, scheduler_output)
+
+    assert output.get_req_output("req-0").finished is True
+    rows = [json.loads(line) for line in (tmp_path / "step_cost_raw.jsonl").read_text().splitlines()]
+    assert rows[0]["batch_size"] == 1
+    assert rows[0]["denoise_ms"] >= 0
+    assert rows[0]["step_scheduler_ms"] >= 0
+    assert rows[0]["post_decode_ms"] >= 0
+
+
+def test_execute_stepwise_skips_disabled_step_cost_profiler(tmp_path, monkeypatch):
+    class _DisabledProfiler:
+        enabled = False
+
+        def timer_start(self):
+            raise AssertionError("disabled profiler timer should not be called")
+
+        def timer_end_ms(self, start_s):
+            del start_s
+            raise AssertionError("disabled profiler timer should not be called")
+
+        def write_step_record(self, **kwargs):
+            del kwargs
+            raise AssertionError("disabled profiler writer should not be called")
+
+    runner = _make_stepwise_runner(tmp_path)
+    runner.step_cost_profiler = _DisabledProfiler()
+    state = DiffusionRequestState(
+        req_id="req-0",
+        sampling=SimpleNamespace(
+            height=512,
+            width=512,
+            num_frames=1,
+            num_outputs_per_prompt=1,
+            do_classifier_free_guidance=False,
+            guidance_scale=0.0,
+            true_cfg_scale=None,
+            extra_args={"profile_combo_id": "512x512_b1", "profile_phase": "measure"},
+        ),
+        latents=torch.zeros(1, 1),
+        timesteps=torch.arange(1),
+        step_index=0,
+    )
+    scheduler_output = SimpleNamespace(
+        step_id=3,
+        scheduled_req_ids=["req-0"],
+    )
+
+    runner._update_states = lambda output: ([state], [])
+    runner._prepare_batch_inputs = lambda states, new_request_ids: SimpleNamespace(num_reqs=len(states))
+    runner._prepare_attn_metadata = lambda input_batch: {}
+    runner._update_states_after = lambda states, input_batch, interrupted: None
+    monkeypatch.setattr(model_runner_module, "set_forward_context", _noop_forward_context)
+
+    output = DiffusionModelRunner.execute_stepwise(runner, scheduler_output)
+
+    assert output.get_req_output("req-0").finished is True
+    assert not (tmp_path / "step_cost_raw.jsonl").exists()
 
 
 @pytest.mark.core_model

@@ -31,7 +31,7 @@ from vllm_omni.diffusion.registry import (
     get_diffusion_pre_process_func,
 )
 from vllm_omni.diffusion.request import OmniDiffusionRequest
-from vllm_omni.diffusion.sched import RequestScheduler, SchedulerInterface, StepScheduler
+from vllm_omni.diffusion.sched import RequestScheduler, SchedulerInterface, SloStepScheduler, StepScheduler
 from vllm_omni.diffusion.sched.interface import DiffusionRequestStatus
 from vllm_omni.diffusion.worker.utils import BatchRunnerOutput, RunnerOutput
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams, OmniTextPrompt
@@ -138,9 +138,7 @@ class DiffusionEngine:
         executor_class = DiffusionExecutor.get_class(od_config)
         self.executor = executor_class(od_config)
         self.step_execution = bool(getattr(od_config, "step_execution", False))
-        self.scheduler: SchedulerInterface = scheduler or (
-            StepScheduler() if self.step_execution else RequestScheduler()
-        )
+        self.scheduler: SchedulerInterface = scheduler or self._make_default_scheduler(od_config)
         self.scheduler.initialize(od_config)
         if self.scheduler.max_num_running_reqs > 1 and not self.step_execution:
             max_num_seqs = self.scheduler.max_num_running_reqs
@@ -170,6 +168,20 @@ class DiffusionEngine:
             logger.error(f"Dummy run failed: {e}")
             self.close()
             raise e
+
+    def _make_default_scheduler(self, od_config: OmniDiffusionConfig) -> SchedulerInterface:
+        if not self.step_execution:
+            return RequestScheduler()
+        additional_config = getattr(od_config, "additional_config", None)
+        if isinstance(additional_config, dict):
+            policy = (
+                additional_config.get("diffusion_scheduler_policy")
+                or additional_config.get("diffusion_step_scheduler_policy")
+                or additional_config.get("scheduler_policy")
+            )
+            if isinstance(policy, str) and policy.lower() in {"slo", "slo_aware", "bucket_slo"}:
+                return SloStepScheduler()
+        return StepScheduler()
 
     async def _check_and_start_background_loop(self):
         if self._closed:
@@ -762,6 +774,10 @@ class DiffusionEngine:
         """
         assert isinstance(method, str), "Only string method names are supported for now"
 
+        if method == "get_scheduler_load_snapshot":
+            with self._cv:
+                return self.scheduler.get_load_snapshot()
+
         # If the busy loop hasn't started yet (e.g. during _dummy_run in
         # __init__, or before the first async request after construction),
         # there is no busy-loop thread to drain the RPC queue. Fall back to
@@ -802,6 +818,9 @@ class DiffusionEngine:
         Mirrors :meth:`async_add_req_and_wait_for_response`: enqueue a task
         keyed by a future and ``await`` the result without blocking the loop.
         """
+        if method == "get_scheduler_load_snapshot":
+            with self._cv:
+                return self.scheduler.get_load_snapshot()
         await self._check_and_start_background_loop()
         task = self._submit_rpc(method, timeout, args, kwargs, unique_reply_rank)
         aio_fut = asyncio.wrap_future(task.future)

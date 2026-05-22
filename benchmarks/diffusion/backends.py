@@ -25,7 +25,12 @@ class RequestFuncInput:
     seed: int | None = None
     fps: int | None = None
     timestamp: float | None = None
+    reference_cost_ms: float | None = None
     slo_ms: float | None = None
+    arrival_time_s: float | None = None
+    deadline_time_s: float | None = None
+    planned_arrival_perf_s: float | None = None
+    task_created_perf_s: float | None = None
     extra_body: dict[str, Any] = field(default_factory=dict)
     image_paths: list[str] | None = None
     request_id: str = field(default_factory=lambda: str(uuid.uuid4()))
@@ -38,10 +43,46 @@ class RequestFuncOutput:
     latency: float = 0.0
     error: str = ""
     start_time: float = 0.0
+    end_time: float = 0.0
     response_body: dict[str, Any] = field(default_factory=dict)
     stage_durations: dict[str, float] = field(default_factory=dict)
     peak_memory_mb: float = 0.0
     slo_achieved: bool | None = None
+
+
+def _add_scheduler_metadata(target: dict[str, Any], input: RequestFuncInput) -> None:
+    if input.reference_cost_ms is not None:
+        target.setdefault("reference_cost_ms", input.reference_cost_ms)
+    if input.slo_ms is not None:
+        target.setdefault("slo_ms", input.slo_ms)
+    if input.arrival_time_s is not None:
+        target.setdefault("arrival_time_s", input.arrival_time_s)
+    if input.deadline_time_s is not None:
+        target.setdefault("deadline_time_s", input.deadline_time_s)
+    if input.request_id:
+        target.setdefault("client_request_id", input.request_id)
+
+
+def _scheduler_metadata(input: RequestFuncInput) -> dict[str, Any]:
+    metadata: dict[str, Any] = {}
+    _add_scheduler_metadata(metadata, input)
+    return metadata
+
+
+def _finalize_output_timing(input: RequestFuncInput, output: RequestFuncOutput) -> RequestFuncOutput:
+    output.end_time = time.perf_counter()
+    output.latency = output.end_time - output.start_time
+    if output.success:
+        start = input.planned_arrival_perf_s if input.planned_arrival_perf_s is not None else output.start_time
+        if input.deadline_time_s is not None and input.arrival_time_s is not None:
+            # deadline_time_s 是 wall-clock 时间；planned_arrival_perf_s 是压测进程
+            # 的单调时钟。用 arrival_time_s 建立二者的相对映射，避免直接比较
+            # epoch 时间和 perf_counter。
+            deadline_perf_s = start + (float(input.deadline_time_s) - float(input.arrival_time_s))
+            output.slo_achieved = output.end_time <= deadline_perf_s
+        elif input.slo_ms is not None:
+            output.slo_achieved = ((output.end_time - start) * 1000.0) <= float(input.slo_ms)
+    return output
 
 
 def _guess_mime_type(path: str) -> str:
@@ -94,6 +135,8 @@ async def async_request_image_edits(
         form.add_field("negative_prompt", str(extra_body["negative_prompt"]))
     if extra_body.get("true_cfg_scale") is not None:
         form.add_field("true_cfg_scale", str(extra_body["true_cfg_scale"]))
+    for key, value in _scheduler_metadata(input).items():
+        form.add_field(key, str(value))
     if extra_body.get("sys_type") is not None:
         form.add_field("sys_type", str(extra_body["sys_type"]))
     if extra_body.get("system_prompt") is not None:
@@ -112,7 +155,7 @@ async def async_request_image_edits(
             output.success = False
             if pbar:
                 pbar.update(1)
-            return output
+            return _finalize_output_timing(input, output)
         with open(img_path, "rb") as img_f:
             image_bytes = img_f.read()
         form.add_field(
@@ -135,14 +178,9 @@ async def async_request_image_edits(
         output.error = str(e)
         output.success = False
 
-    output.latency = time.perf_counter() - output.start_time
-
-    if output.success and input.slo_ms is not None:
-        output.slo_achieved = (output.latency * 1000.0) <= float(input.slo_ms)
-
     if pbar:
         pbar.update(1)
-    return output
+    return _finalize_output_timing(input, output)
 
 
 async def async_request_chat_completions(
@@ -166,6 +204,7 @@ async def async_request_chat_completions(
         extra_body.setdefault("seed", input.seed)
     if input.fps:
         extra_body.setdefault("fps", input.fps)
+    _add_scheduler_metadata(extra_body, input)
 
     if input.image_paths and len(input.image_paths) > 0:
         content = []
@@ -177,7 +216,7 @@ async def async_request_chat_completions(
                 output.success = False
                 if pbar:
                     pbar.update(1)
-                return output
+                return _finalize_output_timing(input, output)
             content.append(
                 {
                     "type": "image_url",
@@ -233,14 +272,9 @@ async def async_request_chat_completions(
         output.error = str(e)
         output.success = False
 
-    output.latency = time.perf_counter() - output.start_time
-
-    if output.success and input.slo_ms is not None:
-        output.slo_achieved = (output.latency * 1000.0) <= float(input.slo_ms)
-
     if pbar:
         pbar.update(1)
-    return output
+    return _finalize_output_timing(input, output)
 
 
 async def async_request_openai_image_generations(
@@ -272,6 +306,7 @@ async def async_request_openai_image_generations(
         payload["seed"] = input.seed
     if input.num_inference_steps is not None:
         payload["num_inference_steps"] = input.num_inference_steps
+    _add_scheduler_metadata(payload, input)
 
     # Add any extra body parameters
     if input.extra_body:
@@ -300,14 +335,9 @@ async def async_request_openai_image_generations(
         output.error = str(e)
         output.success = False
 
-    output.latency = time.perf_counter() - output.start_time
-
-    if output.success and input.slo_ms is not None:
-        output.slo_achieved = (output.latency * 1000.0) <= float(input.slo_ms)
-
     if pbar:
         pbar.update(1)
-    return output
+    return _finalize_output_timing(input, output)
 
 
 async def async_request_v1_videos(
@@ -332,6 +362,7 @@ async def async_request_v1_videos(
         files.setdefault("seed", input.seed)
     if input.fps:
         files.setdefault("fps", input.fps)
+    _add_scheduler_metadata(files, input)
 
     form = aiohttp.FormData()
     for k, v in files.items():
@@ -363,11 +394,11 @@ async def async_request_v1_videos(
                 if not job_id or not job_status:
                     output.error = "API response missing job 'id' or 'status' field."
                     output.success = False
-                    return output
+                    return _finalize_output_timing(input, output)
             else:
                 output.error = f"HTTP {response.status}: {await response.text()}"
                 output.success = False
-                return output
+                return _finalize_output_timing(input, output)
 
         # invoke a poll request (GET /v1/videos/{video_id})
         poll_interval = 2.0  # Unit(s)
@@ -382,7 +413,7 @@ async def async_request_v1_videos(
                 if poll_response.status != 200:
                     output.error = f"Polling failed HTTP {poll_response.status}: {await poll_response.text()}"
                     output.success = False
-                    return output
+                    return _finalize_output_timing(input, output)
 
                 poll_json = await poll_response.json()
                 job_status = poll_json.get("status")
@@ -390,12 +421,12 @@ async def async_request_v1_videos(
                 if time.perf_counter() >= deadline:
                     output.error = f"Timed out waiting for video job {job_id} to complete."
                     output.success = False
-                    return output
+                    return _finalize_output_timing(input, output)
 
         if job_status == "failed":
             output.error = f"Video job failed: {poll_json}"
             output.success = False
-            return output
+            return _finalize_output_timing(input, output)
 
         # invoke a get request (GET /v1/videos/{video_id}/content)
         content_url = f"{job_url}/content"
@@ -405,7 +436,7 @@ async def async_request_v1_videos(
                     f"Content retrieval failed HTTP {content_response.status}: {await content_response.text()}"
                 )
                 output.success = False
-                return output
+                return _finalize_output_timing(input, output)
 
             video_bytes = await content_response.read()
             output.response_body = video_bytes
@@ -430,14 +461,9 @@ async def async_request_v1_videos(
             except Exception as e:
                 print(f"Failed to clean up video job {job_id}: {e}")
 
-    output.latency = time.perf_counter() - output.start_time
-
-    if output.success and input.slo_ms is not None:
-        output.slo_achieved = (output.latency * 1000.0) <= float(input.slo_ms)
-
     if pbar:
         pbar.update(1)
-    return output
+    return _finalize_output_timing(input, output)
 
 
 LEGACY_BACKEND_ENDPOINT_ALIASES = {

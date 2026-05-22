@@ -194,6 +194,11 @@ AGENTS.md
 #  .idea/
 
 # vLLM-Omni specific
+# Local benchmark outputs. Curated lightweight result bundles can be checked
+# in under benchmarks/diffusion/profile_results/ when they are intentionally
+# small enough for GitHub.
+benchmark_outputs/
+
 # Model files and checkpoints
 checkpoints/
 *.bin
@@ -243,6 +248,11 @@ datasets/
 !apps/ComfyUI-vLLM-Omni/example_workflows/*.json
 *.jsonl
 *.parquet
+
+# Curated benchmark result bundles that are intentionally small enough to
+# review and reproduce from the repository.
+!benchmarks/diffusion/profile_results/
+!benchmarks/diffusion/profile_results/**
 
 # Output files
 outputs/

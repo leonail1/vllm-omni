@@ -633,6 +633,10 @@ class StageDiffusionProc:
         signal.signal(signal.SIGTERM, signal_handler)
         signal.signal(signal.SIGINT, signal_handler)
 
+        setattr(od_config, "omni_replica_id", int(omni_replica_id))
+        if isinstance(getattr(od_config, "additional_config", None), dict):
+            od_config.additional_config.setdefault("_omni_replica_id", int(omni_replica_id))
+
         proc = cls(model, od_config)
         coord_client: OmniCoordClientForStage | None = None
         try:

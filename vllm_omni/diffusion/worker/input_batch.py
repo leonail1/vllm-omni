@@ -404,7 +404,8 @@ def _prepare_cfg_scalars(
     states: Sequence[DiffusionRequestState],
 ) -> tuple[bool, float, bool]:
     def _cfg_scalars(state: DiffusionRequestState) -> tuple[bool, float, bool]:
-        true_cfg_scale = getattr(state.sampling, "true_cfg_scale", None) or 4.0
+        raw_true_cfg_scale = getattr(state.sampling, "true_cfg_scale", None)
+        true_cfg_scale = raw_true_cfg_scale if raw_true_cfg_scale is not None else 4.0
         cfg_normalize = bool(getattr(state.sampling, "cfg_normalize", False))
         return state.do_true_cfg, true_cfg_scale, cfg_normalize
 

@@ -190,6 +190,13 @@ class VideoGenerationRequest(BaseModel):
         description=("Optional model-specific parameters passed directly to the model's extra_args. "),
     )
 
+    # SLO-aware scheduler metadata. These fields are optional and ignored by
+    # non-SLO schedulers.
+    reference_cost_ms: float | None = Field(default=None, description="Offline-profiled reference execution cost.")
+    slo_ms: float | None = Field(default=None, description="Request SLO budget in milliseconds.")
+    arrival_time_s: float | None = Field(default=None, description="Client-side arrival timestamp in seconds.")
+    deadline_time_s: float | None = Field(default=None, description="Absolute request deadline timestamp in seconds.")
+
     def resolve_video_params(self) -> VideoParams:
         vp = VideoParams(width=self.width, height=self.height, fps=self.fps, num_frames=self.num_frames)
 

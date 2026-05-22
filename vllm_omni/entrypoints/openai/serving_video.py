@@ -149,16 +149,27 @@ class OmniOpenAIServingVideo:
         if "flow_shift" in provided_fields and request.flow_shift is not None:
             gen_params.extra_args["flow_shift"] = request.flow_shift
 
+        # Apply SLO-aware scheduler metadata. Prefer top-level request fields,
+        # but also accept the same keys inside extra_params for older clients.
+        extra_params = request.extra_params
+        if extra_params is not None and not isinstance(extra_params, dict):
+            raise HTTPException(
+                status_code=HTTPStatus.BAD_REQUEST.value,
+                detail="extra_params must be a JSON object/dict.",
+            )
+        extra_params = dict(extra_params or {})
+        for key in ("reference_cost_ms", "slo_ms", "arrival_time_s", "deadline_time_s"):
+            value = getattr(request, key, None)
+            if value is None:
+                value = extra_params.pop(key, None)
+            if value is not None:
+                setattr(gen_params, key, float(value))
+
         # Apply model-specific extra parameters
-        if request.extra_params is not None:
-            if not isinstance(request.extra_params, dict):
-                raise HTTPException(
-                    status_code=HTTPStatus.BAD_REQUEST.value,
-                    detail="extra_params must be a JSON object/dict.",
-                )
+        if extra_params:
             # Merge extra_params into extra_args
-            gen_params.extra_args.update(request.extra_params)
-            logger.info("Applied extra_params: %s", request.extra_params)
+            gen_params.extra_args.update(extra_params)
+            logger.info("Applied extra_params: %s", extra_params)
 
         self._apply_lora(request.lora, gen_params)
 

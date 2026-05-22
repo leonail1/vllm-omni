@@ -179,6 +179,56 @@ def test_prepare_encode_defaults_to_tokenizer_max_length():
     assert captured["max_sequence_length"] == 1024
 
 
+def test_prepare_encode_preserves_zero_true_cfg_scale():
+    pipeline = object.__new__(QwenImagePipeline)
+    nn.Module.__init__(pipeline)
+    pipeline.tokenizer_max_length = 1024
+    pipeline.vae_scale_factor = 8
+    pipeline.default_sample_size = 128
+    pipeline.scheduler = _FakeScheduler()
+    pipeline._extract_prompts = lambda prompts: (["prompt"], "negative")
+
+    captured = {}
+
+    def _fake_prepare_generation_context(**kwargs):
+        captured["true_cfg_scale"] = kwargs["true_cfg_scale"]
+        embeds = torch.ones((1, 1, 1))
+        mask = torch.ones((1, 1), dtype=torch.long)
+        return {
+            "prompt_embeds": embeds,
+            "prompt_embeds_mask": mask,
+            "negative_prompt_embeds": None,
+            "negative_prompt_embeds_mask": None,
+            "latents": embeds,
+            "timesteps": torch.tensor([1]),
+            "do_true_cfg": False,
+            "guidance": None,
+            "img_shapes": [[(1, 1, 1)]],
+            "txt_seq_lens": [1],
+            "negative_txt_seq_lens": None,
+        }
+
+    pipeline._prepare_generation_context = _fake_prepare_generation_context
+    state = SimpleNamespace(
+        prompts=[{"prompt": "prompt", "negative_prompt": "negative"}],
+        sampling=SimpleNamespace(
+            height=None,
+            width=None,
+            num_inference_steps=None,
+            sigmas=None,
+            guidance_scale_provided=False,
+            num_outputs_per_prompt=1,
+            generator=None,
+            true_cfg_scale=0.0,
+            max_sequence_length=None,
+        ),
+    )
+
+    pipeline.prepare_encode(state)
+
+    assert captured["true_cfg_scale"] == 0.0
+
+
 @pytest.mark.parametrize(
     ("pipeline_class", "drop_idx"),
     [
