@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import asyncio
+import json
 import queue
 import threading
 from types import SimpleNamespace
@@ -85,9 +86,11 @@ def _make_slo_step_request(
     slo_ms: float,
     num_inference_steps: int = 4,
     height: int | None = None,
+    width: int | None = None,
 ) -> OmniDiffusionRequest:
     sampling_params = OmniDiffusionSamplingParams(
         height=height,
+        width=width or height,
         num_inference_steps=num_inference_steps,
         reference_cost_ms=reference_cost_ms,
         slo_ms=slo_ms,
@@ -986,13 +989,20 @@ class TestStepScheduler:
 
 
 class TestSloStepScheduler:
-    def _make_scheduler(self, max_num_seqs: int = 1, slo_config: dict | None = None) -> SloStepScheduler:
+    def _make_scheduler(
+        self,
+        max_num_seqs: int = 1,
+        slo_config: dict | None = None,
+        *,
+        model: str = "Qwen/Qwen-Image",
+    ) -> SloStepScheduler:
         config = {"batch_growth_alpha": 0.0}
         if slo_config:
             config.update(slo_config)
         scheduler = SloStepScheduler()
         scheduler.initialize(
             SimpleNamespace(
+                model=model,
                 max_num_seqs=max_num_seqs,
                 additional_config={"diffusion_slo_scheduler": config},
             )
@@ -1121,6 +1131,66 @@ class TestSloStepScheduler:
         assert _new_ids(sched_output) == [urgent]
         assert sched_output.num_waiting_reqs == 2
 
+    def test_same_key_batch_formation_preserves_absolute_deadline_guard_priority(self) -> None:
+        scheduler = self._make_scheduler(
+            max_num_seqs=2,
+            slo_config={
+                "batch_growth_alpha": 1.0,
+                "min_laxity_guard_ms": 100.0,
+            },
+        )
+
+        scheduler.add_request(
+            _make_slo_step_request(
+                "long-but-guard-safe",
+                reference_cost_ms=2000,
+                slo_ms=2150,
+                num_inference_steps=10,
+            )
+        )
+        urgent = scheduler.add_request(
+            _make_slo_step_request(
+                "short-inside-guard",
+                reference_cost_ms=100,
+                slo_ms=150,
+                num_inference_steps=10,
+            )
+        )
+
+        sched_output = scheduler.schedule()
+
+        assert _new_ids(sched_output) == [urgent]
+
+    def test_same_key_batch_formation_protects_feasible_request_from_missed_bucket(self) -> None:
+        scheduler = self._make_scheduler(
+            max_num_seqs=2,
+            slo_config={
+                "batch_growth_alpha": 2.0,
+                "min_laxity_guard_ms": 100.0,
+            },
+        )
+
+        missed = scheduler.add_request(
+            _make_slo_step_request(
+                "already-missed",
+                reference_cost_ms=1000,
+                slo_ms=900,
+                num_inference_steps=10,
+            )
+        )
+        scheduler.add_request(
+            _make_slo_step_request(
+                "feasible-alone",
+                reference_cost_ms=100,
+                slo_ms=250,
+                num_inference_steps=10,
+            )
+        )
+
+        sched_output = scheduler.schedule()
+
+        assert _new_ids(sched_output) == [missed]
+
     def test_no_deadline_requests_preserve_step_scheduler_fifo(self) -> None:
         scheduler = self._make_scheduler(max_num_seqs=3)
 
@@ -1158,3 +1228,395 @@ class TestSloStepScheduler:
         assert snapshot["safe_admit_capacity"] == 2
         assert len(snapshot["buckets"]) == 2
         assert all(bucket["estimated_step_ms"] > 0 for bucket in snapshot["buckets"])
+
+    def test_cost_model_table_replaces_reference_cost_estimate(self, tmp_path) -> None:
+        model_path = tmp_path / "step_cost_model.json"
+        model_path.write_text(
+            json.dumps(
+                {
+                    "table_lookup": {
+                        "Qwen/Qwen-Image": {
+                            "1024x1024x1": {
+                                "1": {
+                                    "1.0": {
+                                        "effective_batch_size": 1.0,
+                                        "denoise_step_ms": 100.0,
+                                        "p90_ms": 123.0,
+                                    }
+                                },
+                                "2": {
+                                    "2.0": {
+                                        "effective_batch_size": 2.0,
+                                        "denoise_step_ms": 180.0,
+                                        "p90_ms": 210.0,
+                                    }
+                                },
+                            }
+                        }
+                    }
+                }
+            ),
+            encoding="utf-8",
+        )
+        scheduler = self._make_scheduler(
+            max_num_seqs=2,
+            slo_config={
+                "step_cost_model_path": str(model_path),
+                "step_cost_metric": "p90_ms",
+            },
+        )
+        scheduler.add_request(
+            _make_slo_step_request("a", reference_cost_ms=10, slo_ms=100000, num_inference_steps=50, height=1024)
+        )
+        scheduler.add_request(
+            _make_slo_step_request("b", reference_cost_ms=10, slo_ms=100000, num_inference_steps=50, height=1024)
+        )
+
+        snapshot = scheduler.get_load_snapshot()
+
+        bucket = snapshot["buckets"][0]
+        assert bucket["estimated_step_ms"] == pytest.approx(210.0)
+        assert bucket["step_cost_source"] == "exact_table"
+        assert bucket["latent_tokens"] == 4096
+        assert bucket["incremental_step_ms_if_add_one"] >= 0.0
+
+    def test_cost_model_named_formula_is_used_when_table_misses(self) -> None:
+        scheduler = self._make_scheduler(
+            max_num_seqs=1,
+            slo_config={
+                "step_cost_formula": "qwen_image_910b_tp2_v1",
+                "step_cost_safety_factor": 1.1,
+            },
+        )
+        scheduler.add_request(
+            _make_slo_step_request("a", reference_cost_ms=10, slo_ms=1000, num_inference_steps=50, height=1024)
+        )
+
+        snapshot = scheduler.get_load_snapshot()
+
+        bucket = snapshot["buckets"][0]
+        assert bucket["step_cost_source"] == "latent_formula"
+        assert bucket["estimated_step_ms"] == pytest.approx(
+            1.1 * (288.68 - 230.01 - 38.12 + 335.52 + 82.63),
+        )
+
+    def test_cost_model_uses_actual_batch_size_not_effective_batch_size(self, tmp_path) -> None:
+        model_path = tmp_path / "step_cost_model.json"
+        model_path.write_text(
+            json.dumps(
+                {
+                    "table_lookup": {
+                        "Qwen/Qwen-Image": {
+                            "1024x1024x1": {
+                                "1": {
+                                    "2.0": {
+                                        "effective_batch_size": 2.0,
+                                        "denoise_step_ms": 111.0,
+                                        "p90_ms": 111.0,
+                                    }
+                                },
+                                "2": {
+                                    "2.0": {
+                                        "effective_batch_size": 2.0,
+                                        "denoise_step_ms": 222.0,
+                                        "p90_ms": 222.0,
+                                    }
+                                },
+                            }
+                        }
+                    }
+                }
+            ),
+            encoding="utf-8",
+        )
+        scheduler = self._make_scheduler(
+            max_num_seqs=1,
+            slo_config={
+                "step_cost_model_path": str(model_path),
+                "step_cost_metric": "p90_ms",
+            },
+        )
+        scheduler.add_request(
+            OmniDiffusionRequest(
+                prompts=[{"prompt": "cfg", "negative_prompt": "avoid blur"}],
+                sampling_params=OmniDiffusionSamplingParams(
+                    height=1024,
+                    width=1024,
+                    num_inference_steps=50,
+                    reference_cost_ms=10,
+                    slo_ms=100000,
+                    true_cfg_scale=4.0,
+                ),
+                request_ids=["cfg"],
+            )
+        )
+
+        snapshot = scheduler.get_load_snapshot()
+
+        assert snapshot["buckets"][0]["effective_batch_size"] == 2.0
+        assert snapshot["buckets"][0]["estimated_step_ms"] == pytest.approx(111.0)
+
+    def test_true_cfg_effective_batch_requires_negative_prompt(self, tmp_path) -> None:
+        model_path = tmp_path / "step_cost_model.json"
+        model_path.write_text(
+            json.dumps(
+                {
+                    "table_lookup": {
+                        "Qwen/Qwen-Image": {
+                            "1024x1024x1": {
+                                "1": {
+                                    "1.0": {
+                                        "effective_batch_size": 1.0,
+                                        "denoise_step_ms": 111.0,
+                                        "p90_ms": 111.0,
+                                    },
+                                    "2.0": {
+                                        "effective_batch_size": 2.0,
+                                        "denoise_step_ms": 222.0,
+                                        "p90_ms": 222.0,
+                                    },
+                                }
+                            }
+                        }
+                    }
+                }
+            ),
+            encoding="utf-8",
+        )
+        scheduler = self._make_scheduler(
+            max_num_seqs=1,
+            slo_config={
+                "step_cost_model_path": str(model_path),
+                "step_cost_metric": "p90_ms",
+            },
+        )
+        scheduler.add_request(
+            OmniDiffusionRequest(
+                prompts=[{"prompt": "plain"}],
+                sampling_params=OmniDiffusionSamplingParams(
+                    height=1024,
+                    width=1024,
+                    num_inference_steps=50,
+                    reference_cost_ms=10,
+                    slo_ms=100000,
+                    true_cfg_scale=4.0,
+                ),
+                request_ids=["plain"],
+            )
+        )
+
+        snapshot = scheduler.get_load_snapshot()
+
+        assert snapshot["buckets"][0]["effective_batch_size"] == 1.0
+        assert snapshot["buckets"][0]["estimated_step_ms"] == pytest.approx(111.0)
+
+    def test_guidance_scale_flag_does_not_double_qwen_effective_batch_without_true_cfg(self, tmp_path) -> None:
+        model_path = tmp_path / "step_cost_model.json"
+        model_path.write_text(
+            json.dumps(
+                {
+                    "table_lookup": {
+                        "Qwen/Qwen-Image": {
+                            "1024x1024x1": {
+                                "1": {
+                                    "1.0": {
+                                        "effective_batch_size": 1.0,
+                                        "denoise_step_ms": 111.0,
+                                        "p90_ms": 111.0,
+                                    },
+                                    "2.0": {
+                                        "effective_batch_size": 2.0,
+                                        "denoise_step_ms": 222.0,
+                                        "p90_ms": 222.0,
+                                    },
+                                }
+                            }
+                        }
+                    }
+                }
+            ),
+            encoding="utf-8",
+        )
+        scheduler = self._make_scheduler(
+            max_num_seqs=1,
+            slo_config={
+                "step_cost_model_path": str(model_path),
+                "step_cost_metric": "p90_ms",
+            },
+        )
+        scheduler.add_request(
+            OmniDiffusionRequest(
+                prompts=[{"prompt": "plain", "negative_prompt": "avoid blur"}],
+                sampling_params=OmniDiffusionSamplingParams(
+                    height=1024,
+                    width=1024,
+                    num_inference_steps=50,
+                    reference_cost_ms=10,
+                    slo_ms=100000,
+                    guidance_scale=7.5,
+                    true_cfg_scale=1.0,
+                ),
+                request_ids=["plain"],
+            )
+        )
+
+        snapshot = scheduler.get_load_snapshot()
+
+        assert scheduler.get_request_state("plain").req.sampling_params.do_classifier_free_guidance
+        assert snapshot["buckets"][0]["effective_batch_size"] == 1.0
+        assert snapshot["buckets"][0]["estimated_step_ms"] == pytest.approx(111.0)
+
+    def test_cost_model_effective_batch_counts_prompts_in_single_request(self, tmp_path) -> None:
+        model_path = tmp_path / "step_cost_model.json"
+        model_path.write_text(
+            json.dumps(
+                {
+                    "table_lookup": {
+                        "Qwen/Qwen-Image": {
+                            "1024x1024x1": {
+                                "1": {
+                                    "1.0": {
+                                        "effective_batch_size": 1.0,
+                                        "denoise_step_ms": 111.0,
+                                        "p90_ms": 111.0,
+                                    },
+                                    "2.0": {
+                                        "effective_batch_size": 2.0,
+                                        "denoise_step_ms": 222.0,
+                                        "p90_ms": 222.0,
+                                    },
+                                }
+                            }
+                        }
+                    }
+                }
+            ),
+            encoding="utf-8",
+        )
+        scheduler = self._make_scheduler(
+            max_num_seqs=1,
+            slo_config={
+                "step_cost_model_path": str(model_path),
+                "step_cost_metric": "p90_ms",
+            },
+        )
+        scheduler.add_request(
+            OmniDiffusionRequest(
+                prompts=["p0", "p1"],
+                sampling_params=OmniDiffusionSamplingParams(
+                    height=1024,
+                    width=1024,
+                    num_inference_steps=50,
+                    reference_cost_ms=10,
+                    slo_ms=100000,
+                ),
+                request_ids=["p0", "p1"],
+            )
+        )
+
+        snapshot = scheduler.get_load_snapshot()
+
+        assert snapshot["buckets"][0]["effective_batch_size"] == 2.0
+        assert snapshot["buckets"][0]["estimated_step_ms"] == pytest.approx(222.0)
+
+    def test_json_fallback_formula_is_model_scoped(self, tmp_path) -> None:
+        model_path = tmp_path / "step_cost_model.json"
+        model_path.write_text(
+            json.dumps(
+                {
+                    "table_lookup": {
+                        "Qwen/Qwen-Image": {
+                            "1024x1024x1": {
+                                "1": {
+                                    "1.0": {
+                                        "effective_batch_size": 1.0,
+                                        "denoise_step_ms": 100.0,
+                                        "p90_ms": 100.0,
+                                    }
+                                }
+                            }
+                        }
+                    },
+                    "fallback": {
+                        "coefficients": {
+                            "c0": 9999.0,
+                            "c1": 0.0,
+                            "c2": 0.0,
+                        },
+                        "gamma": 1.0,
+                    },
+                }
+            ),
+            encoding="utf-8",
+        )
+        scheduler = self._make_scheduler(
+            max_num_seqs=1,
+            model="Other/Model",
+            slo_config={
+                "step_cost_model_path": str(model_path),
+                "step_cost_metric": "p90_ms",
+            },
+        )
+        scheduler.add_request(
+            _make_slo_step_request("a", reference_cost_ms=5000, slo_ms=100000, num_inference_steps=50, height=1024)
+        )
+
+        snapshot = scheduler.get_load_snapshot()
+
+        assert snapshot["buckets"][0]["step_cost_source"] == "legacy"
+        assert snapshot["buckets"][0]["estimated_step_ms"] == pytest.approx(100.0)
+
+    def test_named_formula_is_model_scoped(self) -> None:
+        scheduler = self._make_scheduler(
+            max_num_seqs=1,
+            model="Other/Model",
+            slo_config={
+                "step_cost_formula": "qwen_image_910b_tp2_v1",
+            },
+        )
+        scheduler.add_request(
+            _make_slo_step_request("a", reference_cost_ms=5000, slo_ms=100000, num_inference_steps=50, height=1024)
+        )
+
+        snapshot = scheduler.get_load_snapshot()
+
+        assert snapshot["buckets"][0]["step_cost_source"] == "legacy"
+        assert snapshot["buckets"][0]["estimated_step_ms"] == pytest.approx(100.0)
+
+    def test_cost_model_does_not_use_default_resolution_as_shape(self, tmp_path) -> None:
+        model_path = tmp_path / "step_cost_model.json"
+        model_path.write_text(
+            json.dumps(
+                {
+                    "table_lookup": {
+                        "Qwen/Qwen-Image": {
+                            "640x640x1": {
+                                "1": {
+                                    "1.0": {
+                                        "effective_batch_size": 1.0,
+                                        "denoise_step_ms": 999.0,
+                                        "p90_ms": 999.0,
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            ),
+            encoding="utf-8",
+        )
+        scheduler = self._make_scheduler(
+            max_num_seqs=1,
+            slo_config={
+                "step_cost_model_path": str(model_path),
+                "step_cost_metric": "p90_ms",
+            },
+        )
+        scheduler.add_request(
+            _make_slo_step_request("a", reference_cost_ms=5000, slo_ms=100000, num_inference_steps=50)
+        )
+
+        snapshot = scheduler.get_load_snapshot()
+
+        assert snapshot["buckets"][0]["step_cost_source"] == "legacy"
+        assert snapshot["buckets"][0]["estimated_step_ms"] == pytest.approx(100.0)

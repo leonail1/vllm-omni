@@ -20,6 +20,10 @@ from vllm_omni.diffusion.sched.interface import (
     SamplingParamsKey,
 )
 from vllm_omni.diffusion.sched.step_scheduler import StepScheduler
+from vllm_omni.diffusion.sched.step_cost_model import (
+    DiffusionStepCostModel,
+    estimate_request_effective_size,
+)
 
 logger = init_logger(__name__)
 
@@ -40,6 +44,9 @@ class SloStepScheduler(StepScheduler):
         self.batch_growth_alpha = 0.60
         self.decode_ms = 0.0
         self.min_laxity_guard_ms = 0.0
+        self.cost_model: DiffusionStepCostModel | None = None
+        self.preemption_laxity_margin_ms = 0.0
+        self.preemption_safe_laxity_ms = 1000.0
 
     def initialize(self, od_config) -> None:
         super().initialize(od_config)
@@ -48,6 +55,18 @@ class SloStepScheduler(StepScheduler):
         self.batch_growth_alpha = _coerce_nonnegative_float(slo_config.get("batch_growth_alpha"), 0.60)
         self.decode_ms = _coerce_nonnegative_float(slo_config.get("decode_ms"), 0.0)
         self.min_laxity_guard_ms = _coerce_float(slo_config.get("min_laxity_guard_ms")) or 0.0
+        self.preemption_laxity_margin_ms = _coerce_nonnegative_float(
+            slo_config.get("preemption_laxity_margin_ms"),
+            0.0,
+        )
+        self.preemption_safe_laxity_ms = _coerce_nonnegative_float(
+            slo_config.get("preemption_safe_laxity_ms"),
+            1000.0,
+        )
+        self.cost_model = DiffusionStepCostModel.from_config(
+            slo_config,
+            default_step_ms=self.default_step_ms,
+        )
 
     def schedule(self) -> DiffusionSchedulerOutput:
         if not self._has_any_deadline():
@@ -115,7 +134,13 @@ class SloStepScheduler(StepScheduler):
         now_s = time.time()
         buckets = []
         for key, states in self._candidate_batches(now_s):
-            step_ms = self._estimate_step_ms(states)
+            step_estimate = self._estimate_step_cost(states)
+            step_ms = step_estimate.step_ms
+            delta_one_ms = self._estimate_incremental_step_ms(states, 1.0)
+            representative = states[0]
+            sampling = representative.req.sampling_params
+            width, height = _sampling_dimensions(sampling)
+            frames = _coerce_float(getattr(sampling, "num_frames", None)) or 1.0
             buckets.append(
                 {
                     "key": None if key is None else asdict(key),
@@ -124,6 +149,15 @@ class SloStepScheduler(StepScheduler):
                     "candidate_batch_size": len(states),
                     "effective_batch_size": self._effective_batch_size(states),
                     "estimated_step_ms": step_ms,
+                    "estimated_step_ms_if_add_one": step_ms + delta_one_ms,
+                    "incremental_step_ms_if_add_one": delta_one_ms,
+                    "step_cost_source": step_estimate.source,
+                    "latent_tokens": step_estimate.latent_tokens,
+                    "shape": {
+                        "width": width,
+                        "height": height,
+                        "num_frames": frames,
+                    },
                     "min_laxity_ms": self._bucket_min_laxity_ms(states, step_ms, now_s),
                     "min_remaining_steps": min(self._remaining_steps(state) for state in states),
                     "max_remaining_steps": max(self._remaining_steps(state) for state in states),
@@ -161,13 +195,16 @@ class SloStepScheduler(StepScheduler):
         return False
 
     def _select_bucket(self, now_s: float) -> tuple[SamplingParamsKey | None, list[str]] | None:
-        candidates: list[tuple[tuple[float, float, float, int], SamplingParamsKey | None, list[str]]] = []
+        candidates: list[tuple[tuple[float, float, float, float, float, int], SamplingParamsKey | None, list[str]]] = []
         for key, states in self._candidate_batches(now_s):
             step_ms = self._estimate_step_ms(states)
             min_laxity_ms = self._bucket_min_laxity_ms(states, step_ms, now_s)
+            min_laxity_ratio = self._bucket_min_laxity_ratio(states, step_ms, now_s)
             has_deadline = 0.0 if math.isfinite(min_laxity_ms) else 1.0
+            guard_rank = 0.0 if min_laxity_ms < self.min_laxity_guard_ms else 1.0
             oldest_arrival_s = min(state.arrival_time_s for state in states)
-            score = (has_deadline, min_laxity_ms, -float(len(states)), int(oldest_arrival_s * 1000))
+            ratio_score = min_laxity_ratio if guard_rank > 0 else min_laxity_ms
+            score = (has_deadline, guard_rank, ratio_score, min_laxity_ms, -float(len(states)), int(oldest_arrival_s * 1000))
             candidates.append((score, key, [state.sched_req_id for state in states]))
 
         if not candidates:
@@ -177,8 +214,41 @@ class SloStepScheduler(StepScheduler):
         if all_without_deadline:
             return self._fifo_fallback_bucket()
 
-        _, key, sched_req_ids = min(candidates, key=lambda item: item[0])
+        selected = min(candidates, key=lambda item: item[0])
+        current = self._current_running_candidate(candidates)
+        if current is not None and current is not selected and self._should_keep_current_bucket(current, selected):
+            selected = current
+
+        _, key, sched_req_ids = selected
         return key, sched_req_ids
+
+    def _current_running_candidate(
+        self,
+        candidates: list[tuple[tuple[float, float, float, float, float, int], SamplingParamsKey | None, list[str]]],
+    ) -> tuple[tuple[float, float, float, float, float, int], SamplingParamsKey | None, list[str]] | None:
+        if not self._running:
+            return None
+        running_set = set(self._running)
+        for candidate in candidates:
+            _, _, sched_req_ids = candidate
+            if running_set.intersection(sched_req_ids):
+                return candidate
+        return None
+
+    def _should_keep_current_bucket(
+        self,
+        current: tuple[tuple[float, float, float, float, float, int], SamplingParamsKey | None, list[str]],
+        selected: tuple[tuple[float, float, float, float, float, int], SamplingParamsKey | None, list[str]],
+    ) -> bool:
+        current_laxity_ms = current[0][3]
+        selected_laxity_ms = selected[0][3]
+        if not (math.isfinite(current_laxity_ms) and math.isfinite(selected_laxity_ms)):
+            return False
+        if selected_laxity_ms <= self.preemption_safe_laxity_ms:
+            return False
+        if current_laxity_ms >= self.min_laxity_guard_ms and selected_laxity_ms >= self.min_laxity_guard_ms:
+            return True
+        return selected_laxity_ms >= current_laxity_ms - self.preemption_laxity_margin_ms
 
     def _fifo_fallback_bucket(self) -> tuple[SamplingParamsKey | None, list[str]] | None:
         batches = self._candidate_batches(time.time())
@@ -220,7 +290,26 @@ class SloStepScheduler(StepScheduler):
             candidate = [*selected, state]
             if selected and self._has_deadline(candidate):
                 step_ms = self._estimate_step_ms(candidate)
-                if self._bucket_min_laxity_ms(candidate, step_ms, now_s) < self.min_laxity_guard_ms:
+                candidate_laxity_ms = self._bucket_min_laxity_ms(candidate, step_ms, now_s)
+                selected_step_ms = self._estimate_step_ms(selected)
+                selected_laxity_ms = self._bucket_min_laxity_ms(selected, selected_step_ms, now_s)
+                if (
+                    selected_laxity_ms >= 0.0
+                    and candidate_laxity_ms < self.min_laxity_guard_ms
+                    and candidate_laxity_ms < selected_laxity_ms
+                ):
+                    continue
+                state_single_laxity_ms = self._state_laxity_ms(
+                    state,
+                    self._estimate_step_ms([state]),
+                    now_s,
+                )
+                state_candidate_laxity_ms = self._state_laxity_ms(state, step_ms, now_s)
+                if (
+                    state_single_laxity_ms >= 0.0
+                    and state_candidate_laxity_ms < self.min_laxity_guard_ms
+                    and state_candidate_laxity_ms < state_single_laxity_ms
+                ):
                     continue
             selected.append(state)
         if not selected and ordered:
@@ -242,9 +331,24 @@ class SloStepScheduler(StepScheduler):
         for state in states:
             if state.deadline_time_s is None:
                 continue
-            remaining_work_ms = self._remaining_steps(state) * step_ms + self.decode_ms
-            laxities.append((state.deadline_time_s - now_s) * 1000.0 - remaining_work_ms)
+            laxities.append(self._state_laxity_ms(state, step_ms, now_s))
         return min(laxities) if laxities else math.inf
+
+    def _state_laxity_ms(self, state: DiffusionRequestState, step_ms: float, now_s: float) -> float:
+        if state.deadline_time_s is None:
+            return math.inf
+        remaining_work_ms = self._remaining_steps(state) * step_ms + self.decode_ms
+        return (state.deadline_time_s - now_s) * 1000.0 - remaining_work_ms
+
+    def _bucket_min_laxity_ratio(self, states: list[DiffusionRequestState], step_ms: float, now_s: float) -> float:
+        ratios: list[float] = []
+        for state in states:
+            if state.deadline_time_s is None:
+                continue
+            remaining_work_ms = self._remaining_steps(state) * step_ms + self.decode_ms
+            laxity_ms = (state.deadline_time_s - now_s) * 1000.0 - remaining_work_ms
+            ratios.append(laxity_ms / max(remaining_work_ms, 0.001))
+        return min(ratios) if ratios else math.inf
 
     def _remaining_steps(self, state: DiffusionRequestState) -> int:
         progress = self._request_progress.get(state.sched_req_id)
@@ -253,6 +357,23 @@ class SloStepScheduler(StepScheduler):
         return max(progress.total_steps - progress.current_step, 1)
 
     def _estimate_step_ms(self, states: list[DiffusionRequestState]) -> float:
+        return self._estimate_step_cost(states).step_ms
+
+    def _estimate_step_cost(self, states: list[DiffusionRequestState]):
+        if states and self.cost_model is not None:
+            sampling = states[0].req.sampling_params
+            width, height = _sampling_dimensions(sampling)
+            estimate = self.cost_model.estimate(
+                model=getattr(self.od_config, "model", None),
+                width=width,
+                height=height,
+                num_frames=getattr(sampling, "num_frames", 1),
+                batch_size=len(states),
+                effective_batch_size=self._effective_batch_size(states),
+            )
+            if estimate.step_ms > 0 and estimate.source != "default":
+                return estimate
+
         single_step_candidates: list[float] = []
         for state in states:
             explicit = _coerce_float(_extra_arg(state, "estimated_step_ms"))
@@ -270,7 +391,32 @@ class SloStepScheduler(StepScheduler):
         single_step_ms = max(single_step_candidates) if single_step_candidates else self.default_step_ms
         b_eff = self._effective_batch_size(states)
         batch_scale = 1.0 + self.batch_growth_alpha * max(b_eff - 1.0, 0.0)
-        return max(single_step_ms * batch_scale, 0.001)
+        step_ms = max(single_step_ms * batch_scale, 0.001)
+        return _LegacyStepCostEstimate(step_ms, "legacy", None)
+
+    def _estimate_incremental_step_ms(self, states: list[DiffusionRequestState], incoming_eff: float) -> float:
+        if not states:
+            return 0.0
+        current = self._estimate_step_ms(states)
+        if self.cost_model is None:
+            if current <= 0:
+                return 0.0
+            current_eff = self._effective_batch_size(states)
+            scale = (1.0 + self.batch_growth_alpha * max(current_eff + incoming_eff - 1.0, 0.0)) / (
+                1.0 + self.batch_growth_alpha * max(current_eff - 1.0, 0.0)
+            )
+            return max(current * scale - current, 0.0)
+        sampling = states[0].req.sampling_params
+        width, height = _sampling_dimensions(sampling)
+        after = self.cost_model.estimate(
+            model=getattr(self.od_config, "model", None),
+            width=width,
+            height=height,
+            num_frames=getattr(sampling, "num_frames", 1),
+            batch_size=len(states) + 1,
+            effective_batch_size=self._effective_batch_size(states) + incoming_eff,
+        ).step_ms
+        return max(after - current, 0.0)
 
     def _shape_fallback_step_ms(self, state: DiffusionRequestState) -> float:
         sampling = state.req.sampling_params
@@ -289,16 +435,24 @@ class SloStepScheduler(StepScheduler):
 
 
 def _request_effective_size(state: DiffusionRequestState) -> float:
-    sampling = state.req.sampling_params
-    outputs = _coerce_float(getattr(sampling, "num_outputs_per_prompt", None)) or 1.0
-    guidance = 1.0
-    true_cfg_scale = _coerce_float(getattr(sampling, "true_cfg_scale", None))
-    guidance_scale = _coerce_float(getattr(sampling, "guidance_scale", None))
-    if bool(getattr(sampling, "do_classifier_free_guidance", False)) or true_cfg_scale is not None:
-        guidance = 2.0
-    elif guidance_scale is not None and guidance_scale > 1.0:
-        guidance = 2.0
-    return max(outputs, 1.0) * guidance
+    return _request_prompt_count(state) * estimate_request_effective_size(
+        state.req.sampling_params,
+        prompts=getattr(state.req, "prompts", None),
+    )
+
+
+def _request_prompt_count(state: DiffusionRequestState) -> float:
+    prompts = getattr(state.req, "prompts", None)
+    if isinstance(prompts, (list, tuple)):
+        return float(max(len(prompts), 1))
+    return 1.0
+
+
+class _LegacyStepCostEstimate:
+    def __init__(self, step_ms: float, source: str, latent_tokens: int | None) -> None:
+        self.step_ms = step_ms
+        self.source = source
+        self.latent_tokens = latent_tokens
 
 
 def _get_slo_scheduler_config(od_config: Any) -> dict[str, Any]:
@@ -314,6 +468,12 @@ def _extra_arg(state: DiffusionRequestState, key: str) -> Any:
     if isinstance(extra_args, dict):
         return extra_args.get(key)
     return None
+
+
+def _sampling_dimensions(sampling: Any) -> tuple[float | None, float | None]:
+    height = _coerce_float(getattr(sampling, "height", None))
+    width = _coerce_float(getattr(sampling, "width", None))
+    return width, height
 
 
 def _coerce_float(value: Any) -> float | None:

@@ -1,0 +1,170 @@
+[
+  {
+    "file": "mixed_slo_ia12_t35_l20.json",
+    "config": {
+      "num_requests": 80,
+      "interarrival_s": 12.0,
+      "max_num_seqs": 4,
+      "steps": 50,
+      "slo_scale": 3.0,
+      "batch_growth_alpha": 0.6,
+      "workload": "mixed_slo",
+      "shape_order": "interleaved",
+      "large_period": null,
+      "tight_slo_scale": 3.5,
+      "loose_slo_scale": 20.0,
+      "model": "Qwen/Qwen-Image",
+      "step_cost_model_path": "benchmarks/diffusion/profile_results/latent_token_aspect/step_cost_model.json",
+      "step_cost_metric": "p90_ms",
+      "step_cost_formula": "qwen_image_910b_tp2_v1",
+      "step_cost_safety_factor": 1.0,
+      "output_file": "benchmark_outputs/slo_cost_oracle_final/mixed_slo_ia12_t35_l20.json"
+    },
+    "fifo_misses": 52,
+    "slo_misses": 12,
+    "miss_reduction": 40,
+    "miss_reduction_pct": 76.92307692307693,
+    "fifo_attainment": 0.35,
+    "slo_attainment": 0.85,
+    "fifo_throughput_rps": 0.06940478139337432,
+    "slo_throughput_rps": 0.07002350412128212,
+    "throughput_delta_pct": 0.8914698893740303,
+    "fifo_steps": 2027,
+    "slo_steps": 1724,
+    "step_reduction_pct": 14.948199309324126,
+    "fifo_mean_batch": 1.973359644795264,
+    "slo_mean_batch": 2.320185614849188,
+    "fifo_misses_by_shape": {
+      "1024x1024": {
+        "requests": 20,
+        "slo_misses": 0
+      },
+      "768x768": {
+        "requests": 60,
+        "slo_misses": 52
+      }
+    },
+    "slo_misses_by_shape": {
+      "1024x1024": {
+        "requests": 20,
+        "slo_misses": 2
+      },
+      "768x768": {
+        "requests": 60,
+        "slo_misses": 10
+      }
+    }
+  },
+  {
+    "file": "mixed_slo_ia12_t40_l20.json",
+    "config": {
+      "num_requests": 80,
+      "interarrival_s": 12.0,
+      "max_num_seqs": 4,
+      "steps": 50,
+      "slo_scale": 3.0,
+      "batch_growth_alpha": 0.6,
+      "workload": "mixed_slo",
+      "shape_order": "interleaved",
+      "large_period": null,
+      "tight_slo_scale": 4.0,
+      "loose_slo_scale": 20.0,
+      "model": "Qwen/Qwen-Image",
+      "step_cost_model_path": "benchmarks/diffusion/profile_results/latent_token_aspect/step_cost_model.json",
+      "step_cost_metric": "p90_ms",
+      "step_cost_formula": "qwen_image_910b_tp2_v1",
+      "step_cost_safety_factor": 1.0,
+      "output_file": "benchmark_outputs/slo_cost_oracle_final/mixed_slo_ia12_t40_l20.json"
+    },
+    "fifo_misses": 49,
+    "slo_misses": 9,
+    "miss_reduction": 40,
+    "miss_reduction_pct": 81.63265306122449,
+    "fifo_attainment": 0.3875,
+    "slo_attainment": 0.8875,
+    "fifo_throughput_rps": 0.06940478139337432,
+    "slo_throughput_rps": 0.07014690770007302,
+    "throughput_delta_pct": 1.0692725944808634,
+    "fifo_steps": 2027,
+    "slo_steps": 1701,
+    "step_reduction_pct": 16.082881105081402,
+    "fifo_mean_batch": 1.973359644795264,
+    "slo_mean_batch": 2.3515579071134627,
+    "fifo_misses_by_shape": {
+      "1024x1024": {
+        "requests": 20,
+        "slo_misses": 0
+      },
+      "768x768": {
+        "requests": 60,
+        "slo_misses": 49
+      }
+    },
+    "slo_misses_by_shape": {
+      "1024x1024": {
+        "requests": 20,
+        "slo_misses": 2
+      },
+      "768x768": {
+        "requests": 60,
+        "slo_misses": 7
+      }
+    }
+  },
+  {
+    "file": "mixed_slo_ia14_t35_l20.json",
+    "config": {
+      "num_requests": 80,
+      "interarrival_s": 14.0,
+      "max_num_seqs": 4,
+      "steps": 50,
+      "slo_scale": 3.0,
+      "batch_growth_alpha": 0.6,
+      "workload": "mixed_slo",
+      "shape_order": "interleaved",
+      "large_period": null,
+      "tight_slo_scale": 3.5,
+      "loose_slo_scale": 20.0,
+      "model": "Qwen/Qwen-Image",
+      "step_cost_model_path": "benchmarks/diffusion/profile_results/latent_token_aspect/step_cost_model.json",
+      "step_cost_metric": "p90_ms",
+      "step_cost_formula": "qwen_image_910b_tp2_v1",
+      "step_cost_safety_factor": 1.0,
+      "output_file": "benchmark_outputs/slo_cost_oracle_final/mixed_slo_ia14_t35_l20.json"
+    },
+    "fifo_misses": 26,
+    "slo_misses": 3,
+    "miss_reduction": 23,
+    "miss_reduction_pct": 88.46153846153845,
+    "fifo_attainment": 0.675,
+    "slo_attainment": 0.9625,
+    "fifo_throughput_rps": 0.06887301049988026,
+    "slo_throughput_rps": 0.06812904349464888,
+    "throughput_delta_pct": -1.0802010828794506,
+    "fifo_steps": 2089,
+    "slo_steps": 2012,
+    "step_reduction_pct": 3.685974150311154,
+    "fifo_mean_batch": 1.9147917663954046,
+    "slo_mean_batch": 1.9880715705765408,
+    "fifo_misses_by_shape": {
+      "1024x1024": {
+        "requests": 20,
+        "slo_misses": 0
+      },
+      "768x768": {
+        "requests": 60,
+        "slo_misses": 26
+      }
+    },
+    "slo_misses_by_shape": {
+      "1024x1024": {
+        "requests": 20,
+        "slo_misses": 0
+      },
+      "768x768": {
+        "requests": 60,
+        "slo_misses": 3
+      }
+    }
+  }
+]

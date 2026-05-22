@@ -47,7 +47,16 @@ def test_build_multistage_generation_inputs_applies_stage_specific_overrides(ser
         "resolution": 1024,
         "lora": {"name": "adapter-a", "path": "/tmp/adapter-a", "scale": 0.6},
     }
-    gen_params = OmniDiffusionSamplingParams(height=768, width=1024, seed=0, num_outputs_per_prompt=2)
+    gen_params = OmniDiffusionSamplingParams(
+        height=768,
+        width=1024,
+        seed=0,
+        num_outputs_per_prompt=2,
+        reference_cost_ms=1234.0,
+        slo_ms=3702.0,
+        arrival_time_s=10.0,
+        deadline_time_s=13.702,
+    )
 
     engine_prompt, sampling_params_list = OmniOpenAIServingChat._build_multistage_generation_inputs(
         serving_chat,
@@ -78,12 +87,20 @@ def test_build_multistage_generation_inputs_applies_stage_specific_overrides(ser
     assert sampling_params_list[1].guidance_scale == 7.5
     assert sampling_params_list[1].num_outputs_per_prompt == 2
     assert sampling_params_list[1].true_cfg_scale == 5.0
+    assert sampling_params_list[1].reference_cost_ms == 1234.0
+    assert sampling_params_list[1].slo_ms == 3702.0
+    assert sampling_params_list[1].arrival_time_s == 10.0
+    assert sampling_params_list[1].deadline_time_s == 13.702
     assert sampling_params_list[1].lora_request.name == "adapter-a"
     assert sampling_params_list[1].lora_scale == 0.6
     assert sampling_params_list[2].height == 768
     assert sampling_params_list[2].width == 1024
     assert sampling_params_list[2].seed == 0
     assert sampling_params_list[2].num_inference_steps == 28
+    assert sampling_params_list[2].reference_cost_ms == 1234.0
+    assert sampling_params_list[2].slo_ms == 3702.0
+    assert sampling_params_list[2].arrival_time_s == 10.0
+    assert sampling_params_list[2].deadline_time_s == 13.702
     assert sampling_params_list[2].lora_request.name == "adapter-a"
     assert sampling_params_list[2].lora_scale == 0.6
     assert gen_params.lora_request is None

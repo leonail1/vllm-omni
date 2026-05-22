@@ -18,6 +18,10 @@ from vllm_omni.distributed.omni_coordinator import (
 )
 from vllm_omni.distributed.omni_coordinator.load_balancer import Task
 from vllm_omni.diffusion.sched.interface import SamplingParamsKey
+from vllm_omni.diffusion.sched.step_cost_model import (
+    DiffusionStepCostModel,
+    estimate_request_effective_size,
+)
 from vllm_omni.engine.stage_client import (
     StagePoolClient,
     StagePoolDiffusionClient,
@@ -40,6 +44,91 @@ def _optional_float(value: Any) -> float | None:
         return float(value)
     except (TypeError, ValueError):
         return None
+
+
+def _stage_slo_scheduler_config(stage_vllm_config: Any) -> dict[str, Any]:
+    additional_config = getattr(stage_vllm_config, "additional_config", None)
+    if not isinstance(additional_config, dict):
+        return {}
+    raw = additional_config.get("diffusion_slo_scheduler") or additional_config.get("slo_scheduler") or {}
+    return raw if isinstance(raw, dict) else {}
+
+
+def _stage_model_name(stage_vllm_config: Any) -> str | None:
+    model = getattr(stage_vllm_config, "model", None)
+    if isinstance(model, str):
+        return model
+    model_config = getattr(stage_vllm_config, "model_config", None)
+    for attr in ("model", "served_model_name"):
+        value = getattr(model_config, attr, None)
+        if isinstance(value, str):
+            return value
+    return None
+
+
+def _sampling_dimensions(sampling_params: Any) -> tuple[float | None, float | None]:
+    height = _optional_float(getattr(sampling_params, "height", None))
+    width = _optional_float(getattr(sampling_params, "width", None))
+    return width, height
+
+
+def _dimensions_from_key(key: dict[str, Any] | None) -> tuple[float | None, float | None]:
+    if key is None:
+        return None, None
+    height = _optional_float(key.get("height"))
+    width = _optional_float(key.get("width"))
+    return width, height
+
+
+def _prompt_count_from_request(request: Any) -> float:
+    if isinstance(request, (list, tuple)):
+        return float(max(len(request), 1))
+    prompts = getattr(request, "prompts", None)
+    if isinstance(prompts, (list, tuple)):
+        return float(max(len(prompts), 1))
+    return 1.0
+
+
+def _has_negative_prompt(value: Any) -> bool:
+    if value is None:
+        return False
+    prompts = getattr(value, "prompts", None)
+    if prompts is not None:
+        return _has_negative_prompt(prompts)
+    if isinstance(value, dict):
+        return value.get("negative_prompt") is not None
+    if isinstance(value, (list, tuple)):
+        return any(_has_negative_prompt(item) for item in value)
+    return False
+
+
+def _task_prompt_count(task: Task | None) -> float:
+    if task is None:
+        return 1.0
+    return max(_optional_float(task.get("prompt_count")) or 1.0, 1.0)
+
+
+def _task_effective_size(task: Task | None) -> float:
+    sampling_params = None if task is None else task.get("sampling_params")
+    return _task_prompt_count(task) * estimate_request_effective_size(
+        sampling_params,
+        has_negative_prompt=bool(task.get("has_negative_prompt")) if task is not None else False,
+    )
+
+
+def _snapshot_incremental_step_ms(
+    bucket: dict[str, Any],
+    incoming_eff: float,
+    current_step_ms: float,
+) -> float | None:
+    incremental = _optional_float(bucket.get("incremental_step_ms_if_add_one"))
+    if incremental is None:
+        step_if_add_one = _optional_float(bucket.get("estimated_step_ms_if_add_one"))
+        if step_if_add_one is not None:
+            incremental = max(step_if_add_one - current_step_ms, 0.0)
+    if incremental is None:
+        return None
+    return max(incremental, 0.0) * max(float(incoming_eff), 1.0)
 
 
 @dataclass
@@ -124,6 +213,10 @@ class StagePool:
         self._affinity: dict[str, str] = {}
         self._scheduler_snapshot_cache: dict[int, tuple[float, dict[str, Any]]] = {}
         self._slo_tie_break_cursor = 0
+        slo_config = _stage_slo_scheduler_config(stage_vllm_config)
+        self._slo_cost_model = DiffusionStepCostModel.from_config(slo_config, default_step_ms=1.0)
+        self._slo_default_num_inference_steps = int(_optional_float(slo_config.get("default_num_inference_steps")) or 50)
+        self._slo_decode_ms = _optional_float(slo_config.get("decode_ms")) or 0.0
 
     # ---- Stage-level properties ----
 
@@ -550,7 +643,12 @@ class StagePool:
         params = params_override if params_override is not None else req_state.sampling_params_list[self.stage_id]
         submit_kwargs = dict(submit_kwargs or {})
         if self.stage_type == "diffusion":
-            task: Task = {"request_id": request_id, "sampling_params": params}
+            task: Task = {
+                "request_id": request_id,
+                "sampling_params": params,
+                "prompt_count": _prompt_count_from_request(request),
+                "has_negative_prompt": _has_negative_prompt(request),
+            }
             replica_id = await self._pick_or_select(
                 request_id,
                 task=task,
@@ -778,20 +876,41 @@ class StagePool:
 
         now_s = _time.time() if now_s is None else now_s
         sampling_params = None if task is None else task.get("sampling_params")
-        reference_cost_ms = _optional_float(getattr(sampling_params, "reference_cost_ms", None))
-        slo_ms = _optional_float(getattr(sampling_params, "slo_ms", None))
-        incoming_cost_ms = reference_cost_ms if reference_cost_ms is not None else (slo_ms / 3.0 if slo_ms else 0.0)
-        admit_delay_ms = self._estimate_admit_delay_ms(snapshot, self._sampling_key_dict(sampling_params))
-        return (deadline_s - now_s) * 1000.0 - admit_delay_ms - incoming_cost_ms
+        incoming_key = self._sampling_key_dict(sampling_params)
+        incoming_cost_ms = self._estimate_task_remaining_cost_ms(task, snapshot)
+        admit_delay_ms = self._estimate_admit_delay_ms(
+            snapshot,
+            incoming_key,
+            incoming_effective_size=_task_effective_size(task),
+        )
+        incoming_laxity_ms = (deadline_s - now_s) * 1000.0 - admit_delay_ms - incoming_cost_ms
+        existing_laxity_after_ms = self._estimate_existing_laxity_after_ms(task, snapshot)
+        if existing_laxity_after_ms is None:
+            return incoming_laxity_ms
+        return min(incoming_laxity_ms, existing_laxity_after_ms)
 
     def _estimate_admit_delay_ms(
         self,
         snapshot: dict[str, Any],
         incoming_key: dict[str, Any] | None,
+        *,
+        incoming_effective_size: float = 1.0,
     ) -> float:
         safe_capacity = int(snapshot.get("safe_admit_capacity", 0) or 0)
         if safe_capacity > 0 and int(snapshot.get("num_waiting", 0) or 0) <= 0:
-            return 0.0
+            if int(snapshot.get("num_running", 0) or 0) <= 0:
+                return 0.0
+            buckets = snapshot.get("buckets")
+            if isinstance(buckets, list) and buckets:
+                step_candidates = [
+                    float(bucket.get("estimated_step_ms", 0.0) or 0.0)
+                    for bucket in buckets
+                    if isinstance(bucket, dict)
+                ]
+                step_candidates = [value for value in step_candidates if value > 0]
+                if step_candidates:
+                    return min(step_candidates)
+            return float(snapshot.get("num_running", 0) or 0)
 
         buckets = snapshot.get("buckets")
         if not isinstance(buckets, list) or not buckets:
@@ -805,9 +924,135 @@ class StagePool:
             min_remaining_steps = float(bucket.get("min_remaining_steps", 1.0) or 1.0)
             delay_ms = max(estimated_step_ms * max(min_remaining_steps, 1.0), 0.0)
             if bucket.get("key") == incoming_key:
-                delay_ms *= 0.95
+                # Same-key requests can be admitted at a step boundary. If
+                # capacity is available but older waiting requests exist, charge
+                # one representative step instead of the whole bucket tail.
+                if safe_capacity > 0:
+                    delay_ms = min(delay_ms, estimated_step_ms)
+                else:
+                    delay_ms *= 0.95
             candidates.append(delay_ms)
         return min(candidates) if candidates else 0.0
+
+    def _estimate_task_remaining_cost_ms(self, task: Task | None, snapshot: dict[str, Any]) -> float:
+        sampling_params = None if task is None else task.get("sampling_params")
+        if sampling_params is None:
+            return 0.0
+
+        remaining_steps = self._task_remaining_steps(sampling_params)
+        step_estimate = self._estimate_incoming_step(
+            sampling_params,
+            snapshot,
+            prompt_count=_task_prompt_count(task),
+            has_negative_prompt=bool(task.get("has_negative_prompt")),
+        )
+        if step_estimate is not None and step_estimate.source != "default":
+            return remaining_steps * step_estimate.step_ms + self._slo_decode_ms
+
+        reference_cost_ms = _optional_float(getattr(sampling_params, "reference_cost_ms", None))
+        if reference_cost_ms is not None:
+            return reference_cost_ms
+        slo_ms = _optional_float(getattr(sampling_params, "slo_ms", None))
+        if slo_ms is not None:
+            return slo_ms / 3.0
+        return 0.0
+
+    def _estimate_incoming_step(
+        self,
+        sampling_params: Any,
+        snapshot: dict[str, Any],
+        *,
+        prompt_count: float = 1.0,
+        has_negative_prompt: bool = False,
+    ) -> Any | None:
+        if self._slo_cost_model is None:
+            return None
+        width, height = _sampling_dimensions(sampling_params)
+        incoming_eff = max(prompt_count, 1.0) * estimate_request_effective_size(
+            sampling_params,
+            has_negative_prompt=has_negative_prompt,
+        )
+        effective_batch_size = incoming_eff
+        batch_size = 1
+        incoming_key = self._sampling_key_dict(sampling_params)
+        bucket = self._matching_bucket(snapshot, incoming_key)
+        if bucket is not None:
+            effective_batch_size += float(bucket.get("effective_batch_size", bucket.get("candidate_batch_size", 0)) or 0)
+            batch_size += int(bucket.get("candidate_batch_size", 0) or 0)
+        return self._slo_cost_model.estimate(
+            model=_stage_model_name(self._stage_vllm_config),
+            width=width,
+            height=height,
+            num_frames=getattr(sampling_params, "num_frames", 1),
+            batch_size=batch_size,
+            effective_batch_size=effective_batch_size,
+        )
+
+    def _estimate_existing_laxity_after_ms(
+        self,
+        task: Task | None,
+        snapshot: dict[str, Any],
+    ) -> float | None:
+        sampling_params = None if task is None else task.get("sampling_params")
+        if sampling_params is None:
+            return None
+        incoming_key = self._sampling_key_dict(sampling_params)
+        bucket = self._matching_bucket(snapshot, incoming_key)
+        if bucket is None:
+            return None
+        min_laxity_ms = _optional_float(bucket.get("min_laxity_ms"))
+        if min_laxity_ms is None:
+            return None
+        current_step_ms = _optional_float(bucket.get("estimated_step_ms"))
+        if current_step_ms is None:
+            return None
+        shape = bucket.get("shape")
+        width = height = frames = None
+        if isinstance(shape, dict):
+            width = _optional_float(shape.get("width"))
+            height = _optional_float(shape.get("height"))
+            frames = _optional_float(shape.get("num_frames"))
+        if width is None or height is None:
+            width, height = _dimensions_from_key(incoming_key)
+        incoming_eff = _task_effective_size(task)
+        current_eff = float(bucket.get("effective_batch_size", bucket.get("candidate_batch_size", 0)) or 0)
+        extra_per_step_ms = None
+        if self._slo_cost_model is not None:
+            estimate = self._slo_cost_model.estimate(
+                model=_stage_model_name(self._stage_vllm_config),
+                width=width,
+                height=height,
+                num_frames=frames or getattr(sampling_params, "num_frames", 1),
+                batch_size=int(bucket.get("candidate_batch_size", 0) or 0) + 1,
+                effective_batch_size=current_eff + incoming_eff,
+            )
+            if estimate.source != "default":
+                extra_per_step_ms = max(estimate.step_ms - current_step_ms, 0.0)
+        if extra_per_step_ms is None:
+            extra_per_step_ms = _snapshot_incremental_step_ms(bucket, incoming_eff, current_step_ms)
+        if extra_per_step_ms is None:
+            return None
+        remaining = float(bucket.get("min_remaining_steps", 1.0) or 1.0)
+        return min_laxity_ms - extra_per_step_ms * max(remaining, 1.0)
+
+    @staticmethod
+    def _matching_bucket(snapshot: dict[str, Any], incoming_key: dict[str, Any] | None) -> dict[str, Any] | None:
+        if incoming_key is None:
+            return None
+        buckets = snapshot.get("buckets")
+        if not isinstance(buckets, list):
+            return None
+        for bucket in buckets:
+            if isinstance(bucket, dict) and bucket.get("key") == incoming_key:
+                return bucket
+        return None
+
+    def _task_remaining_steps(self, sampling_params: Any) -> int:
+        total_steps = _optional_float(getattr(sampling_params, "num_inference_steps", None))
+        if total_steps is None:
+            total_steps = float(self._slo_default_num_inference_steps)
+        step_index = _optional_float(getattr(sampling_params, "step_index", None)) or 0.0
+        return max(int(total_steps - step_index), 1)
 
     def _task_has_deadline(self, task: Task | None) -> bool:
         return self._task_deadline_time_s(task) is not None

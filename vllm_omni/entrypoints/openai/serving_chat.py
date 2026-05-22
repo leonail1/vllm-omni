@@ -2413,6 +2413,10 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
                     guidance_scale_2=guidance_scale_2,
                     layers=layers,
                     resolution=resolution,
+                    reference_cost_ms=getattr(gen_params, "reference_cost_ms", None),
+                    slo_ms=getattr(gen_params, "slo_ms", None),
+                    arrival_time_s=getattr(gen_params, "arrival_time_s", None),
+                    deadline_time_s=getattr(gen_params, "deadline_time_s", None),
                 )
                 if lora_body and isinstance(lora_body, dict):
                     try:

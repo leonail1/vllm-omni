@@ -1,0 +1,70 @@
+{
+  "config": {
+    "num_requests": 80,
+    "interarrival_s": 14.0,
+    "max_num_seqs": 4,
+    "steps": 50,
+    "slo_scale": 3.0,
+    "batch_growth_alpha": 0.6,
+    "workload": "mixed_slo",
+    "shape_order": "interleaved",
+    "large_period": null,
+    "tight_slo_scale": 3.5,
+    "loose_slo_scale": 20.0,
+    "model": "Qwen/Qwen-Image",
+    "step_cost_model_path": "benchmarks/diffusion/profile_results/latent_token_aspect/step_cost_model.json",
+    "step_cost_metric": "p90_ms",
+    "step_cost_formula": "qwen_image_910b_tp2_v1",
+    "step_cost_safety_factor": 1.0,
+    "output_file": "benchmark_outputs/slo_cost_oracle_final/mixed_slo_ia14_t35_l20.json"
+  },
+  "cost_model_enabled": true,
+  "results": [
+    {
+      "policy": "StepScheduler",
+      "requests": 80,
+      "slo_attainment": 0.675,
+      "slo_misses": 26,
+      "slo_misses_by_shape": {
+        "1024x1024": {
+          "requests": 20,
+          "slo_misses": 0
+        },
+        "768x768": {
+          "requests": 60,
+          "slo_misses": 26
+        }
+      },
+      "makespan_s": 1161.5580532832826,
+      "throughput_rps": 0.06887301049988026,
+      "mean_e2e_s": 52.861833653342856,
+      "p95_e2e_s": 79.16869821957947,
+      "mean_batch_size": 1.9147917663954046,
+      "p95_batch_size": 3.0,
+      "steps_executed": 2089
+    },
+    {
+      "policy": "SloStepScheduler",
+      "requests": 80,
+      "slo_attainment": 0.9625,
+      "slo_misses": 3,
+      "slo_misses_by_shape": {
+        "1024x1024": {
+          "requests": 20,
+          "slo_misses": 0
+        },
+        "768x768": {
+          "requests": 60,
+          "slo_misses": 3
+        }
+      },
+      "makespan_s": 1174.242230573566,
+      "throughput_rps": 0.06812904349464888,
+      "mean_e2e_s": 64.88350601978628,
+      "p95_e2e_s": 205.04322852173885,
+      "mean_batch_size": 1.9880715705765408,
+      "p95_batch_size": 4.0,
+      "steps_executed": 2012
+    }
+  ]
+}
