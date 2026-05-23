@@ -96,9 +96,10 @@ def make_trace(args: argparse.Namespace) -> None:
                 "slo_ms": slo_ms,
                 "extra_body": {
                     "extra_args": {
-                        "profile_mode": "e2e_slo_first",
+                        "profile_mode": args.profile_mode,
                         "profile_policy": args.profile_policy,
                         "profile_scale": args.slo_scale,
+                        "profile_repeat": args.profile_repeat,
                         "profile_trace_id": args.trace_id,
                         "profile_shape": f"{width}x{height}",
                     }
@@ -350,6 +351,8 @@ def main() -> None:
     make.add_argument("--output", required=True)
     make.add_argument("--trace-id", required=True)
     make.add_argument("--profile-policy", default="")
+    make.add_argument("--profile-mode", default="e2e_slo_first")
+    make.add_argument("--profile-repeat", type=int, default=0)
     make.add_argument("--num-requests", type=int, default=80)
     make.add_argument("--global-interarrival-s", type=float, default=4.25)
     make.add_argument("--slo-scale", type=float, required=True)

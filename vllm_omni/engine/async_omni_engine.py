@@ -1215,10 +1215,16 @@ class AsyncOmniEngine:
                 raise RuntimeError(f"Stage {plan.stage_idx} initialization completed with a missing client")
 
             clients: list[StagePoolClient] = [client for client in replica_clients if client is not None]
-            stage_vllm_config = None
+            stage_vllm_config = plan.replicas[0].stage_vllm_config
+            stage_slo_config = stage_vllm_config
             output_processor = None
-            if plan.replicas[0].metadata.stage_type != "diffusion":
-                stage_vllm_config = plan.replicas[0].stage_vllm_config
+            if plan.replicas[0].metadata.stage_type == "diffusion":
+                stage_slo_config = build_diffusion_config(
+                    self.model,
+                    plan.replicas[0].stage_cfg,
+                    plan.replicas[0].metadata,
+                )
+            else:
                 assert stage_vllm_config is not None
                 output_processor = build_llm_stage_output_processor(plan, stage_vllm_config)
 
@@ -1228,6 +1234,7 @@ class AsyncOmniEngine:
                     clients,
                     output_processor=output_processor,
                     stage_vllm_config=stage_vllm_config,
+                    stage_slo_config=stage_slo_config,
                 )
             )
             default_sampling_params_list.append(first_client.default_sampling_params)

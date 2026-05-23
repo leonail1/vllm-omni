@@ -290,6 +290,7 @@ class OmniDiffusionSamplingParams:
     slo_ms: float | None = None
     arrival_time_s: float | None = None
     deadline_time_s: float | None = None
+    client_request_id: str | None = None
 
     # Misc
     save_output: bool = True

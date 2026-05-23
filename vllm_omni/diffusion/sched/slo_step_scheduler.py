@@ -47,6 +47,9 @@ class SloStepScheduler(StepScheduler):
         self.cost_model: DiffusionStepCostModel | None = None
         self.preemption_laxity_margin_ms = 0.0
         self.preemption_safe_laxity_ms = 1000.0
+        self.enable_step_preemption = True
+        self.ignore_request_reference_cost = False
+        self.use_shape_fallback_cost = True
 
     def initialize(self, od_config) -> None:
         super().initialize(od_config)
@@ -63,6 +66,9 @@ class SloStepScheduler(StepScheduler):
             slo_config.get("preemption_safe_laxity_ms"),
             1000.0,
         )
+        self.enable_step_preemption = _coerce_bool(slo_config.get("enable_step_preemption"), True)
+        self.ignore_request_reference_cost = _coerce_bool(slo_config.get("ignore_request_reference_cost"), False)
+        self.use_shape_fallback_cost = _coerce_bool(slo_config.get("use_shape_fallback_cost"), True)
         self.cost_model = DiffusionStepCostModel.from_config(
             slo_config,
             default_step_ms=self.default_step_ms,
@@ -77,7 +83,7 @@ class SloStepScheduler(StepScheduler):
         if bucket is None:
             return self._empty_schedule()
 
-        selected_key, selected_ids = bucket
+        selected_key, selected_ids, debug_info = bucket
         selected_set = set(selected_ids)
         original_running = list(self._running)
         original_running_set = set(original_running)
@@ -125,6 +131,7 @@ class SloStepScheduler(StepScheduler):
             finished_req_ids=set(self._finished_req_ids),
             num_running_reqs=len(self._running),
             num_waiting_reqs=len(self._waiting),
+            debug_info=debug_info,
         )
         self._step_id += 1
         self._finished_req_ids.clear()
@@ -194,7 +201,7 @@ class SloStepScheduler(StepScheduler):
                 return True
         return False
 
-    def _select_bucket(self, now_s: float) -> tuple[SamplingParamsKey | None, list[str]] | None:
+    def _select_bucket(self, now_s: float) -> tuple[SamplingParamsKey | None, list[str], dict[str, Any]] | None:
         candidates: list[tuple[tuple[float, float, float, float, float, int], SamplingParamsKey | None, list[str]]] = []
         for key, states in self._candidate_batches(now_s):
             step_ms = self._estimate_step_ms(states)
@@ -212,15 +219,48 @@ class SloStepScheduler(StepScheduler):
 
         all_without_deadline = all(candidate[0][0] > 0 for candidate in candidates)
         if all_without_deadline:
-            return self._fifo_fallback_bucket()
+            fallback = self._fifo_fallback_bucket()
+            if fallback is None:
+                return None
+            key, sched_req_ids = fallback
+            return key, sched_req_ids, {"policy": "fifo_fallback", "candidate_count": len(candidates)}
 
         selected = min(candidates, key=lambda item: item[0])
         current = self._current_running_candidate(candidates)
-        if current is not None and current is not selected and self._should_keep_current_bucket(current, selected):
-            selected = current
+        if current is not None and current is not selected:
+            if not self.enable_step_preemption or self._should_keep_current_bucket(current, selected):
+                selected = current
 
         _, key, sched_req_ids = selected
-        return key, sched_req_ids
+        return key, sched_req_ids, self._selection_debug(candidates, selected, now_s)
+
+    def _selection_debug(
+        self,
+        candidates: list[tuple[tuple[float, float, float, float, float, int], SamplingParamsKey | None, list[str]]],
+        selected: tuple[tuple[float, float, float, float, float, int], SamplingParamsKey | None, list[str]],
+        now_s: float,
+    ) -> dict[str, Any]:
+        debug_candidates = []
+        for score, key, sched_req_ids in candidates:
+            debug_candidates.append(
+                {
+                    "key": None if key is None else asdict(key),
+                    "sched_req_ids": list(sched_req_ids),
+                    "score": list(score),
+                    "min_laxity_ms": score[3],
+                    "batch_size": len(sched_req_ids),
+                }
+            )
+        _, selected_key, selected_ids = selected
+        return {
+            "policy": "slo",
+            "timestamp_s": now_s,
+            "enable_step_preemption": self.enable_step_preemption,
+            "selected_key": None if selected_key is None else asdict(selected_key),
+            "selected_req_ids": list(selected_ids),
+            "candidate_count": len(candidates),
+            "candidates": debug_candidates,
+        }
 
     def _current_running_candidate(
         self,
@@ -284,6 +324,15 @@ class SloStepScheduler(StepScheduler):
         return buckets
 
     def _select_states_for_key(self, states: list[DiffusionRequestState], now_s: float) -> list[DiffusionRequestState]:
+        if not self.enable_step_preemption:
+            running = [state for state in states if state.sched_req_id in self._running]
+            waiting = [state for state in states if state.sched_req_id not in self._running]
+            selected = running[: self.max_num_running_reqs]
+            if len(selected) >= self.max_num_running_reqs:
+                return selected
+            waiting = sorted(waiting, key=lambda state: self._state_admission_priority(state, now_s))
+            return [*selected, *waiting[: self.max_num_running_reqs - len(selected)]]
+
         ordered = sorted(states, key=lambda state: self._state_admission_priority(state, now_s))
         selected: list[DiffusionRequestState] = []
         for state in ordered[: self.max_num_running_reqs]:
@@ -382,7 +431,12 @@ class SloStepScheduler(StepScheduler):
                 continue
 
             progress = self._request_progress.get(state.sched_req_id)
-            if state.reference_cost_ms is not None and state.reference_cost_ms > 0 and progress is not None:
+            if (
+                not self.ignore_request_reference_cost
+                and state.reference_cost_ms is not None
+                and state.reference_cost_ms > 0
+                and progress is not None
+            ):
                 single_step_candidates.append(max(state.reference_cost_ms / max(progress.total_steps, 1), 0.001))
                 continue
 
@@ -419,6 +473,8 @@ class SloStepScheduler(StepScheduler):
         return max(after - current, 0.0)
 
     def _shape_fallback_step_ms(self, state: DiffusionRequestState) -> float:
+        if not self.use_shape_fallback_cost:
+            return self.default_step_ms
         sampling = state.req.sampling_params
         height = _coerce_float(getattr(sampling, "height", None))
         width = _coerce_float(getattr(sampling, "width", None))
@@ -497,3 +553,15 @@ def _coerce_nonnegative_float(value: Any, default: float) -> float:
     if parsed is None or parsed < 0:
         return default
     return parsed
+
+
+def _coerce_bool(value: Any, default: bool) -> bool:
+    if value is None:
+        return default
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return bool(value)
+    if isinstance(value, str):
+        return value.strip().lower() in {"1", "true", "yes", "on"}
+    return default

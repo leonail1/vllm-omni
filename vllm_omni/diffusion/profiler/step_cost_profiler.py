@@ -91,8 +91,17 @@ class DiffusionStepCostProfiler:
         if not self.enabled or not states:
             return
 
-        sampling_params = [state.sampling for state in states]
         now_s = time.time()
+        sampling_params = [_state_sampling(state) for state in states]
+        step_indices_before = (
+            step_indices if step_indices is not None else [_state_step_index(state) for state in states]
+        )
+        post_step_indices = [_state_step_index(state) for state in states]
+        total_steps = [_state_total_steps(state) for state in states]
+        arrival_time_s = [_state_arrival_time_s(state, now_s) for state in states]
+        deadline_time_s = [_state_deadline_time_s(state) for state in states]
+        reference_cost_ms = [_state_reference_cost_ms(state) for state in states]
+        slo_ms = [_state_slo_ms(state) for state in states]
         record: dict[str, Any] = {
             "timestamp_s": now_s,
             "model": getattr(self.od_config, "model", None),
@@ -105,28 +114,24 @@ class DiffusionStepCostProfiler:
             "tp_size": getattr(getattr(self.od_config, "parallel_config", None), "tensor_parallel_size", None),
             "max_num_seqs": getattr(self.od_config, "max_num_seqs", None),
             "global_scheduler_step_id": getattr(scheduler_output, "step_id", None),
+            "scheduler_debug": getattr(scheduler_output, "debug_info", None),
             "num_running_reqs": getattr(scheduler_output, "num_running_reqs", None),
             "num_waiting_reqs": getattr(scheduler_output, "num_waiting_reqs", None),
             "request_ids": [state.req_id for state in states],
             "scheduled_req_ids": list(getattr(scheduler_output, "scheduled_req_ids", [])),
             "batch_size": len(states),
             "effective_batch_size": _effective_batch_size(states),
-            "step_indices": step_indices if step_indices is not None else [int(state.step_index) for state in states],
-            "post_step_indices": [int(state.step_index) for state in states],
-            "remaining_steps": [max(int(state.total_steps) - int(state.step_index), 0) for state in states],
-            "total_steps": [int(state.total_steps) for state in states],
-            "arrival_time_s": [float(state.arrival_time_s) for state in states],
-            "deadline_time_s": [
-                float(state.deadline_time_s) if state.deadline_time_s is not None else None for state in states
-            ],
-            "reference_cost_ms": [
-                float(state.reference_cost_ms) if state.reference_cost_ms is not None else None for state in states
-            ],
-            "slo_ms": [float(state.slo_ms) if state.slo_ms is not None else None for state in states],
-            "age_ms": [(now_s - float(state.arrival_time_s)) * 1000.0 for state in states],
+            "step_indices": step_indices_before,
+            "post_step_indices": post_step_indices,
+            "remaining_steps": [max(total - step, 0) for total, step in zip(total_steps, post_step_indices)],
+            "total_steps": total_steps,
+            "arrival_time_s": arrival_time_s,
+            "deadline_time_s": deadline_time_s,
+            "reference_cost_ms": reference_cost_ms,
+            "slo_ms": slo_ms,
+            "age_ms": [(now_s - arrival) * 1000.0 for arrival in arrival_time_s],
             "time_to_deadline_ms": [
-                (float(state.deadline_time_s) - now_s) * 1000.0 if state.deadline_time_s is not None else None
-                for state in states
+                (deadline - now_s) * 1000.0 if deadline is not None else None for deadline in deadline_time_s
             ],
             "shape_key": _shape_key(sampling_params[0]),
             "shapes": [_shape_dict(params) for params in sampling_params],
@@ -225,8 +230,11 @@ def _effective_batch_size(states: list[DiffusionRequestState]) -> float:
 
 
 def _request_effective_size(state: DiffusionRequestState) -> float:
-    sampling = state.sampling
-    prompt_count = len(state.prompts) if state.prompts else 1
+    sampling = _state_sampling(state)
+    prompts = getattr(state, "prompts", None)
+    if prompts is None:
+        prompts = getattr(getattr(state, "req", None), "prompts", None)
+    prompt_count = len(prompts) if prompts else 1
     outputs = _optional_float(getattr(sampling, "num_outputs_per_prompt", None)) or 1.0
     guidance = 2.0 if bool(getattr(state, "do_true_cfg", False)) else 1.0
     return max(prompt_count, 1) * max(outputs, 1.0) * guidance
@@ -248,7 +256,7 @@ def _profile_tags(states: list[DiffusionRequestState]) -> dict[str, Any]:
     for key in keys:
         values = []
         for state in states:
-            extra_args = getattr(state.sampling, "extra_args", None)
+            extra_args = getattr(_state_sampling(state), "extra_args", None)
             if isinstance(extra_args, dict) and key in extra_args:
                 values.append(extra_args[key])
         if not values:
@@ -265,6 +273,58 @@ def _profile_replica_id(od_config: Any) -> int | None:
     if isinstance(additional_config, dict):
         return _optional_int(additional_config.get("_omni_replica_id"))
     return None
+
+
+def _state_sampling(state: DiffusionRequestState) -> Any:
+    sampling = getattr(state, "sampling", None)
+    if sampling is not None:
+        return sampling
+    req = getattr(state, "req", None)
+    return getattr(req, "sampling_params", None)
+
+
+def _state_step_index(state: DiffusionRequestState) -> int:
+    value = _optional_int(getattr(state, "step_index", None))
+    if value is not None:
+        return value
+    return _optional_int(getattr(_state_sampling(state), "step_index", None)) or 0
+
+
+def _state_total_steps(state: DiffusionRequestState) -> int:
+    value = _optional_int(getattr(state, "total_steps", None))
+    if value is not None:
+        return max(value, 1)
+    value = _optional_int(getattr(_state_sampling(state), "num_inference_steps", None))
+    return max(value or 1, 1)
+
+
+def _state_arrival_time_s(state: DiffusionRequestState, default: float) -> float:
+    value = _optional_float(getattr(state, "arrival_time_s", None))
+    if value is not None:
+        return value
+    value = _optional_float(getattr(_state_sampling(state), "arrival_time_s", None))
+    return default if value is None else value
+
+
+def _state_deadline_time_s(state: DiffusionRequestState) -> float | None:
+    value = _optional_float(getattr(state, "deadline_time_s", None))
+    if value is not None:
+        return value
+    return _optional_float(getattr(_state_sampling(state), "deadline_time_s", None))
+
+
+def _state_reference_cost_ms(state: DiffusionRequestState) -> float | None:
+    value = _optional_float(getattr(state, "reference_cost_ms", None))
+    if value is not None:
+        return value
+    return _optional_float(getattr(_state_sampling(state), "reference_cost_ms", None))
+
+
+def _state_slo_ms(state: DiffusionRequestState) -> float | None:
+    value = _optional_float(getattr(state, "slo_ms", None))
+    if value is not None:
+        return value
+    return _optional_float(getattr(_state_sampling(state), "slo_ms", None))
 
 
 def _optional_float(value: Any) -> float | None:

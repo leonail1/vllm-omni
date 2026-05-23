@@ -3,8 +3,9 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import time as _time
-from dataclasses import dataclass, fields
+from dataclasses import MISSING, dataclass, fields
 from typing import TYPE_CHECKING, Any, cast
 
 from vllm.logger import init_logger
@@ -46,6 +47,18 @@ def _optional_float(value: Any) -> float | None:
         return None
 
 
+def _optional_bool(value: Any, default: bool) -> bool:
+    if value is None:
+        return default
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return bool(value)
+    if isinstance(value, str):
+        return value.strip().lower() in {"1", "true", "yes", "on"}
+    return default
+
+
 def _stage_slo_scheduler_config(stage_vllm_config: Any) -> dict[str, Any]:
     additional_config = getattr(stage_vllm_config, "additional_config", None)
     if not isinstance(additional_config, dict):
@@ -66,9 +79,17 @@ def _stage_model_name(stage_vllm_config: Any) -> str | None:
     return None
 
 
+def _sampling_get(sampling_params: Any, name: str, default: Any = None) -> Any:
+    if sampling_params is None:
+        return default
+    if isinstance(sampling_params, dict):
+        return sampling_params.get(name, default)
+    return getattr(sampling_params, name, default)
+
+
 def _sampling_dimensions(sampling_params: Any) -> tuple[float | None, float | None]:
-    height = _optional_float(getattr(sampling_params, "height", None))
-    width = _optional_float(getattr(sampling_params, "width", None))
+    height = _optional_float(_sampling_get(sampling_params, "height"))
+    width = _optional_float(_sampling_get(sampling_params, "width"))
     return width, height
 
 
@@ -178,6 +199,7 @@ class StagePool:
         *,
         output_processor: Any = None,
         stage_vllm_config: Any = None,
+        stage_slo_config: Any = None,
     ) -> None:
         if isinstance(clients, list):
             normalized_clients: list[StagePoolClient] = list(clients)
@@ -192,6 +214,7 @@ class StagePool:
         self.clients: list[StagePoolClient | None] = list(normalized_clients)
         self._output_processor = output_processor
         self._stage_vllm_config = stage_vllm_config
+        self._stage_slo_config = stage_slo_config if stage_slo_config is not None else stage_vllm_config
         self._next_replica_id = 0
         self._request_bindings: dict[str, int] = {}
         self._replica_metrics: list[_ReplicaMetrics] = [_ReplicaMetrics() for _ in self.clients]
@@ -213,10 +236,19 @@ class StagePool:
         self._affinity: dict[str, str] = {}
         self._scheduler_snapshot_cache: dict[int, tuple[float, dict[str, Any]]] = {}
         self._slo_tie_break_cursor = 0
-        slo_config = _stage_slo_scheduler_config(stage_vllm_config)
+        slo_config = _stage_slo_scheduler_config(self._stage_slo_config)
+        self._enable_stagepool_slo = _optional_bool(
+            slo_config.get("enable_stagepool_slo"),
+            self._default_stagepool_slo_enabled(self._stage_slo_config),
+        )
+        self._slo_default_step_ms = _optional_float(slo_config.get("default_step_ms")) or 1.0
         self._slo_cost_model = DiffusionStepCostModel.from_config(slo_config, default_step_ms=1.0)
         self._slo_default_num_inference_steps = int(_optional_float(slo_config.get("default_num_inference_steps")) or 50)
         self._slo_decode_ms = _optional_float(slo_config.get("decode_ms")) or 0.0
+        self._slo_ignore_reference_cost = _optional_bool(slo_config.get("ignore_request_reference_cost"), False)
+        profile_config = self._stage_profile_config(self._stage_slo_config)
+        self._stagepool_profile_enabled = _optional_bool(profile_config.get("enabled"), False)
+        self._stagepool_profile_path = profile_config.get("output_path")
 
     # ---- Stage-level properties ----
 
@@ -402,6 +434,14 @@ class StagePool:
                 lb_idx = slo_idx if slo_idx is not None else self._lb.select(task, [rep for rep, _ in candidates])
                 replica_info, replica_id = candidates[lb_idx]
                 self._affinity[request_id] = replica_info.input_addr
+                if slo_idx is None and self.stage_type == "diffusion":
+                    self._write_stagepool_profile(
+                        "distributed_lb_select",
+                        task,
+                        replica_id,
+                        self._distributed_candidate_profile(candidates),
+                        _time.time(),
+                    )
                 return replica_id
 
             now = _time.monotonic()
@@ -747,6 +787,15 @@ class StagePool:
             if replica_id is not None:
                 self._request_bindings[request_id] = replica_id
                 return replica_id
+            replica_id = self.select_replica_id(request_id, affinity_request_id=affinity_request_id)
+            self._write_stagepool_profile(
+                "local_lb_select",
+                task,
+                replica_id,
+                self._local_candidate_profile(),
+                _time.time(),
+            )
+            return replica_id
         return self.select_replica_id(request_id, affinity_request_id=affinity_request_id)
 
     async def _select_slo_aware_candidate_index(
@@ -754,7 +803,7 @@ class StagePool:
         candidates: list[tuple[ReplicaInfo, int]],
         task: Task | None,
     ) -> int | None:
-        if not self._task_has_deadline(task) or len(candidates) <= 1:
+        if not self._enable_stagepool_slo or not self._task_has_deadline(task) or len(candidates) <= 1:
             return None
 
         snapshots = await asyncio.gather(
@@ -762,6 +811,7 @@ class StagePool:
             return_exceptions=True,
         )
         scored: list[tuple[float, int, int, int, int]] = []
+        profile_candidates: list[dict[str, Any]] = []
         cursor = self._slo_tie_break_cursor % len(candidates)
         now_s = _time.time()
         for idx, ((replica_info, _), snapshot) in enumerate(zip(candidates, snapshots, strict=False)):
@@ -774,16 +824,36 @@ class StagePool:
             )
             tie_rank = (idx - cursor) % len(candidates)
             scored.append((-predicted_laxity_ms, -safe_capacity, queue_length, tie_rank, idx))
+            profile_candidates.append(
+                {
+                    "candidate_index": idx,
+                    "replica_id": candidates[idx][1],
+                    "input_addr": replica_info.input_addr,
+                    "predicted_laxity_ms": predicted_laxity_ms,
+                    "safe_capacity": safe_capacity,
+                    "queue_length": queue_length,
+                    "tie_rank": tie_rank,
+                    "snapshot_policy": snapshot.get("policy"),
+                }
+            )
 
         if not scored:
+            self._write_stagepool_profile("distributed_slo_select", task, None, profile_candidates, now_s)
             return None
         selected_idx = min(scored)[-1]
         self._slo_tie_break_cursor = (selected_idx + 1) % len(candidates)
+        self._write_stagepool_profile(
+            "distributed_slo_select",
+            task,
+            candidates[selected_idx][1],
+            profile_candidates,
+            now_s,
+        )
         return selected_idx
 
     async def _select_slo_aware_local_replica_id(self, task: Task) -> int | None:
         live = self.live_replica_ids()
-        if not self._task_has_deadline(task) or len(live) <= 1:
+        if not self._enable_stagepool_slo or not self._task_has_deadline(task) or len(live) <= 1:
             return None
 
         snapshots = await asyncio.gather(
@@ -791,6 +861,7 @@ class StagePool:
             return_exceptions=True,
         )
         scored: list[tuple[float, int, int, int, int]] = []
+        profile_candidates: list[dict[str, Any]] = []
         cursor = self._slo_tie_break_cursor % len(live)
         now_s = _time.time()
         for idx, (replica_id, snapshot) in enumerate(zip(live, snapshots, strict=False)):
@@ -801,13 +872,47 @@ class StagePool:
             queue_length = int(snapshot.get("num_waiting", 0) or 0) + int(snapshot.get("num_running", 0) or 0)
             tie_rank = (idx - cursor) % len(live)
             scored.append((-predicted_laxity_ms, -safe_capacity, queue_length, tie_rank, replica_id))
+            profile_candidates.append(
+                {
+                    "candidate_index": idx,
+                    "replica_id": replica_id,
+                    "predicted_laxity_ms": predicted_laxity_ms,
+                    "safe_capacity": safe_capacity,
+                    "queue_length": queue_length,
+                    "tie_rank": tie_rank,
+                    "snapshot_policy": snapshot.get("policy"),
+                }
+            )
 
         if not scored:
+            self._write_stagepool_profile("local_slo_select", task, None, profile_candidates, now_s)
             return None
         selected_replica_id = min(scored)[-1]
         selected_live_idx = live.index(selected_replica_id)
         self._slo_tie_break_cursor = (selected_live_idx + 1) % len(live)
+        self._write_stagepool_profile("local_slo_select", task, selected_replica_id, profile_candidates, now_s)
         return selected_replica_id
+
+    def _distributed_candidate_profile(self, candidates: list[tuple[ReplicaInfo, int]]) -> list[dict[str, Any]]:
+        return [
+            {
+                "candidate_index": idx,
+                "replica_id": replica_id,
+                "input_addr": replica_info.input_addr,
+                "queue_length": replica_info.queue_length,
+                "status": getattr(replica_info.status, "name", str(replica_info.status)),
+            }
+            for idx, (replica_info, replica_id) in enumerate(candidates)
+        ]
+
+    def _local_candidate_profile(self) -> list[dict[str, Any]]:
+        return [
+            {
+                "candidate_index": idx,
+                "replica_id": replica_id,
+            }
+            for idx, replica_id in enumerate(self.live_replica_ids())
+        ]
 
     async def _get_scheduler_snapshot(self, replica_id: int) -> dict[str, Any] | None:
         now_s = _time.time()
@@ -847,7 +952,7 @@ class StagePool:
             return False
         if not isinstance(snapshot.get("timestamp_s"), (int, float)):
             return False
-        if snapshot.get("policy") != "SloStepScheduler":
+        if snapshot.get("policy") not in {"SloStepScheduler", "StepScheduler"}:
             return False
         buckets = snapshot.get("buckets", [])
         if not isinstance(buckets, list):
@@ -902,14 +1007,28 @@ class StagePool:
                 return 0.0
             buckets = snapshot.get("buckets")
             if isinstance(buckets, list) and buckets:
-                step_candidates = [
+                same_key_steps = [
                     float(bucket.get("estimated_step_ms", 0.0) or 0.0)
                     for bucket in buckets
                     if isinstance(bucket, dict)
+                    and incoming_key is not None
+                    and bucket.get("key") == incoming_key
                 ]
-                step_candidates = [value for value in step_candidates if value > 0]
-                if step_candidates:
-                    return min(step_candidates)
+                same_key_steps = [value for value in same_key_steps if value > 0]
+                if same_key_steps:
+                    return min(same_key_steps)
+                tail_candidates = []
+                for bucket in buckets:
+                    if not isinstance(bucket, dict):
+                        continue
+                    estimated_step_ms = float(bucket.get("estimated_step_ms", 0.0) or 0.0)
+                    max_remaining_steps = float(
+                        bucket.get("max_remaining_steps", bucket.get("min_remaining_steps", 1.0)) or 1.0
+                    )
+                    if estimated_step_ms > 0:
+                        tail_candidates.append(estimated_step_ms * max(max_remaining_steps, 1.0))
+                if tail_candidates:
+                    return min(tail_candidates)
             return float(snapshot.get("num_running", 0) or 0)
 
         buckets = snapshot.get("buckets")
@@ -949,13 +1068,13 @@ class StagePool:
         if step_estimate is not None and step_estimate.source != "default":
             return remaining_steps * step_estimate.step_ms + self._slo_decode_ms
 
-        reference_cost_ms = _optional_float(getattr(sampling_params, "reference_cost_ms", None))
-        if reference_cost_ms is not None:
+        reference_cost_ms = _optional_float(_sampling_get(sampling_params, "reference_cost_ms"))
+        if reference_cost_ms is not None and not self._slo_ignore_reference_cost:
             return reference_cost_ms
-        slo_ms = _optional_float(getattr(sampling_params, "slo_ms", None))
-        if slo_ms is not None:
+        slo_ms = _optional_float(_sampling_get(sampling_params, "slo_ms"))
+        if slo_ms is not None and not self._slo_ignore_reference_cost:
             return slo_ms / 3.0
-        return 0.0
+        return remaining_steps * self._slo_default_step_ms + self._slo_decode_ms
 
     def _estimate_incoming_step(
         self,
@@ -980,10 +1099,10 @@ class StagePool:
             effective_batch_size += float(bucket.get("effective_batch_size", bucket.get("candidate_batch_size", 0)) or 0)
             batch_size += int(bucket.get("candidate_batch_size", 0) or 0)
         return self._slo_cost_model.estimate(
-            model=_stage_model_name(self._stage_vllm_config),
+            model=_stage_model_name(self._stage_slo_config),
             width=width,
             height=height,
-            num_frames=getattr(sampling_params, "num_frames", 1),
+            num_frames=_sampling_get(sampling_params, "num_frames", 1),
             batch_size=batch_size,
             effective_batch_size=effective_batch_size,
         )
@@ -1019,10 +1138,10 @@ class StagePool:
         extra_per_step_ms = None
         if self._slo_cost_model is not None:
             estimate = self._slo_cost_model.estimate(
-                model=_stage_model_name(self._stage_vllm_config),
+                model=_stage_model_name(self._stage_slo_config),
                 width=width,
                 height=height,
-                num_frames=frames or getattr(sampling_params, "num_frames", 1),
+                num_frames=frames or _sampling_get(sampling_params, "num_frames", 1),
                 batch_size=int(bucket.get("candidate_batch_size", 0) or 0) + 1,
                 effective_batch_size=current_eff + incoming_eff,
             )
@@ -1048,10 +1167,10 @@ class StagePool:
         return None
 
     def _task_remaining_steps(self, sampling_params: Any) -> int:
-        total_steps = _optional_float(getattr(sampling_params, "num_inference_steps", None))
+        total_steps = _optional_float(_sampling_get(sampling_params, "num_inference_steps"))
         if total_steps is None:
             total_steps = float(self._slo_default_num_inference_steps)
-        step_index = _optional_float(getattr(sampling_params, "step_index", None)) or 0.0
+        step_index = _optional_float(_sampling_get(sampling_params, "step_index")) or 0.0
         return max(int(total_steps - step_index), 1)
 
     def _task_has_deadline(self, task: Task | None) -> bool:
@@ -1063,29 +1182,96 @@ class StagePool:
         sampling_params = task.get("sampling_params")
         if sampling_params is None:
             return None
-        deadline_time_s = _optional_float(getattr(sampling_params, "deadline_time_s", None))
+        deadline_time_s = _optional_float(_sampling_get(sampling_params, "deadline_time_s"))
         if deadline_time_s is not None:
             return deadline_time_s
-        arrival_time_s = _optional_float(getattr(sampling_params, "arrival_time_s", None)) or _time.time()
-        slo_ms = _optional_float(getattr(sampling_params, "slo_ms", None))
+        arrival_time_s = _optional_float(_sampling_get(sampling_params, "arrival_time_s")) or _time.time()
+        slo_ms = _optional_float(_sampling_get(sampling_params, "slo_ms"))
         if slo_ms is not None:
             return arrival_time_s + slo_ms / 1000.0
-        reference_cost_ms = _optional_float(getattr(sampling_params, "reference_cost_ms", None))
+        reference_cost_ms = _optional_float(_sampling_get(sampling_params, "reference_cost_ms"))
         if reference_cost_ms is not None:
             return arrival_time_s + (3.0 * reference_cost_ms) / 1000.0
         return None
+
+    def _write_stagepool_profile(
+        self,
+        event: str,
+        task: Task | None,
+        selected_replica_id: int | None,
+        candidates: list[dict[str, Any]],
+        timestamp_s: float,
+    ) -> None:
+        if not self._stagepool_profile_enabled or not self._stagepool_profile_path:
+            return
+        sampling_params = None if task is None else task.get("sampling_params")
+        arrival_time_s = None if sampling_params is None else _optional_float(_sampling_get(sampling_params, "arrival_time_s"))
+        deadline_time_s = None if sampling_params is None else _optional_float(
+            _sampling_get(sampling_params, "deadline_time_s")
+        )
+        reference_cost_ms = None if sampling_params is None else _optional_float(
+            _sampling_get(sampling_params, "reference_cost_ms")
+        )
+        slo_ms = None if sampling_params is None else _optional_float(_sampling_get(sampling_params, "slo_ms"))
+        raw_client_request_id = None if sampling_params is None else _sampling_get(sampling_params, "client_request_id")
+        client_request_id = None if raw_client_request_id is None else str(raw_client_request_id)
+        record = {
+            "timestamp_s": timestamp_s,
+            "event": event,
+            "stage_id": self.stage_id,
+            "stage_type": self.stage_type,
+            "request_id": None if task is None else task.get("request_id"),
+            "client_request_id": client_request_id,
+            "selected_replica_id": selected_replica_id,
+            "arrival_time_s": arrival_time_s,
+            "deadline_time_s": deadline_time_s,
+            "reference_cost_ms": reference_cost_ms,
+            "slo_ms": slo_ms,
+            "enable_stagepool_slo": self._enable_stagepool_slo,
+            "candidates": candidates,
+        }
+        try:
+            with open(str(self._stagepool_profile_path), "a", encoding="utf-8") as f:
+                f.write(json.dumps(record, ensure_ascii=False, sort_keys=True) + "\n")
+        except Exception as exc:
+            logger.debug("[StagePool] failed to write stagepool profile: %s", exc)
+
+    @staticmethod
+    def _stage_profile_config(stage_vllm_config: Any) -> dict[str, Any]:
+        additional_config = getattr(stage_vllm_config, "additional_config", None)
+        if not isinstance(additional_config, dict):
+            return {}
+        raw = additional_config.get("diffusion_stagepool_profile") or additional_config.get("stagepool_profile") or {}
+        return raw if isinstance(raw, dict) else {}
+
+    @staticmethod
+    def _default_stagepool_slo_enabled(stage_vllm_config: Any) -> bool:
+        additional_config = getattr(stage_vllm_config, "additional_config", None)
+        if not isinstance(additional_config, dict):
+            return False
+        policy = (
+            additional_config.get("diffusion_scheduler_policy")
+            or additional_config.get("diffusion_step_scheduler_policy")
+            or additional_config.get("scheduler_policy")
+        )
+        return isinstance(policy, str) and policy.lower() in {"slo", "slo_aware", "bucket_slo"}
 
     @staticmethod
     def _sampling_key_dict(sampling_params: Any) -> dict[str, Any] | None:
         if sampling_params is None:
             return None
-        lora_request = getattr(sampling_params, "lora_request", None)
+        lora_request = _sampling_get(sampling_params, "lora_request")
         out: dict[str, Any] = {}
         for field in fields(SamplingParamsKey):
             if field.name == "lora_int_id":
                 out[field.name] = None if lora_request is None else getattr(lora_request, "lora_int_id", None)
             else:
-                out[field.name] = getattr(sampling_params, field.name)
+                default = None
+                if field.default is not MISSING:
+                    default = field.default
+                elif field.default_factory is not MISSING:  # type: ignore[attr-defined]
+                    default = field.default_factory()  # type: ignore[misc]
+                out[field.name] = _sampling_get(sampling_params, field.name, default)
         return out
 
     # ---- Stage-local polling ----

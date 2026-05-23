@@ -2417,6 +2417,7 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
                     slo_ms=getattr(gen_params, "slo_ms", None),
                     arrival_time_s=getattr(gen_params, "arrival_time_s", None),
                     deadline_time_s=getattr(gen_params, "deadline_time_s", None),
+                    client_request_id=getattr(gen_params, "client_request_id", None),
                 )
                 if lora_body and isinstance(lora_body, dict):
                     try:
@@ -3056,6 +3057,7 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
         slo_ms = _optional_float(extra_body.get("slo_ms"))
         arrival_time_s = _optional_float(extra_body.get("arrival_time_s"))
         deadline_time_s = _optional_float(extra_body.get("deadline_time_s"))
+        client_request_id = extra_body.get("client_request_id")
 
         if reference_cost_ms is not None:
             sampling_params.reference_cost_ms = reference_cost_ms
@@ -3067,6 +3069,8 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
         if deadline_time_s is None and slo_ms is not None:
             deadline_time_s = arrival_time_s + slo_ms / 1000.0
         sampling_params.deadline_time_s = deadline_time_s
+        if client_request_id is not None:
+            sampling_params.client_request_id = str(client_request_id)
 
     @staticmethod
     def _resolve_height_width_from_extra_body(extra_body: dict[str, Any]) -> tuple[Any, Any]:

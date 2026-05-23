@@ -125,6 +125,7 @@ class DiffusionSchedulerOutput:
     finished_req_ids: set[str]
     num_running_reqs: int
     num_waiting_reqs: int
+    debug_info: dict[str, Any] | None = None
 
     @cached_property
     def scheduled_req_ids(self) -> list[str]:
