@@ -24,6 +24,7 @@ MASTER_PORT_BASE="${MASTER_PORT_BASE:-26320}"
 BENCHMARK_CONCURRENCY="${BENCHMARK_CONCURRENCY:-128}"
 HEALTH_TIMEOUT_S="${HEALTH_TIMEOUT_S:-2400}"
 CONSTANT_STEP_MS="${CONSTANT_STEP_MS:-400}"
+SKIP_EXISTING="${SKIP_EXISTING:-0}"
 ACTIVE_PID_FILE=""
 
 mkdir -p "${OUTDIR}"
@@ -363,6 +364,19 @@ summarize_results() {
     > "${OUTDIR}/ablation_summary.stdout.json"
 }
 
+policy_results_exist() {
+  local policy="$1"
+  for repeat in ${REPEATS//,/ }; do
+    for scale in ${SCALES//,/ }; do
+      local result="${OUTDIR}/${policy}/repeat_${repeat}/scale_${scale}/benchmark_result.json"
+      if [[ ! -s "${result}" ]]; then
+        return 1
+      fi
+    done
+  done
+  return 0
+}
+
 run_policy() {
   local policy="$1"
   local idx
@@ -370,6 +384,13 @@ run_policy() {
   local port=$((PORT_BASE + idx))
   local master_port=$((MASTER_PORT_BASE + idx))
   local pid_file="${OUTDIR}/${policy}/server.pid"
+
+  if [[ "${SKIP_EXISTING}" == "1" ]] && policy_results_exist "${policy}"; then
+    log "skipping ${policy}: existing benchmark_result.json files cover repeats=${REPEATS}, scales=${SCALES}"
+    summarize_results || true
+    write_status "skipped_${policy}" "Skipped ${policy}; existing results found"
+    return 0
+  fi
 
   write_status "starting_${policy}" "Starting ${policy}"
   start_service "${policy}" "${port}" "${master_port}"
