@@ -1,0 +1,802 @@
+[
+  {
+    "request_id": "full_slo_scale_5.0-0000",
+    "shape": "512x512",
+    "arrival_s": 0.0,
+    "reference_cost_ms": 16651.144148781896,
+    "slo_ms": 83255.72074390948,
+    "deadline_s": 83.25572074390948,
+    "step_cost_ms": 333.0228829756379,
+    "cost_source": "exact_table"
+  },
+  {
+    "request_id": "full_slo_scale_5.0-0001",
+    "shape": "768x768",
+    "arrival_s": 4.25,
+    "reference_cost_ms": 16463.377065956593,
+    "slo_ms": 82316.88532978296,
+    "deadline_s": 86.56688532978296,
+    "step_cost_ms": 329.26754131913185,
+    "cost_source": "exact_table"
+  },
+  {
+    "request_id": "full_slo_scale_5.0-0002",
+    "shape": "512x512",
+    "arrival_s": 8.5,
+    "reference_cost_ms": 16651.144148781896,
+    "slo_ms": 83255.72074390948,
+    "deadline_s": 91.75572074390948,
+    "step_cost_ms": 333.0228829756379,
+    "cost_source": "exact_table"
+  },
+  {
+    "request_id": "full_slo_scale_5.0-0003",
+    "shape": "768x768",
+    "arrival_s": 12.75,
+    "reference_cost_ms": 16463.377065956593,
+    "slo_ms": 82316.88532978296,
+    "deadline_s": 95.06688532978296,
+    "step_cost_ms": 329.26754131913185,
+    "cost_source": "exact_table"
+  },
+  {
+    "request_id": "full_slo_scale_5.0-0004",
+    "shape": "1024x1024",
+    "arrival_s": 17.0,
+    "reference_cost_ms": 23089.30584229529,
+    "slo_ms": 115446.52921147645,
+    "deadline_s": 132.44652921147645,
+    "step_cost_ms": 461.7861168459058,
+    "cost_source": "exact_table"
+  },
+  {
+    "request_id": "full_slo_scale_5.0-0005",
+    "shape": "512x512",
+    "arrival_s": 21.25,
+    "reference_cost_ms": 16651.144148781896,
+    "slo_ms": 83255.72074390948,
+    "deadline_s": 104.50572074390948,
+    "step_cost_ms": 333.0228829756379,
+    "cost_source": "exact_table"
+  },
+  {
+    "request_id": "full_slo_scale_5.0-0006",
+    "shape": "768x768",
+    "arrival_s": 25.5,
+    "reference_cost_ms": 16463.377065956593,
+    "slo_ms": 82316.88532978296,
+    "deadline_s": 107.81688532978296,
+    "step_cost_ms": 329.26754131913185,
+    "cost_source": "exact_table"
+  },
+  {
+    "request_id": "full_slo_scale_5.0-0007",
+    "shape": "512x512",
+    "arrival_s": 29.75,
+    "reference_cost_ms": 16651.144148781896,
+    "slo_ms": 83255.72074390948,
+    "deadline_s": 113.00572074390948,
+    "step_cost_ms": 333.0228829756379,
+    "cost_source": "exact_table"
+  },
+  {
+    "request_id": "full_slo_scale_5.0-0008",
+    "shape": "768x768",
+    "arrival_s": 34.0,
+    "reference_cost_ms": 16463.377065956593,
+    "slo_ms": 82316.88532978296,
+    "deadline_s": 116.31688532978296,
+    "step_cost_ms": 329.26754131913185,
+    "cost_source": "exact_table"
+  },
+  {
+    "request_id": "full_slo_scale_5.0-0009",
+    "shape": "1024x1024",
+    "arrival_s": 38.25,
+    "reference_cost_ms": 23089.30584229529,
+    "slo_ms": 115446.52921147645,
+    "deadline_s": 153.69652921147645,
+    "step_cost_ms": 461.7861168459058,
+    "cost_source": "exact_table"
+  },
+  {
+    "request_id": "full_slo_scale_5.0-0010",
+    "shape": "512x512",
+    "arrival_s": 42.5,
+    "reference_cost_ms": 16651.144148781896,
+    "slo_ms": 83255.72074390948,
+    "deadline_s": 125.75572074390948,
+    "step_cost_ms": 333.0228829756379,
+    "cost_source": "exact_table"
+  },
+  {
+    "request_id": "full_slo_scale_5.0-0011",
+    "shape": "768x768",
+    "arrival_s": 46.75,
+    "reference_cost_ms": 16463.377065956593,
+    "slo_ms": 82316.88532978296,
+    "deadline_s": 129.06688532978296,
+    "step_cost_ms": 329.26754131913185,
+    "cost_source": "exact_table"
+  },
+  {
+    "request_id": "full_slo_scale_5.0-0012",
+    "shape": "512x512",
+    "arrival_s": 51.0,
+    "reference_cost_ms": 16651.144148781896,
+    "slo_ms": 83255.72074390948,
+    "deadline_s": 134.25572074390948,
+    "step_cost_ms": 333.0228829756379,
+    "cost_source": "exact_table"
+  },
+  {
+    "request_id": "full_slo_scale_5.0-0013",
+    "shape": "768x768",
+    "arrival_s": 55.25,
+    "reference_cost_ms": 16463.377065956593,
+    "slo_ms": 82316.88532978296,
+    "deadline_s": 137.56688532978296,
+    "step_cost_ms": 329.26754131913185,
+    "cost_source": "exact_table"
+  },
+  {
+    "request_id": "full_slo_scale_5.0-0014",
+    "shape": "1024x1024",
+    "arrival_s": 59.5,
+    "reference_cost_ms": 23089.30584229529,
+    "slo_ms": 115446.52921147645,
+    "deadline_s": 174.94652921147645,
+    "step_cost_ms": 461.7861168459058,
+    "cost_source": "exact_table"
+  },
+  {
+    "request_id": "full_slo_scale_5.0-0015",
+    "shape": "512x512",
+    "arrival_s": 63.75,
+    "reference_cost_ms": 16651.144148781896,
+    "slo_ms": 83255.72074390948,
+    "deadline_s": 147.00572074390948,
+    "step_cost_ms": 333.0228829756379,
+    "cost_source": "exact_table"
+  },
+  {
+    "request_id": "full_slo_scale_5.0-0016",
+    "shape": "768x768",
+    "arrival_s": 68.0,
+    "reference_cost_ms": 16463.377065956593,
+    "slo_ms": 82316.88532978296,
+    "deadline_s": 150.31688532978296,
+    "step_cost_ms": 329.26754131913185,
+    "cost_source": "exact_table"
+  },
+  {
+    "request_id": "full_slo_scale_5.0-0017",
+    "shape": "512x512",
+    "arrival_s": 72.25,
+    "reference_cost_ms": 16651.144148781896,
+    "slo_ms": 83255.72074390948,
+    "deadline_s": 155.50572074390948,
+    "step_cost_ms": 333.0228829756379,
+    "cost_source": "exact_table"
+  },
+  {
+    "request_id": "full_slo_scale_5.0-0018",
+    "shape": "768x768",
+    "arrival_s": 76.5,
+    "reference_cost_ms": 16463.377065956593,
+    "slo_ms": 82316.88532978296,
+    "deadline_s": 158.81688532978296,
+    "step_cost_ms": 329.26754131913185,
+    "cost_source": "exact_table"
+  },
+  {
+    "request_id": "full_slo_scale_5.0-0019",
+    "shape": "1024x1024",
+    "arrival_s": 80.75,
+    "reference_cost_ms": 23089.30584229529,
+    "slo_ms": 115446.52921147645,
+    "deadline_s": 196.19652921147645,
+    "step_cost_ms": 461.7861168459058,
+    "cost_source": "exact_table"
+  },
+  {
+    "request_id": "full_slo_scale_5.0-0020",
+    "shape": "512x512",
+    "arrival_s": 85.0,
+    "reference_cost_ms": 16651.144148781896,
+    "slo_ms": 83255.72074390948,
+    "deadline_s": 168.25572074390948,
+    "step_cost_ms": 333.0228829756379,
+    "cost_source": "exact_table"
+  },
+  {
+    "request_id": "full_slo_scale_5.0-0021",
+    "shape": "768x768",
+    "arrival_s": 89.25,
+    "reference_cost_ms": 16463.377065956593,
+    "slo_ms": 82316.88532978296,
+    "deadline_s": 171.56688532978296,
+    "step_cost_ms": 329.26754131913185,
+    "cost_source": "exact_table"
+  },
+  {
+    "request_id": "full_slo_scale_5.0-0022",
+    "shape": "512x512",
+    "arrival_s": 93.5,
+    "reference_cost_ms": 16651.144148781896,
+    "slo_ms": 83255.72074390948,
+    "deadline_s": 176.75572074390948,
+    "step_cost_ms": 333.0228829756379,
+    "cost_source": "exact_table"
+  },
+  {
+    "request_id": "full_slo_scale_5.0-0023",
+    "shape": "768x768",
+    "arrival_s": 97.75,
+    "reference_cost_ms": 16463.377065956593,
+    "slo_ms": 82316.88532978296,
+    "deadline_s": 180.06688532978296,
+    "step_cost_ms": 329.26754131913185,
+    "cost_source": "exact_table"
+  },
+  {
+    "request_id": "full_slo_scale_5.0-0024",
+    "shape": "1024x1024",
+    "arrival_s": 102.0,
+    "reference_cost_ms": 23089.30584229529,
+    "slo_ms": 115446.52921147645,
+    "deadline_s": 217.44652921147645,
+    "step_cost_ms": 461.7861168459058,
+    "cost_source": "exact_table"
+  },
+  {
+    "request_id": "full_slo_scale_5.0-0025",
+    "shape": "512x512",
+    "arrival_s": 106.25,
+    "reference_cost_ms": 16651.144148781896,
+    "slo_ms": 83255.72074390948,
+    "deadline_s": 189.50572074390948,
+    "step_cost_ms": 333.0228829756379,
+    "cost_source": "exact_table"
+  },
+  {
+    "request_id": "full_slo_scale_5.0-0026",
+    "shape": "768x768",
+    "arrival_s": 110.5,
+    "reference_cost_ms": 16463.377065956593,
+    "slo_ms": 82316.88532978296,
+    "deadline_s": 192.81688532978296,
+    "step_cost_ms": 329.26754131913185,
+    "cost_source": "exact_table"
+  },
+  {
+    "request_id": "full_slo_scale_5.0-0027",
+    "shape": "512x512",
+    "arrival_s": 114.75,
+    "reference_cost_ms": 16651.144148781896,
+    "slo_ms": 83255.72074390948,
+    "deadline_s": 198.00572074390948,
+    "step_cost_ms": 333.0228829756379,
+    "cost_source": "exact_table"
+  },
+  {
+    "request_id": "full_slo_scale_5.0-0028",
+    "shape": "768x768",
+    "arrival_s": 119.0,
+    "reference_cost_ms": 16463.377065956593,
+    "slo_ms": 82316.88532978296,
+    "deadline_s": 201.31688532978296,
+    "step_cost_ms": 329.26754131913185,
+    "cost_source": "exact_table"
+  },
+  {
+    "request_id": "full_slo_scale_5.0-0029",
+    "shape": "1024x1024",
+    "arrival_s": 123.25,
+    "reference_cost_ms": 23089.30584229529,
+    "slo_ms": 115446.52921147645,
+    "deadline_s": 238.69652921147645,
+    "step_cost_ms": 461.7861168459058,
+    "cost_source": "exact_table"
+  },
+  {
+    "request_id": "full_slo_scale_5.0-0030",
+    "shape": "512x512",
+    "arrival_s": 127.5,
+    "reference_cost_ms": 16651.144148781896,
+    "slo_ms": 83255.72074390948,
+    "deadline_s": 210.75572074390948,
+    "step_cost_ms": 333.0228829756379,
+    "cost_source": "exact_table"
+  },
+  {
+    "request_id": "full_slo_scale_5.0-0031",
+    "shape": "768x768",
+    "arrival_s": 131.75,
+    "reference_cost_ms": 16463.377065956593,
+    "slo_ms": 82316.88532978296,
+    "deadline_s": 214.06688532978296,
+    "step_cost_ms": 329.26754131913185,
+    "cost_source": "exact_table"
+  },
+  {
+    "request_id": "full_slo_scale_5.0-0032",
+    "shape": "512x512",
+    "arrival_s": 136.0,
+    "reference_cost_ms": 16651.144148781896,
+    "slo_ms": 83255.72074390948,
+    "deadline_s": 219.25572074390948,
+    "step_cost_ms": 333.0228829756379,
+    "cost_source": "exact_table"
+  },
+  {
+    "request_id": "full_slo_scale_5.0-0033",
+    "shape": "768x768",
+    "arrival_s": 140.25,
+    "reference_cost_ms": 16463.377065956593,
+    "slo_ms": 82316.88532978296,
+    "deadline_s": 222.56688532978296,
+    "step_cost_ms": 329.26754131913185,
+    "cost_source": "exact_table"
+  },
+  {
+    "request_id": "full_slo_scale_5.0-0034",
+    "shape": "1024x1024",
+    "arrival_s": 144.5,
+    "reference_cost_ms": 23089.30584229529,
+    "slo_ms": 115446.52921147645,
+    "deadline_s": 259.94652921147645,
+    "step_cost_ms": 461.7861168459058,
+    "cost_source": "exact_table"
+  },
+  {
+    "request_id": "full_slo_scale_5.0-0035",
+    "shape": "512x512",
+    "arrival_s": 148.75,
+    "reference_cost_ms": 16651.144148781896,
+    "slo_ms": 83255.72074390948,
+    "deadline_s": 232.00572074390948,
+    "step_cost_ms": 333.0228829756379,
+    "cost_source": "exact_table"
+  },
+  {
+    "request_id": "full_slo_scale_5.0-0036",
+    "shape": "768x768",
+    "arrival_s": 153.0,
+    "reference_cost_ms": 16463.377065956593,
+    "slo_ms": 82316.88532978296,
+    "deadline_s": 235.31688532978296,
+    "step_cost_ms": 329.26754131913185,
+    "cost_source": "exact_table"
+  },
+  {
+    "request_id": "full_slo_scale_5.0-0037",
+    "shape": "512x512",
+    "arrival_s": 157.25,
+    "reference_cost_ms": 16651.144148781896,
+    "slo_ms": 83255.72074390948,
+    "deadline_s": 240.50572074390948,
+    "step_cost_ms": 333.0228829756379,
+    "cost_source": "exact_table"
+  },
+  {
+    "request_id": "full_slo_scale_5.0-0038",
+    "shape": "768x768",
+    "arrival_s": 161.5,
+    "reference_cost_ms": 16463.377065956593,
+    "slo_ms": 82316.88532978296,
+    "deadline_s": 243.81688532978296,
+    "step_cost_ms": 329.26754131913185,
+    "cost_source": "exact_table"
+  },
+  {
+    "request_id": "full_slo_scale_5.0-0039",
+    "shape": "1024x1024",
+    "arrival_s": 165.75,
+    "reference_cost_ms": 23089.30584229529,
+    "slo_ms": 115446.52921147645,
+    "deadline_s": 281.19652921147645,
+    "step_cost_ms": 461.7861168459058,
+    "cost_source": "exact_table"
+  },
+  {
+    "request_id": "full_slo_scale_5.0-0040",
+    "shape": "512x512",
+    "arrival_s": 170.0,
+    "reference_cost_ms": 16651.144148781896,
+    "slo_ms": 83255.72074390948,
+    "deadline_s": 253.25572074390948,
+    "step_cost_ms": 333.0228829756379,
+    "cost_source": "exact_table"
+  },
+  {
+    "request_id": "full_slo_scale_5.0-0041",
+    "shape": "768x768",
+    "arrival_s": 174.25,
+    "reference_cost_ms": 16463.377065956593,
+    "slo_ms": 82316.88532978296,
+    "deadline_s": 256.56688532978296,
+    "step_cost_ms": 329.26754131913185,
+    "cost_source": "exact_table"
+  },
+  {
+    "request_id": "full_slo_scale_5.0-0042",
+    "shape": "512x512",
+    "arrival_s": 178.5,
+    "reference_cost_ms": 16651.144148781896,
+    "slo_ms": 83255.72074390948,
+    "deadline_s": 261.7557207439095,
+    "step_cost_ms": 333.0228829756379,
+    "cost_source": "exact_table"
+  },
+  {
+    "request_id": "full_slo_scale_5.0-0043",
+    "shape": "768x768",
+    "arrival_s": 182.75,
+    "reference_cost_ms": 16463.377065956593,
+    "slo_ms": 82316.88532978296,
+    "deadline_s": 265.06688532978296,
+    "step_cost_ms": 329.26754131913185,
+    "cost_source": "exact_table"
+  },
+  {
+    "request_id": "full_slo_scale_5.0-0044",
+    "shape": "1024x1024",
+    "arrival_s": 187.0,
+    "reference_cost_ms": 23089.30584229529,
+    "slo_ms": 115446.52921147645,
+    "deadline_s": 302.44652921147645,
+    "step_cost_ms": 461.7861168459058,
+    "cost_source": "exact_table"
+  },
+  {
+    "request_id": "full_slo_scale_5.0-0045",
+    "shape": "512x512",
+    "arrival_s": 191.25,
+    "reference_cost_ms": 16651.144148781896,
+    "slo_ms": 83255.72074390948,
+    "deadline_s": 274.5057207439095,
+    "step_cost_ms": 333.0228829756379,
+    "cost_source": "exact_table"
+  },
+  {
+    "request_id": "full_slo_scale_5.0-0046",
+    "shape": "768x768",
+    "arrival_s": 195.5,
+    "reference_cost_ms": 16463.377065956593,
+    "slo_ms": 82316.88532978296,
+    "deadline_s": 277.81688532978296,
+    "step_cost_ms": 329.26754131913185,
+    "cost_source": "exact_table"
+  },
+  {
+    "request_id": "full_slo_scale_5.0-0047",
+    "shape": "512x512",
+    "arrival_s": 199.75,
+    "reference_cost_ms": 16651.144148781896,
+    "slo_ms": 83255.72074390948,
+    "deadline_s": 283.0057207439095,
+    "step_cost_ms": 333.0228829756379,
+    "cost_source": "exact_table"
+  },
+  {
+    "request_id": "full_slo_scale_5.0-0048",
+    "shape": "768x768",
+    "arrival_s": 204.0,
+    "reference_cost_ms": 16463.377065956593,
+    "slo_ms": 82316.88532978296,
+    "deadline_s": 286.31688532978296,
+    "step_cost_ms": 329.26754131913185,
+    "cost_source": "exact_table"
+  },
+  {
+    "request_id": "full_slo_scale_5.0-0049",
+    "shape": "1024x1024",
+    "arrival_s": 208.25,
+    "reference_cost_ms": 23089.30584229529,
+    "slo_ms": 115446.52921147645,
+    "deadline_s": 323.69652921147645,
+    "step_cost_ms": 461.7861168459058,
+    "cost_source": "exact_table"
+  },
+  {
+    "request_id": "full_slo_scale_5.0-0050",
+    "shape": "512x512",
+    "arrival_s": 212.5,
+    "reference_cost_ms": 16651.144148781896,
+    "slo_ms": 83255.72074390948,
+    "deadline_s": 295.7557207439095,
+    "step_cost_ms": 333.0228829756379,
+    "cost_source": "exact_table"
+  },
+  {
+    "request_id": "full_slo_scale_5.0-0051",
+    "shape": "768x768",
+    "arrival_s": 216.75,
+    "reference_cost_ms": 16463.377065956593,
+    "slo_ms": 82316.88532978296,
+    "deadline_s": 299.06688532978296,
+    "step_cost_ms": 329.26754131913185,
+    "cost_source": "exact_table"
+  },
+  {
+    "request_id": "full_slo_scale_5.0-0052",
+    "shape": "512x512",
+    "arrival_s": 221.0,
+    "reference_cost_ms": 16651.144148781896,
+    "slo_ms": 83255.72074390948,
+    "deadline_s": 304.2557207439095,
+    "step_cost_ms": 333.0228829756379,
+    "cost_source": "exact_table"
+  },
+  {
+    "request_id": "full_slo_scale_5.0-0053",
+    "shape": "768x768",
+    "arrival_s": 225.25,
+    "reference_cost_ms": 16463.377065956593,
+    "slo_ms": 82316.88532978296,
+    "deadline_s": 307.56688532978296,
+    "step_cost_ms": 329.26754131913185,
+    "cost_source": "exact_table"
+  },
+  {
+    "request_id": "full_slo_scale_5.0-0054",
+    "shape": "1024x1024",
+    "arrival_s": 229.5,
+    "reference_cost_ms": 23089.30584229529,
+    "slo_ms": 115446.52921147645,
+    "deadline_s": 344.94652921147645,
+    "step_cost_ms": 461.7861168459058,
+    "cost_source": "exact_table"
+  },
+  {
+    "request_id": "full_slo_scale_5.0-0055",
+    "shape": "512x512",
+    "arrival_s": 233.75,
+    "reference_cost_ms": 16651.144148781896,
+    "slo_ms": 83255.72074390948,
+    "deadline_s": 317.0057207439095,
+    "step_cost_ms": 333.0228829756379,
+    "cost_source": "exact_table"
+  },
+  {
+    "request_id": "full_slo_scale_5.0-0056",
+    "shape": "768x768",
+    "arrival_s": 238.0,
+    "reference_cost_ms": 16463.377065956593,
+    "slo_ms": 82316.88532978296,
+    "deadline_s": 320.31688532978296,
+    "step_cost_ms": 329.26754131913185,
+    "cost_source": "exact_table"
+  },
+  {
+    "request_id": "full_slo_scale_5.0-0057",
+    "shape": "512x512",
+    "arrival_s": 242.25,
+    "reference_cost_ms": 16651.144148781896,
+    "slo_ms": 83255.72074390948,
+    "deadline_s": 325.5057207439095,
+    "step_cost_ms": 333.0228829756379,
+    "cost_source": "exact_table"
+  },
+  {
+    "request_id": "full_slo_scale_5.0-0058",
+    "shape": "768x768",
+    "arrival_s": 246.5,
+    "reference_cost_ms": 16463.377065956593,
+    "slo_ms": 82316.88532978296,
+    "deadline_s": 328.81688532978296,
+    "step_cost_ms": 329.26754131913185,
+    "cost_source": "exact_table"
+  },
+  {
+    "request_id": "full_slo_scale_5.0-0059",
+    "shape": "1024x1024",
+    "arrival_s": 250.75,
+    "reference_cost_ms": 23089.30584229529,
+    "slo_ms": 115446.52921147645,
+    "deadline_s": 366.19652921147645,
+    "step_cost_ms": 461.7861168459058,
+    "cost_source": "exact_table"
+  },
+  {
+    "request_id": "full_slo_scale_5.0-0060",
+    "shape": "512x512",
+    "arrival_s": 255.0,
+    "reference_cost_ms": 16651.144148781896,
+    "slo_ms": 83255.72074390948,
+    "deadline_s": 338.2557207439095,
+    "step_cost_ms": 333.0228829756379,
+    "cost_source": "exact_table"
+  },
+  {
+    "request_id": "full_slo_scale_5.0-0061",
+    "shape": "768x768",
+    "arrival_s": 259.25,
+    "reference_cost_ms": 16463.377065956593,
+    "slo_ms": 82316.88532978296,
+    "deadline_s": 341.56688532978296,
+    "step_cost_ms": 329.26754131913185,
+    "cost_source": "exact_table"
+  },
+  {
+    "request_id": "full_slo_scale_5.0-0062",
+    "shape": "512x512",
+    "arrival_s": 263.5,
+    "reference_cost_ms": 16651.144148781896,
+    "slo_ms": 83255.72074390948,
+    "deadline_s": 346.7557207439095,
+    "step_cost_ms": 333.0228829756379,
+    "cost_source": "exact_table"
+  },
+  {
+    "request_id": "full_slo_scale_5.0-0063",
+    "shape": "768x768",
+    "arrival_s": 267.75,
+    "reference_cost_ms": 16463.377065956593,
+    "slo_ms": 82316.88532978296,
+    "deadline_s": 350.06688532978296,
+    "step_cost_ms": 329.26754131913185,
+    "cost_source": "exact_table"
+  },
+  {
+    "request_id": "full_slo_scale_5.0-0064",
+    "shape": "1024x1024",
+    "arrival_s": 272.0,
+    "reference_cost_ms": 23089.30584229529,
+    "slo_ms": 115446.52921147645,
+    "deadline_s": 387.44652921147645,
+    "step_cost_ms": 461.7861168459058,
+    "cost_source": "exact_table"
+  },
+  {
+    "request_id": "full_slo_scale_5.0-0065",
+    "shape": "512x512",
+    "arrival_s": 276.25,
+    "reference_cost_ms": 16651.144148781896,
+    "slo_ms": 83255.72074390948,
+    "deadline_s": 359.5057207439095,
+    "step_cost_ms": 333.0228829756379,
+    "cost_source": "exact_table"
+  },
+  {
+    "request_id": "full_slo_scale_5.0-0066",
+    "shape": "768x768",
+    "arrival_s": 280.5,
+    "reference_cost_ms": 16463.377065956593,
+    "slo_ms": 82316.88532978296,
+    "deadline_s": 362.81688532978296,
+    "step_cost_ms": 329.26754131913185,
+    "cost_source": "exact_table"
+  },
+  {
+    "request_id": "full_slo_scale_5.0-0067",
+    "shape": "512x512",
+    "arrival_s": 284.75,
+    "reference_cost_ms": 16651.144148781896,
+    "slo_ms": 83255.72074390948,
+    "deadline_s": 368.0057207439095,
+    "step_cost_ms": 333.0228829756379,
+    "cost_source": "exact_table"
+  },
+  {
+    "request_id": "full_slo_scale_5.0-0068",
+    "shape": "768x768",
+    "arrival_s": 289.0,
+    "reference_cost_ms": 16463.377065956593,
+    "slo_ms": 82316.88532978296,
+    "deadline_s": 371.31688532978296,
+    "step_cost_ms": 329.26754131913185,
+    "cost_source": "exact_table"
+  },
+  {
+    "request_id": "full_slo_scale_5.0-0069",
+    "shape": "1024x1024",
+    "arrival_s": 293.25,
+    "reference_cost_ms": 23089.30584229529,
+    "slo_ms": 115446.52921147645,
+    "deadline_s": 408.69652921147645,
+    "step_cost_ms": 461.7861168459058,
+    "cost_source": "exact_table"
+  },
+  {
+    "request_id": "full_slo_scale_5.0-0070",
+    "shape": "512x512",
+    "arrival_s": 297.5,
+    "reference_cost_ms": 16651.144148781896,
+    "slo_ms": 83255.72074390948,
+    "deadline_s": 380.7557207439095,
+    "step_cost_ms": 333.0228829756379,
+    "cost_source": "exact_table"
+  },
+  {
+    "request_id": "full_slo_scale_5.0-0071",
+    "shape": "768x768",
+    "arrival_s": 301.75,
+    "reference_cost_ms": 16463.377065956593,
+    "slo_ms": 82316.88532978296,
+    "deadline_s": 384.06688532978296,
+    "step_cost_ms": 329.26754131913185,
+    "cost_source": "exact_table"
+  },
+  {
+    "request_id": "full_slo_scale_5.0-0072",
+    "shape": "512x512",
+    "arrival_s": 306.0,
+    "reference_cost_ms": 16651.144148781896,
+    "slo_ms": 83255.72074390948,
+    "deadline_s": 389.2557207439095,
+    "step_cost_ms": 333.0228829756379,
+    "cost_source": "exact_table"
+  },
+  {
+    "request_id": "full_slo_scale_5.0-0073",
+    "shape": "768x768",
+    "arrival_s": 310.25,
+    "reference_cost_ms": 16463.377065956593,
+    "slo_ms": 82316.88532978296,
+    "deadline_s": 392.56688532978296,
+    "step_cost_ms": 329.26754131913185,
+    "cost_source": "exact_table"
+  },
+  {
+    "request_id": "full_slo_scale_5.0-0074",
+    "shape": "1024x1024",
+    "arrival_s": 314.5,
+    "reference_cost_ms": 23089.30584229529,
+    "slo_ms": 115446.52921147645,
+    "deadline_s": 429.94652921147645,
+    "step_cost_ms": 461.7861168459058,
+    "cost_source": "exact_table"
+  },
+  {
+    "request_id": "full_slo_scale_5.0-0075",
+    "shape": "512x512",
+    "arrival_s": 318.75,
+    "reference_cost_ms": 16651.144148781896,
+    "slo_ms": 83255.72074390948,
+    "deadline_s": 402.0057207439095,
+    "step_cost_ms": 333.0228829756379,
+    "cost_source": "exact_table"
+  },
+  {
+    "request_id": "full_slo_scale_5.0-0076",
+    "shape": "768x768",
+    "arrival_s": 323.0,
+    "reference_cost_ms": 16463.377065956593,
+    "slo_ms": 82316.88532978296,
+    "deadline_s": 405.31688532978296,
+    "step_cost_ms": 329.26754131913185,
+    "cost_source": "exact_table"
+  },
+  {
+    "request_id": "full_slo_scale_5.0-0077",
+    "shape": "512x512",
+    "arrival_s": 327.25,
+    "reference_cost_ms": 16651.144148781896,
+    "slo_ms": 83255.72074390948,
+    "deadline_s": 410.5057207439095,
+    "step_cost_ms": 333.0228829756379,
+    "cost_source": "exact_table"
+  },
+  {
+    "request_id": "full_slo_scale_5.0-0078",
+    "shape": "768x768",
+    "arrival_s": 331.5,
+    "reference_cost_ms": 16463.377065956593,
+    "slo_ms": 82316.88532978296,
+    "deadline_s": 413.81688532978296,
+    "step_cost_ms": 329.26754131913185,
+    "cost_source": "exact_table"
+  },
+  {
+    "request_id": "full_slo_scale_5.0-0079",
+    "shape": "1024x1024",
+    "arrival_s": 335.75,
+    "reference_cost_ms": 23089.30584229529,
+    "slo_ms": 115446.52921147645,
+    "deadline_s": 451.19652921147645,
+    "step_cost_ms": 461.7861168459058,
+    "cost_source": "exact_table"
+  }
+]

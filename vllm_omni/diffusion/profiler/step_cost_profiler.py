@@ -92,8 +92,9 @@ class DiffusionStepCostProfiler:
             return
 
         sampling_params = [state.sampling for state in states]
+        now_s = time.time()
         record: dict[str, Any] = {
-            "timestamp_s": time.time(),
+            "timestamp_s": now_s,
             "model": getattr(self.od_config, "model", None),
             "stage_id": getattr(self.od_config, "stage_id", None),
             "replica_id": self.replica_id,
@@ -104,13 +105,29 @@ class DiffusionStepCostProfiler:
             "tp_size": getattr(getattr(self.od_config, "parallel_config", None), "tensor_parallel_size", None),
             "max_num_seqs": getattr(self.od_config, "max_num_seqs", None),
             "global_scheduler_step_id": getattr(scheduler_output, "step_id", None),
+            "num_running_reqs": getattr(scheduler_output, "num_running_reqs", None),
+            "num_waiting_reqs": getattr(scheduler_output, "num_waiting_reqs", None),
             "request_ids": [state.req_id for state in states],
             "scheduled_req_ids": list(getattr(scheduler_output, "scheduled_req_ids", [])),
             "batch_size": len(states),
             "effective_batch_size": _effective_batch_size(states),
             "step_indices": step_indices if step_indices is not None else [int(state.step_index) for state in states],
             "post_step_indices": [int(state.step_index) for state in states],
+            "remaining_steps": [max(int(state.total_steps) - int(state.step_index), 0) for state in states],
             "total_steps": [int(state.total_steps) for state in states],
+            "arrival_time_s": [float(state.arrival_time_s) for state in states],
+            "deadline_time_s": [
+                float(state.deadline_time_s) if state.deadline_time_s is not None else None for state in states
+            ],
+            "reference_cost_ms": [
+                float(state.reference_cost_ms) if state.reference_cost_ms is not None else None for state in states
+            ],
+            "slo_ms": [float(state.slo_ms) if state.slo_ms is not None else None for state in states],
+            "age_ms": [(now_s - float(state.arrival_time_s)) * 1000.0 for state in states],
+            "time_to_deadline_ms": [
+                (float(state.deadline_time_s) - now_s) * 1000.0 if state.deadline_time_s is not None else None
+                for state in states
+            ],
             "shape_key": _shape_key(sampling_params[0]),
             "shapes": [_shape_dict(params) for params in sampling_params],
             "profile_tags": _profile_tags(states),
@@ -224,6 +241,9 @@ def _profile_tags(states: list[DiffusionRequestState]) -> dict[str, Any]:
         "profile_batch_size",
         "profile_shape",
         "profile_mode",
+        "profile_policy",
+        "profile_scale",
+        "profile_trace_id",
     )
     for key in keys:
         values = []

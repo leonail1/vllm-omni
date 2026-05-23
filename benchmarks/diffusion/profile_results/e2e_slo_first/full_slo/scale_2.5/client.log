@@ -1,0 +1,30 @@
+Loading requests...
+Prepared 80 requests from trace dataset.
+
+============ Serving Benchmark Result ============
+Endpoint:                                /v1/chat/completions
+Model:                                   Qwen/Qwen-Image
+Dataset:                                 trace
+Task:                                    t2i
+--------------------------------------------------
+Benchmark duration (s):                  372.45
+Request rate:                            inf
+Max request concurrency:                 128
+Successful requests:                     80/80
+--------------------------------------------------
+Request throughput (req/s):              0.21
+Latency Mean (s):                        26.5572
+Latency Median (s):                      24.5953
+Latency P99 (s):                         41.5521
+Latency P95 (s):                         40.7526
+--------------------------------------------------
+SLO Attainment Rate (all):               97.50%
+SLO Met (success count):                 78
+SLO Scale:                               3.0
+--------------------------------------------------
+Stage Durations Mean (s):
+  queue_wait_ms:                         0.3586
+  stage_0_gen_ms:                        26206.4574
+
+============================================================
+Metrics saved to /home/lzg/vllm-omni/benchmark_outputs/e2e_slo_first/full_slo/scale_2.5/benchmark_result.json

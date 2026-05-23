@@ -534,6 +534,9 @@ class TraceDataset(BaseDataset):
         if not image_paths:
             single = row.get("image_path")
             image_paths = [single] if single else None
+        extra_body = row.get("extra_body")
+        if not isinstance(extra_body, dict):
+            extra_body = {}
 
         if not image_paths and self.args.task in ["i2v", "i2i", "ti2v", "ti2i", "it2i"]:
             raise ValueError(
@@ -564,6 +567,7 @@ class TraceDataset(BaseDataset):
             slo_ms=slo_ms,
             arrival_time_s=arrival_time_s,
             deadline_time_s=deadline_time_s,
+            extra_body=extra_body,
             image_paths=image_paths,
             request_id=str(row.get("request_id")) if row.get("request_id") is not None else str(uuid.uuid4()),
         )
