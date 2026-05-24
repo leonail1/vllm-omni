@@ -70,6 +70,8 @@ def _make_runner(cache_backend, cache_backend_name: str, enable_cache_dit_summar
 def _make_stepwise_runner(tmp_path):
     class _StepPipeline:
         interrupt = False
+        input_batch_during_decode = "unset"
+        runner = None
 
         def denoise_step(self, input_batch):
             return torch.ones(input_batch.num_reqs, 1)
@@ -79,12 +81,15 @@ def _make_stepwise_runner(tmp_path):
             req.step_index += 1
 
         def post_decode(self, req):
+            if self.runner is not None:
+                self.input_batch_during_decode = self.runner.input_batch
             return SimpleNamespace(decoded=req.req_id)
 
     runner = object.__new__(DiffusionModelRunner)
     runner.vllm_config = object()
     runner.device = torch.device("cpu")
     runner.pipeline = _StepPipeline()
+    runner.pipeline.runner = runner
     runner.cache_backend = None
     runner.offload_backend = None
     runner.state_cache = {}
@@ -138,17 +143,67 @@ def test_execute_stepwise_emits_step_cost_profile_record(tmp_path, monkeypatch):
     runner._update_states = lambda output: ([state], [])
     runner._prepare_batch_inputs = lambda states, new_request_ids: SimpleNamespace(num_reqs=len(states))
     runner._prepare_attn_metadata = lambda input_batch: {}
-    runner._update_states_after = lambda states, input_batch, interrupted: None
+    def _fail_update_states_after(states, input_batch, interrupted):
+        del states, input_batch, interrupted
+        raise AssertionError("final decode should skip cached batch refresh")
+
+    runner.state_cache["req-0"] = state
+    runner._update_states_after = _fail_update_states_after
     monkeypatch.setattr(model_runner_module, "set_forward_context", _noop_forward_context)
 
     output = DiffusionModelRunner.execute_stepwise(runner, scheduler_output)
 
     assert output.get_req_output("req-0").finished is True
+    assert runner.pipeline.input_batch_during_decode is None
+    assert runner.state_cache == {}
     rows = [json.loads(line) for line in (tmp_path / "step_cost_raw.jsonl").read_text().splitlines()]
     assert rows[0]["batch_size"] == 1
     assert rows[0]["denoise_ms"] >= 0
     assert rows[0]["step_scheduler_ms"] >= 0
     assert rows[0]["post_decode_ms"] >= 0
+
+
+def test_execute_stepwise_cleans_state_cache_when_post_decode_fails(tmp_path, monkeypatch):
+    runner = _make_stepwise_runner(tmp_path)
+    state = DiffusionRequestState(
+        req_id="req-0",
+        sampling=SimpleNamespace(
+            height=512,
+            width=512,
+            num_frames=1,
+            num_outputs_per_prompt=1,
+            do_classifier_free_guidance=False,
+            guidance_scale=0.0,
+            true_cfg_scale=None,
+            extra_args={"profile_combo_id": "512x512_b1", "profile_phase": "measure"},
+        ),
+        latents=torch.zeros(1, 1),
+        timesteps=torch.arange(1),
+        step_index=0,
+    )
+    scheduler_output = SimpleNamespace(
+        step_id=3,
+        scheduled_req_ids=["req-0"],
+    )
+
+    runner.state_cache["req-0"] = state
+    runner._update_states = lambda output: ([state], [])
+    runner._prepare_batch_inputs = lambda states, new_request_ids: SimpleNamespace(num_reqs=len(states))
+    runner._prepare_attn_metadata = lambda input_batch: {}
+    runner._update_states_after = lambda states, input_batch, interrupted: None
+
+    def _raise_post_decode(req):
+        del req
+        raise RuntimeError("decode failed")
+
+    runner.pipeline.post_decode = _raise_post_decode
+    monkeypatch.setattr(model_runner_module, "set_forward_context", _noop_forward_context)
+
+    with pytest.raises(RuntimeError, match="decode failed"):
+        DiffusionModelRunner.execute_stepwise(runner, scheduler_output)
+
+    assert runner.input_batch is None
+    assert runner.state_cache == {}
 
 
 def test_execute_stepwise_skips_disabled_step_cost_profiler(tmp_path, monkeypatch):

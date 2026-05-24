@@ -52,6 +52,22 @@ class DiffusionModelRunner(OmniConnectorModelRunnerMixin):
     The Worker only handles infrastructure (device, distributed env).
     """
 
+    @staticmethod
+    def _empty_device_cache(device: torch.device) -> None:
+        if device.type == "cuda":
+            torch.cuda.empty_cache()
+            return
+        if device.type == "npu":
+            npu_module = getattr(torch, "npu", None)
+            empty_cache = getattr(npu_module, "empty_cache", None)
+            if callable(empty_cache):
+                empty_cache()
+
+    def _drop_completed_step_states(self, states: list[DiffusionRequestState], *, interrupted: bool = False) -> None:
+        for state in states:
+            if interrupted or state.denoise_completed:
+                self.state_cache.pop(state.req_id, None)
+
     def __init__(
         self,
         vllm_config,
@@ -471,6 +487,7 @@ class DiffusionModelRunner(OmniConnectorModelRunnerMixin):
 
                 else:
                     offset = 0
+                    completed_without_cached_batch = False
                     for req in states:
                         row_num = req.latents.shape[0]
                         step_scheduler_start_s = profiler.timer_start() if profiler is not None else 0.0
@@ -483,24 +500,6 @@ class DiffusionModelRunner(OmniConnectorModelRunnerMixin):
                             else 0.0
                         )
                         offset = offset + row_num
-                        if req.denoise_completed:
-                            post_decode_start_s = profiler.timer_start() if profiler is not None else 0.0
-                            result = self.pipeline.post_decode(req)
-                            post_decode_ms += (
-                                profiler.timer_end_ms(post_decode_start_s)
-                                if profiler is not None
-                                else 0.0
-                            )
-                        else:
-                            result = None
-                        runner_output_list.append(
-                            RunnerOutput(
-                                req_id=req.req_id,
-                                step_index=req.step_index,
-                                finished=req.denoise_completed,
-                                result=result,
-                            )
-                        )
 
                     if noise_pred is not None and offset != noise_pred.shape[0]:
                         raise ValueError(
@@ -508,7 +507,39 @@ class DiffusionModelRunner(OmniConnectorModelRunnerMixin):
                             f"but batched noise_pred has {noise_pred.shape[0]} rows."
                         )
 
-                self._update_states_after(states, input_batch, pipeline_interrupted)
+                    noise_pred = None
+                    if all(req.denoise_completed for req in states):
+                        self.input_batch = None
+                        input_batch = None
+                        completed_without_cached_batch = True
+                        self._empty_device_cache(self.device)
+
+                    try:
+                        for req in states:
+                            if req.denoise_completed:
+                                post_decode_start_s = profiler.timer_start() if profiler is not None else 0.0
+                                result = self.pipeline.post_decode(req)
+                                post_decode_ms += (
+                                    profiler.timer_end_ms(post_decode_start_s)
+                                    if profiler is not None
+                                    else 0.0
+                                )
+                            else:
+                                result = None
+                            runner_output_list.append(
+                                RunnerOutput(
+                                    req_id=req.req_id,
+                                    step_index=req.step_index,
+                                    finished=req.denoise_completed,
+                                    result=result,
+                                )
+                            )
+                    finally:
+                        if completed_without_cached_batch:
+                            self._drop_completed_step_states(states)
+
+                if input_batch is not None:
+                    self._update_states_after(states, input_batch, pipeline_interrupted)
                 total_step_ms = profiler.timer_end_ms(total_start_s) if profiler is not None else 0.0
                 if profiler is not None:
                     profiler.write_step_record(

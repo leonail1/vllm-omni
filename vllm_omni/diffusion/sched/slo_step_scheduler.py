@@ -124,6 +124,10 @@ class SloStepScheduler(StepScheduler):
 
         self._running_sampling_params_key = selected_key if self._running else None
 
+        debug_info = dict(debug_info)
+        debug_info["resident_reqs"] = len(self._resident_sched_req_ids())
+        debug_info["safe_admit_capacity"] = self._safe_admit_capacity()
+
         scheduler_output = DiffusionSchedulerOutput(
             step_id=self._step_id,
             scheduled_new_reqs=scheduled_new_reqs,
@@ -176,8 +180,9 @@ class SloStepScheduler(StepScheduler):
             "timestamp_s": now_s,
             "num_waiting": len(self._waiting),
             "num_running": len(self._running),
+            "num_resident_reqs": len(self._resident_sched_req_ids()),
             "max_num_running": self.max_num_running_reqs,
-            "safe_admit_capacity": max(0, self.max_num_running_reqs - len(self._running)),
+            "safe_admit_capacity": self._safe_admit_capacity(),
             "buckets": buckets,
         }
 
@@ -301,6 +306,7 @@ class SloStepScheduler(StepScheduler):
         grouped: dict[SamplingParamsKey, list[DiffusionRequestState]] = {}
         singleton_buckets: list[tuple[SamplingParamsKey | None, list[DiffusionRequestState]]] = []
         seen_req_ids: set[str] = set()
+        resident_ids = self._resident_sched_req_ids()
 
         for sched_req_id in [*self._running, *self._waiting]:
             if sched_req_id in seen_req_ids:
@@ -311,7 +317,8 @@ class SloStepScheduler(StepScheduler):
                 continue
             key = state.sampling_params_key
             if key is None:
-                singleton_buckets.append((None, [state]))
+                if self._can_admit_state(state, resident_ids, 0):
+                    singleton_buckets.append((None, [state]))
             else:
                 grouped.setdefault(key, []).append(state)
 
@@ -324,18 +331,25 @@ class SloStepScheduler(StepScheduler):
         return buckets
 
     def _select_states_for_key(self, states: list[DiffusionRequestState], now_s: float) -> list[DiffusionRequestState]:
+        resident_ids = self._resident_sched_req_ids()
         if not self.enable_step_preemption:
             running = [state for state in states if state.sched_req_id in self._running]
             waiting = [state for state in states if state.sched_req_id not in self._running]
             selected = running[: self.max_num_running_reqs]
             if len(selected) >= self.max_num_running_reqs:
                 return selected
+            new_admissions = sum(1 for state in selected if state.sched_req_id not in resident_ids)
             waiting = sorted(waiting, key=lambda state: self._state_admission_priority(state, now_s))
-            return [*selected, *waiting[: self.max_num_running_reqs - len(selected)]]
+            return self._append_admissible_states(selected, waiting, resident_ids, new_admissions)
 
         ordered = sorted(states, key=lambda state: self._state_admission_priority(state, now_s))
         selected: list[DiffusionRequestState] = []
-        for state in ordered[: self.max_num_running_reqs]:
+        new_admissions = 0
+        for state in ordered:
+            if len(selected) >= self.max_num_running_reqs:
+                break
+            if not self._can_admit_state(state, resident_ids, new_admissions):
+                continue
             candidate = [*selected, state]
             if selected and self._has_deadline(candidate):
                 step_ms = self._estimate_step_ms(candidate)
@@ -361,9 +375,48 @@ class SloStepScheduler(StepScheduler):
                 ):
                     continue
             selected.append(state)
-        if not selected and ordered:
-            selected.append(ordered[0])
+            if state.sched_req_id not in resident_ids:
+                new_admissions += 1
         return selected
+
+    def _append_admissible_states(
+        self,
+        selected: list[DiffusionRequestState],
+        waiting: list[DiffusionRequestState],
+        resident_ids: set[str],
+        new_admissions: int,
+    ) -> list[DiffusionRequestState]:
+        for state in waiting:
+            if len(selected) >= self.max_num_running_reqs:
+                break
+            if not self._can_admit_state(state, resident_ids, new_admissions):
+                continue
+            selected.append(state)
+            if state.sched_req_id not in resident_ids:
+                new_admissions += 1
+        return selected
+
+    def _resident_sched_req_ids(self) -> set[str]:
+        resident_ids = set(self._running)
+        for sched_req_id, state in self._request_states.items():
+            if state.is_finished():
+                continue
+            if state.status in (DiffusionRequestStatus.RUNNING, DiffusionRequestStatus.PREEMPTED):
+                resident_ids.add(sched_req_id)
+        return resident_ids
+
+    def _safe_admit_capacity(self) -> int:
+        return max(0, self.max_num_running_reqs - len(self._resident_sched_req_ids()))
+
+    def _can_admit_state(
+        self,
+        state: DiffusionRequestState,
+        resident_ids: set[str],
+        new_admissions: int,
+    ) -> bool:
+        if state.sched_req_id in resident_ids:
+            return True
+        return len(resident_ids) + new_admissions < self.max_num_running_reqs
 
     def _state_admission_priority(self, state: DiffusionRequestState, now_s: float) -> tuple[float, float, float]:
         step_ms = self._estimate_step_ms([state])

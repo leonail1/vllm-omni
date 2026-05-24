@@ -1052,7 +1052,7 @@ class TestSloStepScheduler:
         assert scheduler.get_request_state(running).status == DiffusionRequestStatus.PREEMPTED
         assert running in list(scheduler._waiting)
 
-    def test_can_switch_to_urgent_waiting_bucket_when_running_is_full(self) -> None:
+    def test_does_not_admit_new_bucket_when_resident_slots_are_full(self) -> None:
         scheduler = self._make_scheduler(max_num_seqs=1)
 
         running = scheduler.add_request(_make_slo_step_request("running", reference_cost_ms=100, slo_ms=10000))
@@ -1063,10 +1063,65 @@ class TestSloStepScheduler:
         urgent = scheduler.add_request(_make_slo_step_request("urgent", reference_cost_ms=100, slo_ms=200, height=768))
         second = scheduler.schedule()
 
+        assert _new_ids(second) == []
+        assert _cached_ids(second) == [running]
+        assert scheduler.get_request_state(urgent).status == DiffusionRequestStatus.WAITING
+        assert scheduler.get_load_snapshot()["safe_admit_capacity"] == 0
+
+    def test_preempted_resident_request_keeps_capacity_until_finished(self) -> None:
+        scheduler = self._make_scheduler(max_num_seqs=2)
+
+        running = scheduler.add_request(_make_slo_step_request("running", reference_cost_ms=100, slo_ms=10000))
+        first = scheduler.schedule()
+        assert _new_ids(first) == [running]
+        assert scheduler.update_from_output(first, _make_step_output(running, step_index=1)) == set()
+
+        urgent = scheduler.add_request(_make_slo_step_request("urgent", reference_cost_ms=100, slo_ms=200, height=768))
+        second = scheduler.schedule()
         assert _new_ids(second) == [urgent]
-        assert _cached_ids(second) == []
         assert scheduler.get_request_state(running).status == DiffusionRequestStatus.PREEMPTED
-        assert running in list(scheduler._waiting)
+        assert scheduler.get_load_snapshot()["safe_admit_capacity"] == 0
+
+        scheduler.update_from_output(second, _make_step_output(urgent, step_index=1))
+        third = scheduler.add_request(
+            _make_slo_step_request("third", reference_cost_ms=100, slo_ms=50, height=1024)
+        )
+        third_output = scheduler.schedule()
+
+        assert _new_ids(third_output) == []
+        assert third not in _cached_ids(third_output)
+        assert scheduler.get_request_state(third).status == DiffusionRequestStatus.WAITING
+
+    def test_none_key_waiting_request_respects_resident_capacity(self) -> None:
+        scheduler = self._make_scheduler(max_num_seqs=2)
+
+        running = scheduler.add_request(_make_slo_step_request("running", reference_cost_ms=100, slo_ms=10000))
+        first = scheduler.schedule()
+        assert _new_ids(first) == [running]
+        assert scheduler.update_from_output(first, _make_step_output(running, step_index=1)) == set()
+
+        urgent = scheduler.add_request(_make_slo_step_request("urgent", reference_cost_ms=100, slo_ms=200, height=768))
+        second = scheduler.schedule()
+        assert _new_ids(second) == [urgent]
+        assert scheduler.get_request_state(running).status == DiffusionRequestStatus.PREEMPTED
+
+        scheduler.update_from_output(second, _make_step_output(urgent, step_index=1))
+        multi_prompt = scheduler.add_request(
+            OmniDiffusionRequest(
+                prompts=["multi-0", "multi-1"],
+                sampling_params=OmniDiffusionSamplingParams(
+                    num_inference_steps=4,
+                    reference_cost_ms=100,
+                    slo_ms=50,
+                ),
+                request_ids=["multi-0", "multi-1"],
+            )
+        )
+        third = scheduler.schedule()
+
+        assert multi_prompt not in third.scheduled_req_ids
+        assert scheduler.get_request_state(multi_prompt).status == DiffusionRequestStatus.WAITING
+        assert scheduler.get_load_snapshot()["safe_admit_capacity"] == 0
 
     def test_none_sampling_key_requests_are_singleton_buckets(self) -> None:
         scheduler = self._make_scheduler(max_num_seqs=2)
