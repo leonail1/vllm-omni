@@ -1,0 +1,39 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="980" height="360" viewBox="0 0 980 360">
+<rect width="100%" height="100%" fill="white"/>
+<text x="490" y="32" text-anchor="middle" font-family="Arial" font-size="22" font-weight="700">Miss Rate by Shape: current vs no_preempt_lookup</text>
+<text x="225.0" y="58" text-anchor="middle" font-family="Arial" font-size="12" fill="#111827">current</text>
+<text x="225.0" y="74" text-anchor="middle" font-family="Arial" font-size="12" fill="#6b7280">scale 2.5</text>
+<text x="375.0" y="58" text-anchor="middle" font-family="Arial" font-size="12" fill="#111827">no_preempt_lookup</text>
+<text x="375.0" y="74" text-anchor="middle" font-family="Arial" font-size="12" fill="#6b7280">scale 2.5</text>
+<text x="525.0" y="58" text-anchor="middle" font-family="Arial" font-size="12" fill="#111827">current</text>
+<text x="525.0" y="74" text-anchor="middle" font-family="Arial" font-size="12" fill="#6b7280">scale 4</text>
+<text x="675.0" y="58" text-anchor="middle" font-family="Arial" font-size="12" fill="#111827">no_preempt_lookup</text>
+<text x="675.0" y="74" text-anchor="middle" font-family="Arial" font-size="12" fill="#6b7280">scale 4</text>
+<text x="134" y="112" text-anchor="end" font-family="Arial" font-size="14" fill="#111827">512x512</text>
+<rect x="150" y="80" width="142" height="46" fill="rgb(255,135,135)" stroke="#d1d5db"/>
+<text x="221.0" y="110" text-anchor="middle" font-family="Arial" font-size="14" fill="#111827">34.4%</text>
+<rect x="300" y="80" width="142" height="46" fill="rgb(255,185,185)" stroke="#059669"/>
+<text x="371.0" y="110" text-anchor="middle" font-family="Arial" font-size="14" fill="#111827">18.8%</text>
+<rect x="450" y="80" width="142" height="46" fill="rgb(255,155,155)" stroke="#d1d5db"/>
+<text x="521.0" y="110" text-anchor="middle" font-family="Arial" font-size="14" fill="#111827">28.1%</text>
+<rect x="600" y="80" width="142" height="46" fill="rgb(255,245,245)" stroke="#059669"/>
+<text x="671.0" y="110" text-anchor="middle" font-family="Arial" font-size="14" fill="#111827">0.0%</text>
+<text x="134" y="166" text-anchor="end" font-family="Arial" font-size="14" fill="#111827">768x768</text>
+<rect x="150" y="134" width="142" height="46" fill="rgb(255,145,145)" stroke="#d1d5db"/>
+<text x="221.0" y="164" text-anchor="middle" font-family="Arial" font-size="14" fill="#111827">31.2%</text>
+<rect x="300" y="134" width="142" height="46" fill="rgb(255,165,165)" stroke="#059669"/>
+<text x="371.0" y="164" text-anchor="middle" font-family="Arial" font-size="14" fill="#111827">25.0%</text>
+<rect x="450" y="134" width="142" height="46" fill="rgb(255,155,155)" stroke="#d1d5db"/>
+<text x="521.0" y="164" text-anchor="middle" font-family="Arial" font-size="14" fill="#111827">28.1%</text>
+<rect x="600" y="134" width="142" height="46" fill="rgb(255,245,245)" stroke="#059669"/>
+<text x="671.0" y="164" text-anchor="middle" font-family="Arial" font-size="14" fill="#111827">0.0%</text>
+<text x="134" y="220" text-anchor="end" font-family="Arial" font-size="14" fill="#111827">1024x1024</text>
+<rect x="150" y="188" width="142" height="46" fill="rgb(255,165,165)" stroke="#d1d5db"/>
+<text x="221.0" y="218" text-anchor="middle" font-family="Arial" font-size="14" fill="#111827">25.0%</text>
+<rect x="300" y="188" width="142" height="46" fill="rgb(255,125,125)" stroke="#059669"/>
+<text x="371.0" y="218" text-anchor="middle" font-family="Arial" font-size="14" fill="#111827">37.5%</text>
+<rect x="450" y="188" width="142" height="46" fill="rgb(255,185,185)" stroke="#d1d5db"/>
+<text x="521.0" y="218" text-anchor="middle" font-family="Arial" font-size="14" fill="#111827">18.8%</text>
+<rect x="600" y="188" width="142" height="46" fill="rgb(255,245,245)" stroke="#059669"/>
+<text x="671.0" y="218" text-anchor="middle" font-family="Arial" font-size="14" fill="#111827">0.0%</text>
+</svg>

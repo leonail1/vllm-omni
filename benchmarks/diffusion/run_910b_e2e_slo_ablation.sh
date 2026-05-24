@@ -17,7 +17,7 @@ NUM_REQUESTS="${NUM_REQUESTS:-80}"
 GLOBAL_INTERARRIVAL_S="${GLOBAL_INTERARRIVAL_S:-4.25}"
 SCALES="${SCALES:-2.5,4.0}"
 REPEATS="${REPEATS:-0,1,2}"
-POLICIES="${POLICIES:-current,stagepool_only,instance_only,constant_cost,formula_cost,full_slo,no_preemption,alpha0,alpha1}"
+POLICIES="${POLICIES:-current,stagepool_only,instance_only,constant_cost,formula_cost,full_slo,no_preemption,slo_no_preemption_lookup,alpha0,alpha1}"
 PROFILE_MODE="${PROFILE_MODE:-e2e_slo_ablation}"
 PORT_BASE="${PORT_BASE:-18320}"
 MASTER_PORT_BASE="${MASTER_PORT_BASE:-26320}"
@@ -234,6 +234,13 @@ elif policy == "full_slo":
     config["diffusion_scheduler_policy"] = "slo"
     config["diffusion_slo_scheduler"] = {**lookup, "enable_stagepool_slo": True}
 elif policy == "no_preemption":
+    config["diffusion_scheduler_policy"] = "slo"
+    config["diffusion_slo_scheduler"] = {
+        **lookup,
+        "enable_stagepool_slo": True,
+        "enable_step_preemption": False,
+    }
+elif policy == "slo_no_preemption_lookup":
     config["diffusion_scheduler_policy"] = "slo"
     config["diffusion_slo_scheduler"] = {
         **lookup,
