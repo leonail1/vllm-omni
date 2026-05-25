@@ -41,6 +41,8 @@ def _make_state(
             "profile_shape": f"{height}x{height}",
             "profile_mode": "aligned",
             "profile_workload": "current-mix",
+            "profile_interarrival_s": 4.25,
+            "profile_load_label": "ia_4p25",
         },
     )
     state = DiffusionRequestState(
@@ -173,6 +175,8 @@ def test_step_cost_profiler_writes_jsonl_record(tmp_path, monkeypatch) -> None:
     assert rows[0]["replica_id"] == 0
     assert rows[0]["profile_tags"]["profile_combo_id"] == "512x512_b2"
     assert rows[0]["profile_tags"]["profile_workload"] == "current-mix"
+    assert rows[0]["profile_tags"]["profile_interarrival_s"] == 4.25
+    assert rows[0]["profile_tags"]["profile_load_label"] == "ia_4p25"
 
 
 def test_step_cost_profiler_counts_multi_prompt_effective_batch(tmp_path, monkeypatch) -> None:

@@ -21,6 +21,7 @@ MODEL = "Qwen/Qwen-Image"
 DEFAULT_COST_MODEL = "benchmarks/diffusion/profile_results/latent_token_aspect/step_cost_model.json"
 WORKLOAD_SHAPES = {
     "current-mix": [(512, 512), (768, 768), (512, 512), (768, 768), (1024, 1024)],
+    "shape-grouped-current-mix": [(512, 512)] * 8 + [(768, 768)] * 8 + [(1024, 1024)] * 4,
     "large-heavy": [(1024, 1024), (1024, 1024), (768, 768), (1024, 1024), (512, 512)],
     "rectangular-mix": [
         (512, 768),
@@ -139,6 +140,8 @@ def make_trace(args: argparse.Namespace) -> None:
                         "profile_trace_id": args.trace_id,
                         "profile_workload": args.workload,
                         "profile_shape": f"{width}x{height}",
+                        "profile_interarrival_s": args.global_interarrival_s,
+                        "profile_load_label": args.profile_load_label,
                     }
                 },
             }
@@ -391,6 +394,7 @@ def main() -> None:
     make.add_argument("--profile-policy", default="")
     make.add_argument("--profile-mode", default="e2e_slo_first")
     make.add_argument("--profile-repeat", type=int, default=0)
+    make.add_argument("--profile-load-label", default="")
     make.add_argument("--workload", default="current-mix", choices=sorted(WORKLOAD_SHAPES))
     make.add_argument("--num-requests", type=int, default=80)
     make.add_argument("--global-interarrival-s", type=float, default=4.25)

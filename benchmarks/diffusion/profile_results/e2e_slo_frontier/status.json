@@ -1,0 +1,24 @@
+{
+  "message": "E2E SLO frontier result bundle packaged",
+  "output_dir": "/home/lzg/vllm-omni/benchmark_outputs/e2e_slo_frontier_pilot",
+  "bundle_dir": "/home/lzg/vllm-omni/benchmarks/diffusion/profile_results/e2e_slo_frontier",
+  "workloads": [
+    "current-mix",
+    "shape-grouped-current-mix"
+  ],
+  "interarrivals": [
+    4.25,
+    2.5
+  ],
+  "policies": [
+    "current",
+    "slo_no_preemption_lookup"
+  ],
+  "scales": [
+    4.0,
+    6.0
+  ],
+  "repeats": [
+    0
+  ]
+}

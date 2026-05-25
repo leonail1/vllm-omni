@@ -253,6 +253,8 @@ def _profile_tags(states: list[DiffusionRequestState]) -> dict[str, Any]:
         "profile_scale",
         "profile_trace_id",
         "profile_workload",
+        "profile_interarrival_s",
+        "profile_load_label",
     )
     for key in keys:
         values = []
