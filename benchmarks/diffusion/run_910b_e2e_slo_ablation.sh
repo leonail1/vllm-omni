@@ -15,15 +15,19 @@ TP_SIZE="${TP_SIZE:-2}"
 MAX_NUM_SEQS="${MAX_NUM_SEQS:-4}"
 NUM_REQUESTS="${NUM_REQUESTS:-80}"
 GLOBAL_INTERARRIVAL_S="${GLOBAL_INTERARRIVAL_S:-4.25}"
-SCALES="${SCALES:-2.5,4.0}"
-REPEATS="${REPEATS:-0,1,2}"
-POLICIES="${POLICIES:-current,stagepool_only,instance_only,constant_cost,formula_cost,full_slo,no_preemption,slo_no_preemption_lookup,alpha0,alpha1}"
+SCALES="${SCALES:-2.5,3.0,3.5,4.0}"
+REPEATS="${REPEATS:-0}"
+WORKLOADS="${WORKLOADS:-current-mix,large-heavy,rectangular-mix,bursty}"
+POLICIES="${POLICIES:-current,slo_no_preemption_lookup}"
 PROFILE_MODE="${PROFILE_MODE:-e2e_slo_ablation}"
 PORT_BASE="${PORT_BASE:-18320}"
 MASTER_PORT_BASE="${MASTER_PORT_BASE:-26320}"
 BENCHMARK_CONCURRENCY="${BENCHMARK_CONCURRENCY:-128}"
 HEALTH_TIMEOUT_S="${HEALTH_TIMEOUT_S:-2400}"
 CONSTANT_STEP_MS="${CONSTANT_STEP_MS:-400}"
+STAGEPOOL_LAXITY_WINDOW_MS="${STAGEPOOL_LAXITY_WINDOW_MS:-1500}"
+STAGEPOOL_PACK_MIN_LAXITY_MS="${STAGEPOOL_PACK_MIN_LAXITY_MS:-1000}"
+NO_PREEMPTION_ADMISSION_GUARD="${NO_PREEMPTION_ADMISSION_GUARD:-1}"
 SKIP_EXISTING="${SKIP_EXISTING:-0}"
 ACTIVE_PID_FILE=""
 
@@ -35,6 +39,76 @@ DEPLOY_CONFIG="${OUTDIR}/qwen_image_4replicas_tp2.yaml"
 
 log() {
   printf '[%s] %s\n' "$(date '+%F %T')" "$*" | tee -a "${LOG}"
+}
+
+validate_safe_token() {
+  local kind="$1"
+  local value="$2"
+  if [[ -z "${value}" || "${value}" == *"/"* || "${value}" == *".."* ]]; then
+    log "invalid ${kind}: ${value}"
+    exit 2
+  fi
+}
+
+validate_workload() {
+  local workload="$1"
+  validate_safe_token "workload" "${workload}"
+  case "${workload}" in
+    current-mix|large-heavy|rectangular-mix|bursty) ;;
+    *)
+      log "unknown workload: ${workload}"
+      exit 2
+      ;;
+  esac
+}
+
+validate_policy() {
+  local policy="$1"
+  validate_safe_token "policy" "${policy}"
+  case "${policy}" in
+    current|stagepool_only|instance_only|constant_cost|formula_cost|full_slo|no_preemption|slo_no_preemption_lookup|alpha0|alpha1) ;;
+    *)
+      log "unknown policy: ${policy}"
+      exit 2
+      ;;
+  esac
+}
+
+validate_repeat() {
+  local repeat="$1"
+  validate_safe_token "repeat" "${repeat}"
+  if [[ ! "${repeat}" =~ ^[0-9]+$ ]]; then
+    log "invalid repeat: ${repeat}"
+    exit 2
+  fi
+}
+
+validate_scale() {
+  local scale="$1"
+  validate_safe_token "scale" "${scale}"
+  if [[ ! "${scale}" =~ ^[0-9]+([.][0-9]+)?$ ]]; then
+    log "invalid scale: ${scale}"
+    exit 2
+  fi
+}
+
+validate_matrix_args() {
+  local workload
+  for workload in ${WORKLOADS//,/ }; do
+    validate_workload "${workload}"
+  done
+  local policy
+  for policy in ${POLICIES//,/ }; do
+    validate_policy "${policy}"
+  done
+  local repeat
+  for repeat in ${REPEATS//,/ }; do
+    validate_repeat "${repeat}"
+  done
+  local scale
+  for scale in ${SCALES//,/ }; do
+    validate_scale "${scale}"
+  done
 }
 
 write_status() {
@@ -181,11 +255,22 @@ make_additional_config() {
   local policy="$1"
   local raw="$2"
   local stagepool_raw="$3"
-  python - "${policy}" "${raw}" "${stagepool_raw}" "${COST_MODEL}" "${CONSTANT_STEP_MS}" <<'PY'
+  python - "${policy}" "${raw}" "${stagepool_raw}" "${COST_MODEL}" "${CONSTANT_STEP_MS}" \
+    "${STAGEPOOL_LAXITY_WINDOW_MS}" "${STAGEPOOL_PACK_MIN_LAXITY_MS}" \
+    "${NO_PREEMPTION_ADMISSION_GUARD}" <<'PY'
 import json
 import sys
 
-policy, raw, stagepool_raw, cost_model, constant_step_ms = sys.argv[1:6]
+(
+    policy,
+    raw,
+    stagepool_raw,
+    cost_model,
+    constant_step_ms,
+    stagepool_laxity_window_ms,
+    stagepool_pack_min_laxity_ms,
+    no_preemption_admission_guard,
+) = sys.argv[1:9]
 config = {
     "diffusion_step_profile": {
         "enabled": True,
@@ -246,6 +331,9 @@ elif policy == "slo_no_preemption_lookup":
         **lookup,
         "enable_stagepool_slo": True,
         "enable_step_preemption": False,
+        "no_preemption_admission_guard": no_preemption_admission_guard.strip().lower() not in {"0", "false", "no"},
+        "stagepool_laxity_window_ms": float(stagepool_laxity_window_ms),
+        "stagepool_pack_min_laxity_ms": float(stagepool_pack_min_laxity_ms),
     }
 elif policy == "alpha0":
     config["diffusion_scheduler_policy"] = "slo"
@@ -313,19 +401,28 @@ start_service() {
   echo $! > "${pid_file}"
 }
 
+clean_policy_result_dirs() {
+  local policy="$1"
+  for workload in ${WORKLOADS//,/ }; do
+    rm -rf "${OUTDIR}/${workload}/${policy}"
+  done
+}
+
 make_trace() {
   local policy="$1"
   local repeat="$2"
   local scale="$3"
-  local dir="${OUTDIR}/${policy}/repeat_${repeat}/scale_${scale}"
+  local workload="$4"
+  local dir="${OUTDIR}/${workload}/${policy}/repeat_${repeat}/scale_${scale}"
   local trace="${dir}/trace.txt"
   mkdir -p "${dir}"
   python benchmarks/diffusion/e2e_slo_first_experiment.py make-trace \
     --output "${trace}" \
-    --trace-id "${policy}_r${repeat}_scale_${scale}" \
+    --trace-id "${workload}_${policy}_r${repeat}_scale_${scale}" \
     --profile-mode "${PROFILE_MODE}" \
     --profile-policy "${policy}" \
     --profile-repeat "${repeat}" \
+    --workload "${workload}" \
     --num-requests "${NUM_REQUESTS}" \
     --global-interarrival-s "${GLOBAL_INTERARRIVAL_S}" \
     --slo-scale "${scale}" \
@@ -337,11 +434,12 @@ run_benchmark() {
   local repeat="$2"
   local scale="$3"
   local port="$4"
-  local dir="${OUTDIR}/${policy}/repeat_${repeat}/scale_${scale}"
+  local workload="$5"
+  local dir="${OUTDIR}/${workload}/${policy}/repeat_${repeat}/scale_${scale}"
   local trace="${dir}/trace.txt"
   local result="${dir}/benchmark_result.json"
   local client_log="${dir}/client.log"
-  log "running ${policy} repeat=${repeat} scale=${scale}"
+  log "running ${policy} workload=${workload} repeat=${repeat} scale=${scale}"
   python benchmarks/diffusion/diffusion_benchmark_serving.py \
     --base-url "http://127.0.0.1:${port}" \
     --model "${MODEL}" \
@@ -367,18 +465,21 @@ summarize_results() {
     --policies "${POLICIES}" \
     --scales "${SCALES}" \
     --repeats "${REPEATS}" \
+    --workloads "${WORKLOADS}" \
     --profile-mode "${PROFILE_MODE}" \
     > "${OUTDIR}/ablation_summary.stdout.json"
 }
 
 policy_results_exist() {
   local policy="$1"
-  for repeat in ${REPEATS//,/ }; do
-    for scale in ${SCALES//,/ }; do
-      local result="${OUTDIR}/${policy}/repeat_${repeat}/scale_${scale}/benchmark_result.json"
-      if [[ ! -s "${result}" ]]; then
-        return 1
-      fi
+  for workload in ${WORKLOADS//,/ }; do
+    for repeat in ${REPEATS//,/ }; do
+      for scale in ${SCALES//,/ }; do
+        local result="${OUTDIR}/${workload}/${policy}/repeat_${repeat}/scale_${scale}/benchmark_result.json"
+        if [[ ! -s "${result}" ]]; then
+          return 1
+        fi
+      done
     done
   done
   return 0
@@ -400,19 +501,22 @@ run_policy() {
   fi
 
   write_status "starting_${policy}" "Starting ${policy}"
+  clean_policy_result_dirs "${policy}"
   start_service "${policy}" "${port}" "${master_port}"
   ACTIVE_PID_FILE="${pid_file}"
   wait_health "${port}" || { stop_service "${pid_file}"; ACTIVE_PID_FILE=""; return 1; }
-  for repeat in ${REPEATS//,/ }; do
-    for scale in ${SCALES//,/ }; do
-      make_trace "${policy}" "${repeat}" "${scale}" || { stop_service "${pid_file}"; ACTIVE_PID_FILE=""; return 1; }
-      run_benchmark "${policy}" "${repeat}" "${scale}" "${port}" || {
-        stop_service "${pid_file}"
-        ACTIVE_PID_FILE=""
-        return 1
-      }
-      summarize_results || true
-      write_status "running_${policy}" "Completed ${policy} repeat=${repeat} scale=${scale}"
+  for workload in ${WORKLOADS//,/ }; do
+    for repeat in ${REPEATS//,/ }; do
+      for scale in ${SCALES//,/ }; do
+        make_trace "${policy}" "${repeat}" "${scale}" "${workload}" || { stop_service "${pid_file}"; ACTIVE_PID_FILE=""; return 1; }
+        run_benchmark "${policy}" "${repeat}" "${scale}" "${port}" "${workload}" || {
+          stop_service "${pid_file}"
+          ACTIVE_PID_FILE=""
+          return 1
+        }
+        summarize_results || true
+        write_status "running_${policy}" "Completed ${policy} workload=${workload} repeat=${repeat} scale=${scale}"
+      done
     done
   done
   stop_service "${pid_file}"
@@ -421,10 +525,11 @@ run_policy() {
 }
 
 main() {
+  validate_matrix_args
   setup_env
   write_deploy_config
   log "output dir: ${OUTDIR}"
-  log "config: model=${MODEL}, replicas=${REPLICAS}, tp=${TP_SIZE}, requests=${NUM_REQUESTS}, interarrival=${GLOBAL_INTERARRIVAL_S}, scales=${SCALES}, repeats=${REPEATS}, policies=${POLICIES}"
+  log "config: model=${MODEL}, replicas=${REPLICAS}, tp=${TP_SIZE}, requests=${NUM_REQUESTS}, interarrival=${GLOBAL_INTERARRIVAL_S}, workloads=${WORKLOADS}, scales=${SCALES}, repeats=${REPEATS}, policies=${POLICIES}"
   for policy in ${POLICIES//,/ }; do
     run_policy "${policy}" || { write_status failed "${policy} failed"; exit 1; }
   done

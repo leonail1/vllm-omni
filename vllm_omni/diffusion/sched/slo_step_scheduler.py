@@ -48,6 +48,7 @@ class SloStepScheduler(StepScheduler):
         self.preemption_laxity_margin_ms = 0.0
         self.preemption_safe_laxity_ms = 1000.0
         self.enable_step_preemption = True
+        self.no_preemption_admission_guard = True
         self.ignore_request_reference_cost = False
         self.use_shape_fallback_cost = True
 
@@ -67,6 +68,10 @@ class SloStepScheduler(StepScheduler):
             1000.0,
         )
         self.enable_step_preemption = _coerce_bool(slo_config.get("enable_step_preemption"), True)
+        self.no_preemption_admission_guard = _coerce_bool(
+            slo_config.get("no_preemption_admission_guard"),
+            True,
+        )
         self.ignore_request_reference_cost = _coerce_bool(slo_config.get("ignore_request_reference_cost"), False)
         self.use_shape_fallback_cost = _coerce_bool(slo_config.get("use_shape_fallback_cost"), True)
         self.cost_model = DiffusionStepCostModel.from_config(
@@ -340,7 +345,14 @@ class SloStepScheduler(StepScheduler):
                 return selected
             new_admissions = sum(1 for state in selected if state.sched_req_id not in resident_ids)
             waiting = sorted(waiting, key=lambda state: self._state_admission_priority(state, now_s))
-            return self._append_admissible_states(selected, waiting, resident_ids, new_admissions)
+            return self._append_admissible_states(
+                selected,
+                waiting,
+                resident_ids,
+                new_admissions,
+                now_s,
+                protect_laxity=self.no_preemption_admission_guard,
+            )
 
         ordered = sorted(states, key=lambda state: self._state_admission_priority(state, now_s))
         selected: list[DiffusionRequestState] = []
@@ -350,30 +362,8 @@ class SloStepScheduler(StepScheduler):
                 break
             if not self._can_admit_state(state, resident_ids, new_admissions):
                 continue
-            candidate = [*selected, state]
-            if selected and self._has_deadline(candidate):
-                step_ms = self._estimate_step_ms(candidate)
-                candidate_laxity_ms = self._bucket_min_laxity_ms(candidate, step_ms, now_s)
-                selected_step_ms = self._estimate_step_ms(selected)
-                selected_laxity_ms = self._bucket_min_laxity_ms(selected, selected_step_ms, now_s)
-                if (
-                    selected_laxity_ms >= 0.0
-                    and candidate_laxity_ms < self.min_laxity_guard_ms
-                    and candidate_laxity_ms < selected_laxity_ms
-                ):
-                    continue
-                state_single_laxity_ms = self._state_laxity_ms(
-                    state,
-                    self._estimate_step_ms([state]),
-                    now_s,
-                )
-                state_candidate_laxity_ms = self._state_laxity_ms(state, step_ms, now_s)
-                if (
-                    state_single_laxity_ms >= 0.0
-                    and state_candidate_laxity_ms < self.min_laxity_guard_ms
-                    and state_candidate_laxity_ms < state_single_laxity_ms
-                ):
-                    continue
+            if self._would_violate_admission_guard(selected, state, now_s):
+                continue
             selected.append(state)
             if state.sched_req_id not in resident_ids:
                 new_admissions += 1
@@ -385,16 +375,56 @@ class SloStepScheduler(StepScheduler):
         waiting: list[DiffusionRequestState],
         resident_ids: set[str],
         new_admissions: int,
+        now_s: float,
+        *,
+        protect_laxity: bool = False,
     ) -> list[DiffusionRequestState]:
         for state in waiting:
             if len(selected) >= self.max_num_running_reqs:
                 break
             if not self._can_admit_state(state, resident_ids, new_admissions):
                 continue
+            if protect_laxity and self._would_violate_admission_guard(selected, state, now_s):
+                continue
             selected.append(state)
             if state.sched_req_id not in resident_ids:
                 new_admissions += 1
         return selected
+
+    def _would_violate_admission_guard(
+        self,
+        selected: list[DiffusionRequestState],
+        state: DiffusionRequestState,
+        now_s: float,
+    ) -> bool:
+        if not selected:
+            return False
+        candidate = [*selected, state]
+        if not self._has_deadline(candidate):
+            return False
+
+        step_ms = self._estimate_step_ms(candidate)
+        candidate_laxity_ms = self._bucket_min_laxity_ms(candidate, step_ms, now_s)
+        selected_step_ms = self._estimate_step_ms(selected)
+        selected_laxity_ms = self._bucket_min_laxity_ms(selected, selected_step_ms, now_s)
+        if (
+            selected_laxity_ms >= 0.0
+            and candidate_laxity_ms < self.min_laxity_guard_ms
+            and candidate_laxity_ms < selected_laxity_ms
+        ):
+            return True
+
+        state_single_laxity_ms = self._state_laxity_ms(
+            state,
+            self._estimate_step_ms([state]),
+            now_s,
+        )
+        state_candidate_laxity_ms = self._state_laxity_ms(state, step_ms, now_s)
+        return (
+            state_single_laxity_ms >= 0.0
+            and state_candidate_laxity_ms < self.min_laxity_guard_ms
+            and state_candidate_laxity_ms < state_single_laxity_ms
+        )
 
     def _resident_sched_req_ids(self) -> set[str]:
         resident_ids = set(self._running)

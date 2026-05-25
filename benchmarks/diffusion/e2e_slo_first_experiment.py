@@ -19,7 +19,20 @@ if str(REPO_ROOT) not in sys.path:
 
 MODEL = "Qwen/Qwen-Image"
 DEFAULT_COST_MODEL = "benchmarks/diffusion/profile_results/latent_token_aspect/step_cost_model.json"
-SHAPE_PATTERN = [(512, 512), (768, 768), (512, 512), (768, 768), (1024, 1024)]
+WORKLOAD_SHAPES = {
+    "current-mix": [(512, 512), (768, 768), (512, 512), (768, 768), (1024, 1024)],
+    "large-heavy": [(1024, 1024), (1024, 1024), (768, 768), (1024, 1024), (512, 512)],
+    "rectangular-mix": [
+        (512, 768),
+        (768, 512),
+        (576, 1024),
+        (1024, 576),
+        (512, 512),
+        (768, 768),
+        (1024, 1024),
+    ],
+    "bursty": [(512, 512), (768, 768), (512, 512), (768, 768), (1024, 1024)],
+}
 
 
 def _imagenet_labels(dataset_readme: str | Path) -> list[str]:
@@ -50,9 +63,32 @@ def _request_repr(row: dict[str, Any]) -> str:
     return f"Request({fields})"
 
 
+def _shape_for_workload(workload: str, index: int) -> tuple[int, int]:
+    try:
+        shapes = WORKLOAD_SHAPES[workload]
+    except KeyError as exc:
+        supported = ", ".join(sorted(WORKLOAD_SHAPES))
+        raise ValueError(f"unsupported workload {workload!r}; choose one of: {supported}") from exc
+    return shapes[index % len(shapes)]
+
+
+def _arrival_time_s(args: argparse.Namespace, index: int) -> float:
+    if args.workload != "bursty":
+        return index * args.global_interarrival_s
+    burst_size = max(args.burst_size, 1)
+    burst_index = index // burst_size
+    in_burst_index = index % burst_size
+    burst_span_s = args.burst_interarrival_s * max(burst_size - 1, 0)
+    burst_period_s = max(args.global_interarrival_s * burst_size, burst_span_s)
+    return burst_index * burst_period_s + in_burst_index * args.burst_interarrival_s
+
+
 def make_trace(args: argparse.Namespace) -> None:
     from vllm_omni.diffusion.sched.step_cost_model import DiffusionStepCostModel
 
+    if args.workload not in WORKLOAD_SHAPES:
+        supported = ", ".join(sorted(WORKLOAD_SHAPES))
+        raise ValueError(f"unsupported workload {args.workload!r}; choose one of: {supported}")
     labels = _imagenet_labels(args.imagenet_readme)
     cost_model = DiffusionStepCostModel.from_config(
         {
@@ -70,7 +106,7 @@ def make_trace(args: argparse.Namespace) -> None:
     metadata_rows: list[dict[str, Any]] = []
     with output.open("w", encoding="utf-8") as f:
         for i in range(args.num_requests):
-            width, height = SHAPE_PATTERN[i % len(SHAPE_PATTERN)]
+            width, height = _shape_for_workload(args.workload, i)
             estimate = cost_model.estimate(
                 model=args.model,
                 width=width,
@@ -81,7 +117,7 @@ def make_trace(args: argparse.Namespace) -> None:
             )
             reference_cost_ms = estimate.step_ms * args.num_inference_steps
             slo_ms = reference_cost_ms * args.slo_scale
-            arrival_s = i * args.global_interarrival_s
+            arrival_s = _arrival_time_s(args, i)
             row = {
                 "request_id": f"{args.trace_id}-{i:04d}",
                 "prompt": _prompt(labels, i),
@@ -101,6 +137,7 @@ def make_trace(args: argparse.Namespace) -> None:
                         "profile_scale": args.slo_scale,
                         "profile_repeat": args.profile_repeat,
                         "profile_trace_id": args.trace_id,
+                        "profile_workload": args.workload,
                         "profile_shape": f"{width}x{height}",
                     }
                 },
@@ -109,6 +146,7 @@ def make_trace(args: argparse.Namespace) -> None:
             metadata_rows.append(
                 {
                     "request_id": row["request_id"],
+                    "workload": args.workload,
                     "shape": f"{width}x{height}",
                     "arrival_s": arrival_s,
                     "reference_cost_ms": reference_cost_ms,
@@ -353,8 +391,11 @@ def main() -> None:
     make.add_argument("--profile-policy", default="")
     make.add_argument("--profile-mode", default="e2e_slo_first")
     make.add_argument("--profile-repeat", type=int, default=0)
+    make.add_argument("--workload", default="current-mix", choices=sorted(WORKLOAD_SHAPES))
     make.add_argument("--num-requests", type=int, default=80)
     make.add_argument("--global-interarrival-s", type=float, default=4.25)
+    make.add_argument("--burst-size", type=int, default=8)
+    make.add_argument("--burst-interarrival-s", type=float, default=0.35)
     make.add_argument("--slo-scale", type=float, required=True)
     make.add_argument("--num-inference-steps", type=int, default=50)
     make.add_argument("--seed", type=int, default=1234)

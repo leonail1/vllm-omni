@@ -246,6 +246,15 @@ class StagePool:
         self._slo_default_num_inference_steps = int(_optional_float(slo_config.get("default_num_inference_steps")) or 50)
         self._slo_decode_ms = _optional_float(slo_config.get("decode_ms")) or 0.0
         self._slo_ignore_reference_cost = _optional_bool(slo_config.get("ignore_request_reference_cost"), False)
+        laxity_window_ms = _optional_float(slo_config.get("stagepool_laxity_window_ms"))
+        self._slo_stagepool_laxity_window_ms = max(laxity_window_ms or 0.0, 0.0)
+        pack_min_laxity_ms = _optional_float(slo_config.get("stagepool_pack_min_laxity_ms"))
+        self._slo_stagepool_pack_min_laxity_ms = 0.0 if pack_min_laxity_ms is None else pack_min_laxity_ms
+        self._scheduler_snapshot_ttl_s = (
+            0.0
+            if self._slo_stagepool_laxity_window_ms > 0
+            else self.SCHEDULER_SNAPSHOT_TTL_S
+        )
         profile_config = self._stage_profile_config(self._stage_slo_config)
         self._stagepool_profile_enabled = _optional_bool(profile_config.get("enabled"), False)
         self._stagepool_profile_path = profile_config.get("output_path")
@@ -810,38 +819,37 @@ class StagePool:
             *(self._get_scheduler_snapshot(replica_id) for _, replica_id in candidates),
             return_exceptions=True,
         )
-        scored: list[tuple[float, int, int, int, int]] = []
+        scored: list[dict[str, Any]] = []
         profile_candidates: list[dict[str, Any]] = []
         cursor = self._slo_tie_break_cursor % len(candidates)
         now_s = _time.time()
+        sampling_params = None if task is None else task.get("sampling_params")
+        incoming_key = self._sampling_key_dict(sampling_params)
         for idx, ((replica_info, _), snapshot) in enumerate(zip(candidates, snapshots, strict=False)):
             if isinstance(snapshot, BaseException) or snapshot is None:
                 continue
-            predicted_laxity_ms = self._predict_task_laxity_ms(task, snapshot, now_s=now_s)
-            safe_capacity = int(snapshot.get("safe_admit_capacity", 0) or 0)
-            queue_length = int(snapshot.get("num_waiting", replica_info.queue_length) or 0) + int(
-                snapshot.get("num_running", 0) or 0
-            )
             tie_rank = (idx - cursor) % len(candidates)
-            scored.append((-predicted_laxity_ms, -safe_capacity, queue_length, tie_rank, idx))
-            profile_candidates.append(
-                {
-                    "candidate_index": idx,
-                    "replica_id": candidates[idx][1],
-                    "input_addr": replica_info.input_addr,
-                    "predicted_laxity_ms": predicted_laxity_ms,
-                    "safe_capacity": safe_capacity,
-                    "queue_length": queue_length,
-                    "tie_rank": tie_rank,
-                    "snapshot_policy": snapshot.get("policy"),
-                }
+            candidate = self._stagepool_slo_candidate_profile(
+                task,
+                snapshot,
+                incoming_key=incoming_key,
+                now_s=now_s,
+                candidate_index=idx,
+                replica_id=candidates[idx][1],
+                tie_rank=tie_rank,
+                fallback_queue_length=replica_info.queue_length,
+                input_addr=replica_info.input_addr,
             )
+            scored.append(candidate)
+            profile_candidates.append(candidate)
 
         if not scored:
             self._write_stagepool_profile("distributed_slo_select", task, None, profile_candidates, now_s)
             return None
-        selected_idx = min(scored)[-1]
+        selected = self._choose_stagepool_slo_candidate(scored)
+        selected_idx = int(selected["candidate_index"])
         self._slo_tie_break_cursor = (selected_idx + 1) % len(candidates)
+        self._scheduler_snapshot_cache.pop(candidates[selected_idx][1], None)
         self._write_stagepool_profile(
             "distributed_slo_select",
             task,
@@ -860,38 +868,132 @@ class StagePool:
             *(self._get_scheduler_snapshot(replica_id) for replica_id in live),
             return_exceptions=True,
         )
-        scored: list[tuple[float, int, int, int, int]] = []
+        scored: list[dict[str, Any]] = []
         profile_candidates: list[dict[str, Any]] = []
         cursor = self._slo_tie_break_cursor % len(live)
         now_s = _time.time()
+        sampling_params = None if task is None else task.get("sampling_params")
+        incoming_key = self._sampling_key_dict(sampling_params)
         for idx, (replica_id, snapshot) in enumerate(zip(live, snapshots, strict=False)):
             if isinstance(snapshot, BaseException) or snapshot is None:
                 continue
-            predicted_laxity_ms = self._predict_task_laxity_ms(task, snapshot, now_s=now_s)
-            safe_capacity = int(snapshot.get("safe_admit_capacity", 0) or 0)
-            queue_length = int(snapshot.get("num_waiting", 0) or 0) + int(snapshot.get("num_running", 0) or 0)
             tie_rank = (idx - cursor) % len(live)
-            scored.append((-predicted_laxity_ms, -safe_capacity, queue_length, tie_rank, replica_id))
-            profile_candidates.append(
-                {
-                    "candidate_index": idx,
-                    "replica_id": replica_id,
-                    "predicted_laxity_ms": predicted_laxity_ms,
-                    "safe_capacity": safe_capacity,
-                    "queue_length": queue_length,
-                    "tie_rank": tie_rank,
-                    "snapshot_policy": snapshot.get("policy"),
-                }
+            candidate = self._stagepool_slo_candidate_profile(
+                task,
+                snapshot,
+                incoming_key=incoming_key,
+                now_s=now_s,
+                candidate_index=idx,
+                replica_id=replica_id,
+                tie_rank=tie_rank,
+                fallback_queue_length=0,
             )
+            scored.append(candidate)
+            profile_candidates.append(candidate)
 
         if not scored:
             self._write_stagepool_profile("local_slo_select", task, None, profile_candidates, now_s)
             return None
-        selected_replica_id = min(scored)[-1]
+        selected = self._choose_stagepool_slo_candidate(scored)
+        selected_replica_id = int(selected["replica_id"])
         selected_live_idx = live.index(selected_replica_id)
         self._slo_tie_break_cursor = (selected_live_idx + 1) % len(live)
+        self._scheduler_snapshot_cache.pop(selected_replica_id, None)
         self._write_stagepool_profile("local_slo_select", task, selected_replica_id, profile_candidates, now_s)
         return selected_replica_id
+
+    def _stagepool_slo_candidate_profile(
+        self,
+        task: Task | None,
+        snapshot: dict[str, Any],
+        *,
+        incoming_key: dict[str, Any] | None,
+        now_s: float,
+        candidate_index: int,
+        replica_id: int,
+        tie_rank: int,
+        fallback_queue_length: int,
+        input_addr: str | None = None,
+    ) -> dict[str, Any]:
+        predicted_laxity_ms = self._predict_task_laxity_ms(task, snapshot, now_s=now_s)
+        safe_capacity = int(snapshot.get("safe_admit_capacity", 0) or 0)
+        queue_length = int(snapshot.get("num_waiting", fallback_queue_length) or 0) + int(
+            snapshot.get("num_running", 0) or 0
+        )
+        matching_bucket = self._matching_bucket(snapshot, incoming_key)
+        matching_bucket_size = (
+            int(matching_bucket.get("candidate_batch_size", 0) or 0) if matching_bucket is not None else 0
+        )
+        matching_bucket_laxity_ms = (
+            _optional_float(matching_bucket.get("min_laxity_ms")) if matching_bucket is not None else None
+        )
+        can_pack_same_key = (
+            safe_capacity > 0
+            and matching_bucket_size > 0
+            and predicted_laxity_ms >= self._slo_stagepool_pack_min_laxity_ms
+            and (
+                matching_bucket_laxity_ms is None
+                or matching_bucket_laxity_ms >= self._slo_stagepool_pack_min_laxity_ms
+            )
+        )
+        candidate = {
+            "candidate_index": candidate_index,
+            "replica_id": replica_id,
+            "predicted_laxity_ms": predicted_laxity_ms,
+            "safe_capacity": safe_capacity,
+            "queue_length": queue_length,
+            "tie_rank": tie_rank,
+            "snapshot_policy": snapshot.get("policy"),
+            "matching_bucket_size": matching_bucket_size,
+            "matching_bucket_min_laxity_ms": matching_bucket_laxity_ms,
+            "can_pack_same_key": can_pack_same_key,
+        }
+        if input_addr is not None:
+            candidate["input_addr"] = input_addr
+        return candidate
+
+    def _choose_stagepool_slo_candidate(self, candidates: list[dict[str, Any]]) -> dict[str, Any]:
+        def laxity_first(candidate: dict[str, Any]) -> tuple[float, int, int, int, int]:
+            return (
+                -float(candidate["predicted_laxity_ms"]),
+                -int(candidate["safe_capacity"]),
+                int(candidate["queue_length"]),
+                int(candidate["tie_rank"]),
+                int(candidate["candidate_index"]),
+            )
+
+        best = min(candidates, key=laxity_first)
+        if self._slo_stagepool_laxity_window_ms <= 0:
+            return best
+
+        best_laxity_ms = float(best["predicted_laxity_ms"])
+        if best_laxity_ms < self._slo_stagepool_pack_min_laxity_ms:
+            return best
+
+        laxity_floor_ms = max(
+            self._slo_stagepool_pack_min_laxity_ms,
+            best_laxity_ms - self._slo_stagepool_laxity_window_ms,
+        )
+        eligible = [
+            candidate
+            for candidate in candidates
+            if float(candidate["predicted_laxity_ms"]) >= laxity_floor_ms
+        ]
+        if not any(bool(candidate["can_pack_same_key"]) for candidate in eligible):
+            return best
+
+        def packing_first(candidate: dict[str, Any]) -> tuple[int, int, float, int, int, int, int]:
+            return (
+                -int(bool(candidate["can_pack_same_key"])),
+                -int(candidate["matching_bucket_size"]),
+                -float(candidate["predicted_laxity_ms"]),
+                -int(candidate["safe_capacity"]),
+                int(candidate["queue_length"]),
+                int(candidate["tie_rank"]),
+                int(candidate["candidate_index"]),
+            )
+
+        return min(eligible, key=packing_first)
 
     def _distributed_candidate_profile(self, candidates: list[tuple[ReplicaInfo, int]]) -> list[dict[str, Any]]:
         return [
@@ -919,7 +1021,7 @@ class StagePool:
         cached = self._scheduler_snapshot_cache.get(replica_id)
         if cached is not None:
             cached_at_s, snapshot = cached
-            if now_s - cached_at_s <= self.SCHEDULER_SNAPSHOT_TTL_S:
+            if now_s - cached_at_s <= self._scheduler_snapshot_ttl_s:
                 return snapshot
 
         if replica_id >= len(self.clients):
@@ -941,7 +1043,10 @@ class StagePool:
 
         if not self._is_valid_scheduler_snapshot(snapshot):
             return None
-        self._scheduler_snapshot_cache[replica_id] = (now_s, snapshot)
+        if self._scheduler_snapshot_ttl_s > 0:
+            self._scheduler_snapshot_cache[replica_id] = (now_s, snapshot)
+        else:
+            self._scheduler_snapshot_cache.pop(replica_id, None)
         return snapshot
 
     @staticmethod

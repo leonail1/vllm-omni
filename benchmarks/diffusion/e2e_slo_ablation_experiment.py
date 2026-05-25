@@ -68,6 +68,20 @@ def _scale_dir(policy_dir: Path, repeat: int, scale: float) -> Path:
     return candidates[0]
 
 
+def _profile_policy_dir(output_dir: Path, policy: str, workload: str | None) -> Path:
+    if workload:
+        shared = output_dir / policy
+        if shared.exists():
+            return shared
+    return output_dir / policy
+
+
+def _result_policy_dir(output_dir: Path, policy: str, workload: str | None) -> Path:
+    if workload:
+        return output_dir / workload / policy
+    return output_dir / policy
+
+
 def _filtered_raw_rows(
     policy_dir: Path,
     *,
@@ -75,12 +89,16 @@ def _filtered_raw_rows(
     policy: str,
     repeat: int,
     scale: float,
-) -> tuple[list[dict[str, Any]], int]:
+    workload: str | None = None,
+    response_ids: set[str] | None = None,
+) -> tuple[list[dict[str, Any]], int, int, int]:
     all_rows: list[dict[str, Any]] = []
     for path in sorted(policy_dir.glob("step_cost_raw*.jsonl")):
         all_rows.extend(_read_jsonl(path))
 
     rows = []
+    matched_before_response_filter = 0
+    dropped_by_response_filter = 0
     for row in all_rows:
         tags = row.get("profile_tags") or {}
         if tags.get("profile_mode") != profile_mode:
@@ -94,10 +112,64 @@ def _filtered_raw_rows(
             continue
         if abs(row_scale - scale) > 1e-9 or row_repeat != repeat:
             continue
+        if workload and not _tags_match_workload(
+            tags,
+            workload=workload,
+            policy=policy,
+            repeat=repeat,
+            scale=scale,
+        ):
+            continue
         if row.get("interrupted"):
             continue
+        matched_before_response_filter += 1
+        if response_ids is not None and not (_row_request_ids(row) & response_ids):
+            dropped_by_response_filter += 1
+            continue
         rows.append(row)
-    return rows, len(all_rows)
+    return rows, len(all_rows), matched_before_response_filter, dropped_by_response_filter
+
+
+def _row_request_ids(row: dict[str, Any]) -> set[str]:
+    ids: set[str] = set()
+    for key in ("request_ids", "scheduled_req_ids"):
+        value = row.get(key)
+        if isinstance(value, list):
+            ids.update(str(item) for item in value if item)
+        elif value:
+            ids.add(str(value))
+    return ids
+
+
+def _tag_values(value: Any) -> list[str]:
+    if isinstance(value, list):
+        return [str(item) for item in value if item is not None]
+    if value is None:
+        return []
+    return [str(value)]
+
+
+def _tags_match_workload(
+    tags: dict[str, Any],
+    *,
+    workload: str,
+    policy: str,
+    repeat: int,
+    scale: float,
+) -> bool:
+    workload_values = _tag_values(tags.get("profile_workload"))
+    if workload_values:
+        return workload in workload_values
+
+    # Older profiler builds did not persist profile_workload. The trace id is
+    # still unique per workload/policy/repeat/scale, so use it as a compatibility
+    # fallback for already-collected runs.
+    expected_trace_ids = {
+        f"{workload}_{policy}_r{repeat}_scale_{_scale_label(scale)}",
+        f"{workload}_{policy}_r{repeat}_scale_{scale:.1f}",
+        f"{workload}_{policy}_r{repeat}_scale_{scale}",
+    }
+    return any(trace_id in expected_trace_ids for trace_id in _tag_values(tags.get("profile_trace_id")))
 
 
 def _flatten_numbers(rows: list[dict[str, Any]], key: str) -> list[float]:
@@ -238,39 +310,59 @@ def _request_stats(payload: dict[str, Any]) -> dict[str, Any]:
 def _summarize_one(
     output_dir: Path,
     *,
+    workload: str | None,
     profile_mode: str,
     policy: str,
     repeat: int,
     scale: float,
 ) -> dict[str, Any]:
-    policy_dir = output_dir / policy
-    result_path = _scale_dir(policy_dir, repeat, scale) / "benchmark_result.json"
+    policy_dir = _profile_policy_dir(output_dir, policy, workload)
+    result_policy_dir = _result_policy_dir(output_dir, policy, workload)
+    result_path = _scale_dir(result_policy_dir, repeat, scale) / "benchmark_result.json"
     if not result_path.exists():
-        return {"policy": policy, "repeat": repeat, "slo_scale": scale, "status": "missing"}
+        return {
+            "workload": workload or "default",
+            "policy": policy,
+            "repeat": repeat,
+            "slo_scale": scale,
+            "status": "missing",
+        }
 
     payload = _read_json(result_path)
     metrics = payload.get("metrics") or {}
-    rows, raw_total = _filtered_raw_rows(
+    response_ids = {
+        str(req.get("response_id"))
+        for req in payload.get("requests", [])
+        if req.get("response_id")
+    }
+    rows, raw_total, profile_rows_before_response_filter, profile_rows_dropped_by_response_filter = _filtered_raw_rows(
         policy_dir,
         profile_mode=profile_mode,
         policy=policy,
         repeat=repeat,
         scale=scale,
+        workload=workload,
+        response_ids=response_ids or None,
     )
     trace_ids = list(
         dict.fromkeys(
             [
+                f"{workload}_{policy}_r{repeat}_scale_{_scale_label(scale)}" if workload else "",
+                f"{workload}_{policy}_r{repeat}_scale_{scale:.1f}" if workload else "",
+                f"{workload}_{policy}_r{repeat}_scale_{scale}" if workload else "",
                 f"{policy}_r{repeat}_scale_{_scale_label(scale)}",
                 f"{policy}_r{repeat}_scale_{scale:.1f}",
                 f"{policy}_r{repeat}_scale_{scale}",
             ]
         )
     )
+    trace_ids = [trace_id for trace_id in trace_ids if trace_id]
     completed = int(metrics.get("completed_requests") or 0)
     failed = int(metrics.get("failed_requests") or 0)
     slo_met = int(metrics.get("slo_met_success") or 0)
     duration = float(metrics.get("duration") or 0.0)
     row = {
+        "workload": workload or "default",
         "policy": policy,
         "repeat": repeat,
         "slo_scale": scale,
@@ -288,11 +380,20 @@ def _summarize_one(
     }
     row.update(_request_stats(payload))
     row.update(_bucket_stats(rows, raw_total))
-    response_ids = {
-        str(req.get("response_id"))
-        for req in payload.get("requests", [])
-        if req.get("response_id")
-    }
+    row["profile_rows_before_response_filter"] = profile_rows_before_response_filter
+    row["profile_rows_dropped_by_response_filter"] = profile_rows_dropped_by_response_filter
+    if completed > 0 and row["profile_rows_for_run"] <= 0:
+        row["status"] = "profile_missing"
+        row["profile_warning"] = (
+            "No matching step profile rows found for this completed run; "
+            "bucket, deadline, and replica-utilization metrics are not trustworthy."
+        )
+    elif failed > 0 and profile_rows_dropped_by_response_filter > 0:
+        row["profile_warning"] = (
+            "Some matching step profile rows were dropped by response_id filtering because "
+            "this run has failed requests without response ids; bucket, deadline, and "
+            "replica-utilization metrics may be biased toward successful requests."
+        )
     client_request_ids = {
         str(req.get("request_id"))
         for req in payload.get("requests", [])
@@ -310,10 +411,10 @@ def _summarize_one(
 
 
 def _aggregate(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    grouped: dict[tuple[str, float], list[dict[str, Any]]] = defaultdict(list)
+    grouped: dict[tuple[str, str, float], list[dict[str, Any]]] = defaultdict(list)
     for row in rows:
         if row.get("status") == "ok":
-            grouped[(str(row["policy"]), float(row["slo_scale"]))].append(row)
+            grouped[(str(row.get("workload") or "default"), str(row["policy"]), float(row["slo_scale"]))].append(row)
 
     out = []
     metrics = [
@@ -324,6 +425,8 @@ def _aggregate(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
         "duration_s",
         "mean_bucket_size",
         "p95_bucket_size",
+        "profile_rows_before_response_filter",
+        "profile_rows_dropped_by_response_filter",
         "mean_denoise_ms",
         "p95_denoise_ms",
         "p5_time_to_deadline_ms",
@@ -335,8 +438,13 @@ def _aggregate(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
         "stagepool_null_selection_rows",
         "stagepool_slo_null_selection_rows",
     ]
-    for (policy, scale), items in sorted(grouped.items()):
-        row: dict[str, Any] = {"policy": policy, "slo_scale": scale, "repeats": len(items)}
+    for (workload, policy, scale), items in sorted(grouped.items()):
+        row: dict[str, Any] = {
+            "workload": workload,
+            "policy": policy,
+            "slo_scale": scale,
+            "repeats": len(items),
+        }
         for metric in metrics:
             values = [float(item.get(metric) or 0.0) for item in items]
             row[f"{metric}_mean"] = _mean(values)
@@ -351,15 +459,19 @@ def summarize(args: argparse.Namespace) -> None:
     policies = [item.strip() for item in args.policies.split(",") if item.strip()]
     scales = [float(item.strip()) for item in args.scales.split(",") if item.strip()]
     repeats = [int(item.strip()) for item in args.repeats.split(",") if item.strip()]
+    workloads = [item.strip() for item in args.workloads.split(",") if item.strip()]
+    workload_items: list[str | None] = workloads or [None]
 
     rows = [
         _summarize_one(
             output_dir,
+            workload=workload,
             profile_mode=args.profile_mode,
             policy=policy,
             repeat=repeat,
             scale=scale,
         )
+        for workload in workload_items
         for policy in policies
         for repeat in repeats
         for scale in scales
@@ -367,23 +479,38 @@ def summarize(args: argparse.Namespace) -> None:
     aggregate = _aggregate(rows)
     missing_runs = [
         {
+            "workload": row.get("workload") or "default",
             "policy": row.get("policy"),
             "repeat": row.get("repeat"),
             "slo_scale": row.get("slo_scale"),
+            "status": row.get("status"),
         }
         for row in rows
         if row.get("status") != "ok"
     ]
     missing_by_policy_scale = Counter(
-        (str(row["policy"]), float(row["slo_scale"])) for row in rows if row.get("status") != "ok"
+        (str(row.get("workload") or "default"), str(row["policy"]), float(row["slo_scale"]))
+        for row in rows
+        if row.get("status") != "ok"
     )
     expected_repeats = len(repeats)
     for row in aggregate:
         row["expected_repeats"] = expected_repeats
-        row["missing_runs"] = int(missing_by_policy_scale.get((str(row["policy"]), float(row["slo_scale"])), 0))
+        row["missing_runs"] = int(
+            missing_by_policy_scale.get(
+                (str(row.get("workload") or "default"), str(row["policy"]), float(row["slo_scale"])),
+                0,
+            )
+        )
     payload = {
         "output_dir": str(output_dir),
         "profile_mode": args.profile_mode,
+        "matrix": {
+            "workloads": workloads,
+            "policies": policies,
+            "scales": scales,
+            "repeats": repeats,
+        },
         "missing_runs": missing_runs,
         "rows": rows,
         "aggregate": aggregate,
@@ -394,6 +521,7 @@ def summarize(args: argparse.Namespace) -> None:
     )
 
     table_fields = [
+        "workload",
         "policy",
         "slo_scale",
         "expected_repeats",
@@ -418,13 +546,14 @@ def summarize(args: argparse.Namespace) -> None:
     lines = [
         "# E2E SLO Ablation Summary",
         "",
-        "| Policy | SLO scale | Repeats | Miss rate | Goodput | Throughput | P95 latency | Mean bucket | P5 TTD |",
-        "|---|---:|---:|---:|---:|---:|---:|---:|---:|",
+        "| Workload | Policy | SLO scale | Repeats | Miss rate | Goodput | Throughput | P95 latency | Mean bucket | P5 TTD |",
+        "|---|---|---:|---:|---:|---:|---:|---:|---:|---:|",
     ]
     for row in aggregate:
         lines.append(
-            "| {policy} | {scale:g} | {repeats} | {miss:.2%} | {goodput:.4f} | {throughput:.4f} | "
+            "| {workload} | {policy} | {scale:g} | {repeats} | {miss:.2%} | {goodput:.4f} | {throughput:.4f} | "
             "{p95:.2f}s | {bucket:.3f} | {ttd:.1f}ms |".format(
+                workload=row.get("workload") or "default",
                 policy=row["policy"],
                 scale=float(row["slo_scale"]),
                 repeats=int(row["repeats"]),
@@ -439,7 +568,10 @@ def summarize(args: argparse.Namespace) -> None:
     if missing_runs:
         lines.extend(["", "## Missing Runs", ""])
         for row in missing_runs:
-            lines.append(f"- {row['policy']} repeat={row['repeat']} scale={row['slo_scale']}")
+            lines.append(
+                f"- {row['workload']} / {row['policy']} repeat={row['repeat']} "
+                f"scale={row['slo_scale']} status={row['status']}"
+            )
     (output_dir / "ablation_report.md").write_text("\n".join(lines) + "\n", encoding="utf-8")
     print(json.dumps(payload, indent=2, ensure_ascii=False))
 
@@ -450,6 +582,7 @@ def main() -> None:
     parser.add_argument("--policies", required=True)
     parser.add_argument("--scales", default="2.5,4.0")
     parser.add_argument("--repeats", default="0,1,2")
+    parser.add_argument("--workloads", default="")
     parser.add_argument("--profile-mode", default="e2e_slo_ablation")
     args = parser.parse_args()
     summarize(args)

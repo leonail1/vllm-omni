@@ -1,0 +1,24 @@
+{
+  "message": "E2E SLO result bundle packaged",
+  "output_dir": "benchmark_outputs/e2e_slo_workload_sweep",
+  "bundle_dir": "benchmarks/diffusion/profile_results/e2e_slo_workload_sweep",
+  "workloads": [
+    "current-mix",
+    "large-heavy",
+    "rectangular-mix",
+    "bursty"
+  ],
+  "policies": [
+    "current",
+    "slo_no_preemption_lookup"
+  ],
+  "scales": [
+    2.5,
+    3.0,
+    3.5,
+    4.0
+  ],
+  "repeats": [
+    0
+  ]
+}

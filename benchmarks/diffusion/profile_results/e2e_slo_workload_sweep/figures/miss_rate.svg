@@ -1,0 +1,86 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1270" height="540" viewBox="0 0 1270 540">
+<rect width="100%" height="100%" fill="#ffffff"/>
+<text x="635.0" y="32" text-anchor="middle" font-family="Arial" font-size="22" font-weight="700">SLO Miss Rate</text>
+<line x1="72" y1="422" x2="1246" y2="422" stroke="#111827"/>
+<line x1="72" y1="64" x2="72" y2="422" stroke="#111827"/>
+<line x1="68" y1="422.0" x2="1246" y2="422.0" stroke="#e5e7eb"/>
+<text x="62" y="426.0" text-anchor="end" font-family="Arial" font-size="11">0%</text>
+<line x1="68" y1="350.4" x2="1246" y2="350.4" stroke="#e5e7eb"/>
+<text x="62" y="354.4" text-anchor="end" font-family="Arial" font-size="11">20%</text>
+<line x1="68" y1="278.8" x2="1246" y2="278.8" stroke="#e5e7eb"/>
+<text x="62" y="282.8" text-anchor="end" font-family="Arial" font-size="11">40%</text>
+<line x1="68" y1="207.2" x2="1246" y2="207.2" stroke="#e5e7eb"/>
+<text x="62" y="211.2" text-anchor="end" font-family="Arial" font-size="11">60%</text>
+<line x1="68" y1="135.6" x2="1246" y2="135.6" stroke="#e5e7eb"/>
+<text x="62" y="139.6" text-anchor="end" font-family="Arial" font-size="11">79%</text>
+<line x1="68" y1="64.0" x2="1246" y2="64.0" stroke="#e5e7eb"/>
+<text x="62" y="68.0" text-anchor="end" font-family="Arial" font-size="11">99%</text>
+<text x="108.7" y="444" text-anchor="middle" font-family="Arial" font-size="11">bursty</text>
+<text x="108.7" y="460" text-anchor="middle" font-family="Arial" font-size="11">scale 2.5</text>
+<rect x="80.0" y="178.4" width="26.7" height="243.6" fill="#2563eb"/>
+<rect x="110.7" y="259.6" width="26.7" height="162.4" fill="#dc2626"/>
+<text x="182.1" y="444" text-anchor="middle" font-family="Arial" font-size="11">bursty</text>
+<text x="182.1" y="460" text-anchor="middle" font-family="Arial" font-size="11">scale 3</text>
+<rect x="153.4" y="313.7" width="26.7" height="108.3" fill="#2563eb"/>
+<rect x="184.1" y="282.1" width="26.7" height="139.9" fill="#dc2626"/>
+<text x="255.4" y="444" text-anchor="middle" font-family="Arial" font-size="11">bursty</text>
+<text x="255.4" y="460" text-anchor="middle" font-family="Arial" font-size="11">scale 3.5</text>
+<rect x="226.8" y="367.9" width="26.7" height="54.1" fill="#2563eb"/>
+<rect x="257.4" y="309.2" width="26.7" height="112.8" fill="#dc2626"/>
+<text x="328.8" y="444" text-anchor="middle" font-family="Arial" font-size="11">bursty</text>
+<text x="328.8" y="460" text-anchor="middle" font-family="Arial" font-size="11">scale 4</text>
+<rect x="300.1" y="295.7" width="26.7" height="126.3" fill="#2563eb"/>
+<rect x="330.8" y="349.8" width="26.7" height="72.2" fill="#dc2626"/>
+<text x="402.2" y="444" text-anchor="middle" font-family="Arial" font-size="11">current-mix</text>
+<text x="402.2" y="460" text-anchor="middle" font-family="Arial" font-size="11">scale 2.5</text>
+<rect x="373.5" y="268.6" width="26.7" height="153.4" fill="#2563eb"/>
+<rect x="404.2" y="340.8" width="26.7" height="81.2" fill="#dc2626"/>
+<text x="475.6" y="444" text-anchor="middle" font-family="Arial" font-size="11">current-mix</text>
+<text x="475.6" y="460" text-anchor="middle" font-family="Arial" font-size="11">scale 3</text>
+<rect x="446.9" y="273.1" width="26.7" height="148.9" fill="#2563eb"/>
+<rect x="477.6" y="399.4" width="26.7" height="22.6" fill="#dc2626"/>
+<text x="548.9" y="444" text-anchor="middle" font-family="Arial" font-size="11">current-mix</text>
+<text x="548.9" y="460" text-anchor="middle" font-family="Arial" font-size="11">scale 3.5</text>
+<rect x="520.2" y="318.2" width="26.7" height="103.8" fill="#2563eb"/>
+<rect x="550.9" y="422.0" width="26.7" height="0.0" fill="#dc2626"/>
+<text x="622.3" y="444" text-anchor="middle" font-family="Arial" font-size="11">current-mix</text>
+<text x="622.3" y="460" text-anchor="middle" font-family="Arial" font-size="11">scale 4</text>
+<rect x="593.6" y="367.9" width="26.7" height="54.1" fill="#2563eb"/>
+<rect x="624.3" y="413.0" width="26.7" height="9.0" fill="#dc2626"/>
+<text x="695.7" y="444" text-anchor="middle" font-family="Arial" font-size="11">large-heavy</text>
+<text x="695.7" y="460" text-anchor="middle" font-family="Arial" font-size="11">scale 2.5</text>
+<rect x="667.0" y="160.3" width="26.7" height="261.7" fill="#2563eb"/>
+<rect x="697.7" y="304.7" width="26.7" height="117.3" fill="#dc2626"/>
+<text x="769.1" y="444" text-anchor="middle" font-family="Arial" font-size="11">large-heavy</text>
+<text x="769.1" y="460" text-anchor="middle" font-family="Arial" font-size="11">scale 3</text>
+<rect x="740.4" y="110.7" width="26.7" height="311.3" fill="#2563eb"/>
+<rect x="771.1" y="304.7" width="26.7" height="117.3" fill="#dc2626"/>
+<text x="842.4" y="444" text-anchor="middle" font-family="Arial" font-size="11">large-heavy</text>
+<text x="842.4" y="460" text-anchor="middle" font-family="Arial" font-size="11">scale 3.5</text>
+<rect x="813.8" y="237.0" width="26.7" height="185.0" fill="#2563eb"/>
+<rect x="844.4" y="345.3" width="26.7" height="76.7" fill="#dc2626"/>
+<text x="915.8" y="444" text-anchor="middle" font-family="Arial" font-size="11">large-heavy</text>
+<text x="915.8" y="460" text-anchor="middle" font-family="Arial" font-size="11">scale 4</text>
+<rect x="887.1" y="246.0" width="26.7" height="176.0" fill="#2563eb"/>
+<rect x="917.8" y="345.3" width="26.7" height="76.7" fill="#dc2626"/>
+<text x="989.2" y="444" text-anchor="middle" font-family="Arial" font-size="11">rectangular-mix</text>
+<text x="989.2" y="460" text-anchor="middle" font-family="Arial" font-size="11">scale 2.5</text>
+<rect x="960.5" y="228.0" width="26.7" height="194.0" fill="#2563eb"/>
+<rect x="991.2" y="358.8" width="26.7" height="63.2" fill="#dc2626"/>
+<text x="1062.6" y="444" text-anchor="middle" font-family="Arial" font-size="11">rectangular-mix</text>
+<text x="1062.6" y="460" text-anchor="middle" font-family="Arial" font-size="11">scale 3</text>
+<rect x="1033.9" y="255.1" width="26.7" height="166.9" fill="#2563eb"/>
+<rect x="1064.6" y="354.3" width="26.7" height="67.7" fill="#dc2626"/>
+<text x="1135.9" y="444" text-anchor="middle" font-family="Arial" font-size="11">rectangular-mix</text>
+<text x="1135.9" y="460" text-anchor="middle" font-family="Arial" font-size="11">scale 3.5</text>
+<rect x="1107.2" y="250.6" width="26.7" height="171.4" fill="#2563eb"/>
+<rect x="1137.9" y="372.4" width="26.7" height="49.6" fill="#dc2626"/>
+<text x="1209.3" y="444" text-anchor="middle" font-family="Arial" font-size="11">rectangular-mix</text>
+<text x="1209.3" y="460" text-anchor="middle" font-family="Arial" font-size="11">scale 4</text>
+<rect x="1180.6" y="340.8" width="26.7" height="81.2" fill="#2563eb"/>
+<rect x="1211.3" y="399.4" width="26.7" height="22.6" fill="#dc2626"/>
+<rect x="72" y="492" width="12" height="12" fill="#2563eb"/>
+<text x="90" y="502" font-family="Arial" font-size="12">current</text>
+<rect x="282" y="492" width="12" height="12" fill="#dc2626"/>
+<text x="300" y="502" font-family="Arial" font-size="12">slo_no_preemption_lookup</text>
+</svg>

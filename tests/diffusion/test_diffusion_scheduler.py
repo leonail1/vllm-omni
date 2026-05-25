@@ -1186,6 +1186,43 @@ class TestSloStepScheduler:
         assert _new_ids(sched_output) == [urgent]
         assert sched_output.num_waiting_reqs == 2
 
+    def test_no_preemption_admission_guard_protects_running_bucket(self) -> None:
+        scheduler = self._make_scheduler(
+            max_num_seqs=2,
+            slo_config={
+                "default_step_ms": 100.0,
+                "batch_growth_alpha": 2.0,
+                "enable_step_preemption": False,
+                "min_laxity_guard_ms": 0.0,
+            },
+        )
+
+        running = scheduler.add_request(
+            _make_slo_step_request(
+                "running",
+                reference_cost_ms=1000,
+                slo_ms=10000,
+                num_inference_steps=10,
+            )
+        )
+        first = scheduler.schedule()
+        assert _new_ids(first) == [running]
+        assert scheduler.update_from_output(first, _make_step_output(running, step_index=1)) == set()
+
+        urgent = scheduler.add_request(
+            _make_slo_step_request(
+                "urgent",
+                reference_cost_ms=1000,
+                slo_ms=200,
+                num_inference_steps=10,
+            )
+        )
+        second = scheduler.schedule()
+
+        assert _new_ids(second) == []
+        assert _cached_ids(second) == [running]
+        assert scheduler.get_request_state(urgent).status == DiffusionRequestStatus.WAITING
+
     def test_same_key_batch_formation_preserves_absolute_deadline_guard_priority(self) -> None:
         scheduler = self._make_scheduler(
             max_num_seqs=2,
