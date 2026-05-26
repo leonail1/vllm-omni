@@ -1,0 +1,19 @@
+{
+  "status": "packaged",
+  "bundle": "benchmarks/diffusion/profile_results/e2e_slo_frontier_adaptive_queue_pilot",
+  "workloads": [
+    "current-mix",
+    "shape-grouped-current-mix"
+  ],
+  "interarrival_s": 2.5,
+  "scales": [
+    4.0,
+    6.0
+  ],
+  "policies": [
+    "current",
+    "slo_no_preemption_lookup",
+    "slo_no_preemption_guarded",
+    "slo_no_preemption_adaptive_guarded"
+  ]
+}

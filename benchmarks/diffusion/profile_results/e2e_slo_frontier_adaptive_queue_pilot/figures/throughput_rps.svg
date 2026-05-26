@@ -1,0 +1,46 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1180" height="520" viewBox="0 0 1180 520">
+<rect width="100%" height="100%" fill="#fff"/>
+<text x="590.0" y="32" text-anchor="middle" font-family="Arial" font-size="22" font-weight="700">Throughput</text>
+<line x1="70" y1="400" x2="1150" y2="400" stroke="#111"/>
+<line x1="70" y1="55" x2="70" y2="400" stroke="#111"/>
+<line x1="66" y1="400.0" x2="1150" y2="400.0" stroke="#e5e7eb"/>
+<text x="60" y="404.0" text-anchor="end" font-family="Arial" font-size="11">0.00</text>
+<line x1="66" y1="331.0" x2="1150" y2="331.0" stroke="#e5e7eb"/>
+<text x="60" y="335.0" text-anchor="end" font-family="Arial" font-size="11">0.06</text>
+<line x1="66" y1="262.0" x2="1150" y2="262.0" stroke="#e5e7eb"/>
+<text x="60" y="266.0" text-anchor="end" font-family="Arial" font-size="11">0.11</text>
+<line x1="66" y1="193.0" x2="1150" y2="193.0" stroke="#e5e7eb"/>
+<text x="60" y="197.0" text-anchor="end" font-family="Arial" font-size="11">0.17</text>
+<line x1="66" y1="124.0" x2="1150" y2="124.0" stroke="#e5e7eb"/>
+<text x="60" y="128.0" text-anchor="end" font-family="Arial" font-size="11">0.23</text>
+<line x1="66" y1="55.0" x2="1150" y2="55.0" stroke="#e5e7eb"/>
+<text x="60" y="59.0" text-anchor="end" font-family="Arial" font-size="11">0.29</text>
+<text x="205.0" y="425" text-anchor="middle" font-family="Arial" font-size="11">current-mix</text>
+<text x="205.0" y="442" text-anchor="middle" font-family="Arial" font-size="11">scale 4</text>
+<rect x="78.0" y="161.6" width="60.0" height="238.4" fill="#2563eb"/>
+<rect x="141.0" y="139.7" width="60.0" height="260.3" fill="#059669"/>
+<rect x="204.0" y="183.4" width="60.0" height="216.6" fill="#dc2626"/>
+<rect x="267.0" y="116.2" width="60.0" height="283.8" fill="#7c3aed"/>
+<text x="475.0" y="425" text-anchor="middle" font-family="Arial" font-size="11">current-mix</text>
+<text x="475.0" y="442" text-anchor="middle" font-family="Arial" font-size="11">scale 6</text>
+<rect x="348.0" y="130.4" width="60.0" height="269.6" fill="#2563eb"/>
+<rect x="411.0" y="184.0" width="60.0" height="216.0" fill="#059669"/>
+<rect x="474.0" y="100.1" width="60.0" height="299.9" fill="#dc2626"/>
+<rect x="537.0" y="107.8" width="60.0" height="292.2" fill="#7c3aed"/>
+<text x="745.0" y="425" text-anchor="middle" font-family="Arial" font-size="11">shape-grouped-current-mix</text>
+<text x="745.0" y="442" text-anchor="middle" font-family="Arial" font-size="11">scale 4</text>
+<rect x="618.0" y="155.3" width="60.0" height="244.7" fill="#2563eb"/>
+<rect x="681.0" y="124.2" width="60.0" height="275.8" fill="#059669"/>
+<rect x="744.0" y="110.2" width="60.0" height="289.8" fill="#dc2626"/>
+<rect x="807.0" y="100.0" width="60.0" height="300.0" fill="#7c3aed"/>
+<text x="1015.0" y="425" text-anchor="middle" font-family="Arial" font-size="11">shape-grouped-current-mix</text>
+<text x="1015.0" y="442" text-anchor="middle" font-family="Arial" font-size="11">scale 6</text>
+<rect x="888.0" y="136.0" width="60.0" height="264.0" fill="#2563eb"/>
+<rect x="951.0" y="125.6" width="60.0" height="274.4" fill="#059669"/>
+<rect x="1014.0" y="102.4" width="60.0" height="297.6" fill="#dc2626"/>
+<rect x="1077.0" y="105.7" width="60.0" height="294.3" fill="#7c3aed"/>
+<rect x="70" y="475" width="12" height="12" fill="#2563eb"/><text x="88" y="485" font-family="Arial" font-size="12">current</text>
+<rect x="330" y="475" width="12" height="12" fill="#059669"/><text x="348" y="485" font-family="Arial" font-size="12">slo_no_preemption_lookup</text>
+<rect x="590" y="475" width="12" height="12" fill="#dc2626"/><text x="608" y="485" font-family="Arial" font-size="12">slo_no_preemption_guarded</text>
+<rect x="850" y="475" width="12" height="12" fill="#7c3aed"/><text x="868" y="485" font-family="Arial" font-size="12">slo_no_preemption_adaptive_guarded</text>
+</svg>

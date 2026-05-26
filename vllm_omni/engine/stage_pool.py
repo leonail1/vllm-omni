@@ -254,6 +254,10 @@ class StagePool:
         self._slo_stagepool_pack_max_queue_length = int(max(pack_max_queue_length or 0.0, 0.0))
         pack_max_matching_bucket_size = _optional_float(slo_config.get("stagepool_pack_max_matching_bucket_size"))
         self._slo_stagepool_pack_max_matching_bucket_size = int(max(pack_max_matching_bucket_size or 0.0, 0.0))
+        queue_guard_window_ms = _optional_float(slo_config.get("stagepool_queue_guard_window_ms"))
+        self._slo_stagepool_queue_guard_window_ms = max(queue_guard_window_ms or 0.0, 0.0)
+        queue_guard_max_queue_length = _optional_float(slo_config.get("stagepool_queue_guard_max_queue_length"))
+        self._slo_stagepool_queue_guard_max_queue_length = int(max(queue_guard_max_queue_length or 0.0, 0.0))
         self._scheduler_snapshot_ttl_s = (
             0.0
             if self._slo_stagepool_laxity_window_ms > 0
@@ -968,6 +972,45 @@ class StagePool:
             candidate["input_addr"] = input_addr
         return candidate
 
+    def _choose_stagepool_queue_guard_candidate(
+        self,
+        candidates: list[dict[str, Any]],
+        best: dict[str, Any],
+    ) -> dict[str, Any]:
+        if self._slo_stagepool_queue_guard_window_ms <= 0:
+            return best
+        if self._slo_stagepool_queue_guard_max_queue_length <= 0:
+            return best
+        if int(best["queue_length"]) < self._slo_stagepool_queue_guard_max_queue_length:
+            return best
+
+        best_laxity_ms = float(best["predicted_laxity_ms"])
+        if best_laxity_ms < self._slo_stagepool_pack_min_laxity_ms:
+            return best
+        laxity_floor_ms = max(
+            self._slo_stagepool_pack_min_laxity_ms,
+            best_laxity_ms - self._slo_stagepool_queue_guard_window_ms,
+        )
+        eligible = [
+            candidate
+            for candidate in candidates
+            if int(candidate["queue_length"]) < self._slo_stagepool_queue_guard_max_queue_length
+            and float(candidate["predicted_laxity_ms"]) >= laxity_floor_ms
+        ]
+        if not eligible:
+            return best
+
+        def queue_first(candidate: dict[str, Any]) -> tuple[int, int, float, int, int]:
+            return (
+                int(candidate["queue_length"]),
+                -int(candidate["safe_capacity"]),
+                -float(candidate["predicted_laxity_ms"]),
+                int(candidate["tie_rank"]),
+                int(candidate["candidate_index"]),
+            )
+
+        return min(eligible, key=queue_first)
+
     def _choose_stagepool_slo_candidate(self, candidates: list[dict[str, Any]]) -> dict[str, Any]:
         def laxity_first(candidate: dict[str, Any]) -> tuple[float, int, int, int, int]:
             return (
@@ -979,6 +1022,7 @@ class StagePool:
             )
 
         best = min(candidates, key=laxity_first)
+        best = self._choose_stagepool_queue_guard_candidate(candidates, best)
         if self._slo_stagepool_laxity_window_ms <= 0:
             return best
 
@@ -995,6 +1039,14 @@ class StagePool:
             for candidate in candidates
             if float(candidate["predicted_laxity_ms"]) >= laxity_floor_ms
         ]
+        if self._slo_stagepool_queue_guard_window_ms > 0 and self._slo_stagepool_queue_guard_max_queue_length > 0:
+            queue_eligible = [
+                candidate
+                for candidate in eligible
+                if int(candidate["queue_length"]) < self._slo_stagepool_queue_guard_max_queue_length
+            ]
+            if queue_eligible:
+                eligible = queue_eligible
         if not any(bool(candidate["can_pack_same_key"]) for candidate in eligible):
             return best
 

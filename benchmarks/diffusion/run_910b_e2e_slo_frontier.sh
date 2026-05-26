@@ -22,7 +22,9 @@ POLICIES="${POLICIES:-current,slo_no_preemption_lookup}"
 CANDIDATE_POLICY="${CANDIDATE_POLICY:-}"
 if [[ -z "${CANDIDATE_POLICY}" ]]; then
   CANDIDATE_POLICY="slo_no_preemption_lookup"
-  if [[ ",${POLICIES}," == *",slo_no_preemption_guarded,"* ]]; then
+  if [[ ",${POLICIES}," == *",slo_no_preemption_adaptive_guarded,"* ]]; then
+    CANDIDATE_POLICY="slo_no_preemption_adaptive_guarded"
+  elif [[ ",${POLICIES}," == *",slo_no_preemption_guarded,"* ]]; then
     CANDIDATE_POLICY="slo_no_preemption_guarded"
   fi
 fi
@@ -39,6 +41,8 @@ GUARDED_STAGEPOOL_LAXITY_WINDOW_MS="${GUARDED_STAGEPOOL_LAXITY_WINDOW_MS:-500}"
 GUARDED_STAGEPOOL_PACK_MAX_QUEUE_LENGTH="${GUARDED_STAGEPOOL_PACK_MAX_QUEUE_LENGTH:-2}"
 GUARDED_STAGEPOOL_PACK_MAX_MATCHING_BUCKET_SIZE="${GUARDED_STAGEPOOL_PACK_MAX_MATCHING_BUCKET_SIZE:-2}"
 GUARDED_NO_PREEMPTION_ADMISSION_MAX_BATCH_SIZE="${GUARDED_NO_PREEMPTION_ADMISSION_MAX_BATCH_SIZE:-3}"
+ADAPTIVE_STAGEPOOL_QUEUE_GUARD_WINDOW_MS="${ADAPTIVE_STAGEPOOL_QUEUE_GUARD_WINDOW_MS:-10000}"
+ADAPTIVE_STAGEPOOL_QUEUE_GUARD_MAX_QUEUE_LENGTH="${ADAPTIVE_STAGEPOOL_QUEUE_GUARD_MAX_QUEUE_LENGTH:-4}"
 SKIP_EXISTING="${SKIP_EXISTING:-0}"
 ACTIVE_PID_FILE=""
 
@@ -77,7 +81,7 @@ validate_policy() {
   local policy="$1"
   validate_safe_token "policy" "${policy}"
   case "${policy}" in
-    current|stagepool_only|instance_only|constant_cost|formula_cost|full_slo|no_preemption|slo_no_preemption_lookup|slo_no_preemption_guarded|alpha0|alpha1) ;;
+    current|stagepool_only|instance_only|constant_cost|formula_cost|full_slo|no_preemption|slo_no_preemption_lookup|slo_no_preemption_guarded|slo_no_preemption_adaptive_guarded|alpha0|alpha1) ;;
     *)
       log "unknown policy: ${policy}"
       exit 2
@@ -294,7 +298,8 @@ make_additional_config() {
     "${STAGEPOOL_LAXITY_WINDOW_MS}" "${STAGEPOOL_PACK_MIN_LAXITY_MS}" \
     "${NO_PREEMPTION_ADMISSION_GUARD}" "${GUARDED_STAGEPOOL_LAXITY_WINDOW_MS}" \
     "${GUARDED_STAGEPOOL_PACK_MAX_QUEUE_LENGTH}" "${GUARDED_STAGEPOOL_PACK_MAX_MATCHING_BUCKET_SIZE}" \
-    "${GUARDED_NO_PREEMPTION_ADMISSION_MAX_BATCH_SIZE}" <<'PY'
+    "${GUARDED_NO_PREEMPTION_ADMISSION_MAX_BATCH_SIZE}" "${ADAPTIVE_STAGEPOOL_QUEUE_GUARD_WINDOW_MS}" \
+    "${ADAPTIVE_STAGEPOOL_QUEUE_GUARD_MAX_QUEUE_LENGTH}" <<'PY'
 import json
 import sys
 
@@ -311,7 +316,9 @@ import sys
     guarded_stagepool_pack_max_queue_length,
     guarded_stagepool_pack_max_matching_bucket_size,
     guarded_no_preemption_admission_max_batch_size,
-) = sys.argv[1:13]
+    adaptive_stagepool_queue_guard_window_ms,
+    adaptive_stagepool_queue_guard_max_queue_length,
+) = sys.argv[1:15]
 config = {
     "diffusion_step_profile": {
         "enabled": True,
@@ -387,6 +394,21 @@ elif policy == "slo_no_preemption_guarded":
         "stagepool_pack_min_laxity_ms": float(stagepool_pack_min_laxity_ms),
         "stagepool_pack_max_queue_length": int(float(guarded_stagepool_pack_max_queue_length)),
         "stagepool_pack_max_matching_bucket_size": int(float(guarded_stagepool_pack_max_matching_bucket_size)),
+        "no_preemption_admission_max_batch_size": int(float(guarded_no_preemption_admission_max_batch_size)),
+    }
+elif policy == "slo_no_preemption_adaptive_guarded":
+    config["diffusion_scheduler_policy"] = "slo"
+    config["diffusion_slo_scheduler"] = {
+        **lookup,
+        "enable_stagepool_slo": True,
+        "enable_step_preemption": False,
+        "no_preemption_admission_guard": True,
+        "stagepool_laxity_window_ms": float(guarded_stagepool_laxity_window_ms),
+        "stagepool_pack_min_laxity_ms": float(stagepool_pack_min_laxity_ms),
+        "stagepool_pack_max_queue_length": int(float(guarded_stagepool_pack_max_queue_length)),
+        "stagepool_pack_max_matching_bucket_size": int(float(guarded_stagepool_pack_max_matching_bucket_size)),
+        "stagepool_queue_guard_window_ms": float(adaptive_stagepool_queue_guard_window_ms),
+        "stagepool_queue_guard_max_queue_length": int(float(adaptive_stagepool_queue_guard_max_queue_length)),
         "no_preemption_admission_max_batch_size": int(float(guarded_no_preemption_admission_max_batch_size)),
     }
 elif policy == "alpha0":

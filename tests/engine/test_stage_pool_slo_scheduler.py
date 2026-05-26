@@ -534,6 +534,155 @@ async def test_stage_pool_pack_bucket_size_guard_blocks_large_bucket() -> None:
     assert await pool._select_slo_aware_local_replica_id(task) == 1
 
 
+def test_stage_pool_queue_guard_avoids_overloaded_close_laxity_candidate() -> None:
+    pool = StagePool(
+        0,
+        [],
+        stage_vllm_config=_stage_config_with_slo_options(
+            {
+                "stagepool_queue_guard_window_ms": 1000.0,
+                "stagepool_queue_guard_max_queue_length": 4,
+            }
+        ),
+    )
+    candidates = [
+        {
+            "candidate_index": 0,
+            "replica_id": 0,
+            "predicted_laxity_ms": 10000.0,
+            "safe_capacity": 1,
+            "queue_length": 7,
+            "tie_rank": 0,
+            "matching_bucket_size": 0,
+            "can_pack_same_key": False,
+        },
+        {
+            "candidate_index": 1,
+            "replica_id": 1,
+            "predicted_laxity_ms": 9400.0,
+            "safe_capacity": 1,
+            "queue_length": 2,
+            "tie_rank": 1,
+            "matching_bucket_size": 0,
+            "can_pack_same_key": False,
+        },
+    ]
+
+    assert pool._choose_stagepool_slo_candidate(candidates)["replica_id"] == 1
+
+
+def test_stage_pool_queue_guard_keeps_much_safer_candidate() -> None:
+    pool = StagePool(
+        0,
+        [],
+        stage_vllm_config=_stage_config_with_slo_options(
+            {
+                "stagepool_queue_guard_window_ms": 1000.0,
+                "stagepool_queue_guard_max_queue_length": 4,
+            }
+        ),
+    )
+    candidates = [
+        {
+            "candidate_index": 0,
+            "replica_id": 0,
+            "predicted_laxity_ms": 10000.0,
+            "safe_capacity": 1,
+            "queue_length": 7,
+            "tie_rank": 0,
+            "matching_bucket_size": 0,
+            "can_pack_same_key": False,
+        },
+        {
+            "candidate_index": 1,
+            "replica_id": 1,
+            "predicted_laxity_ms": 8000.0,
+            "safe_capacity": 1,
+            "queue_length": 2,
+            "tie_rank": 1,
+            "matching_bucket_size": 0,
+            "can_pack_same_key": False,
+        },
+    ]
+
+    assert pool._choose_stagepool_slo_candidate(candidates)["replica_id"] == 0
+
+
+def test_stage_pool_queue_guard_treats_limit_as_full() -> None:
+    pool = StagePool(
+        0,
+        [],
+        stage_vllm_config=_stage_config_with_slo_options(
+            {
+                "stagepool_queue_guard_window_ms": 1000.0,
+                "stagepool_queue_guard_max_queue_length": 4,
+            }
+        ),
+    )
+    candidates = [
+        {
+            "candidate_index": 0,
+            "replica_id": 0,
+            "predicted_laxity_ms": 10000.0,
+            "safe_capacity": 1,
+            "queue_length": 4,
+            "tie_rank": 0,
+            "matching_bucket_size": 0,
+            "can_pack_same_key": False,
+        },
+        {
+            "candidate_index": 1,
+            "replica_id": 1,
+            "predicted_laxity_ms": 9600.0,
+            "safe_capacity": 1,
+            "queue_length": 3,
+            "tie_rank": 1,
+            "matching_bucket_size": 0,
+            "can_pack_same_key": False,
+        },
+    ]
+
+    assert pool._choose_stagepool_slo_candidate(candidates)["replica_id"] == 1
+
+
+def test_stage_pool_queue_guard_filters_packing_candidates() -> None:
+    pool = StagePool(
+        0,
+        [],
+        stage_vllm_config=_stage_config_with_slo_options(
+            {
+                "stagepool_laxity_window_ms": 1000.0,
+                "stagepool_queue_guard_window_ms": 1000.0,
+                "stagepool_queue_guard_max_queue_length": 4,
+            }
+        ),
+    )
+    candidates = [
+        {
+            "candidate_index": 0,
+            "replica_id": 0,
+            "predicted_laxity_ms": 10000.0,
+            "safe_capacity": 1,
+            "queue_length": 5,
+            "tie_rank": 0,
+            "matching_bucket_size": 1,
+            "can_pack_same_key": True,
+        },
+        {
+            "candidate_index": 1,
+            "replica_id": 1,
+            "predicted_laxity_ms": 9600.0,
+            "safe_capacity": 1,
+            "queue_length": 2,
+            "tie_rank": 1,
+            "matching_bucket_size": 0,
+            "can_pack_same_key": False,
+        },
+    ]
+
+    assert pool._choose_stagepool_slo_candidate(candidates)["replica_id"] == 1
+
+
 @pytest.mark.asyncio
 async def test_stage_pool_cost_model_avoids_replica_that_would_hurt_existing_bucket(tmp_path) -> None:
     task = _task(deadline_offset_s=10.0)
