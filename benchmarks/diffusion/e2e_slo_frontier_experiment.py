@@ -661,6 +661,11 @@ def _comparison_fields() -> list[str]:
     ]
 
 
+def _comparison_file_name(candidate_policy: str) -> str:
+    safe_policy = candidate_policy.replace("/", "_")
+    return f"current_vs_{safe_policy}.csv"
+
+
 def _frontier_fields() -> list[str]:
     return [
         "workload",
@@ -745,9 +750,12 @@ def summarize(args: argparse.Namespace) -> None:
 
     comparison = _comparison_rows(aggregate, args.candidate_policy)
     frontier = _frontier_rows(aggregate, thresholds)
+    comparison_file_name = _comparison_file_name(args.candidate_policy)
     payload = {
         "output_dir": str(output_dir),
         "profile_mode": args.profile_mode,
+        "candidate_policy": args.candidate_policy,
+        "comparison_file": comparison_file_name,
         "matrix": {
             "workloads": workloads,
             "interarrivals": interarrivals,
@@ -767,9 +775,9 @@ def summarize(args: argparse.Namespace) -> None:
         encoding="utf-8",
     )
     _write_csv(output_dir / "frontier_table.csv", aggregate, _summary_table_fields())
-    _write_csv(output_dir / "current_vs_slo_no_preemption_lookup.csv", comparison, _comparison_fields())
+    _write_csv(output_dir / comparison_file_name, comparison, _comparison_fields())
     _write_csv(output_dir / "frontier_by_threshold.csv", frontier, _frontier_fields())
-    _write_report(output_dir, aggregate, comparison, frontier, missing_runs)
+    _write_report(output_dir, aggregate, comparison, frontier, missing_runs, candidate_policy=args.candidate_policy)
     print(json.dumps(payload, indent=2, ensure_ascii=False))
 
 
@@ -779,6 +787,8 @@ def _write_report(
     comparison: list[dict[str, Any]],
     frontier: list[dict[str, Any]],
     missing_runs: list[dict[str, Any]],
+    *,
+    candidate_policy: str,
 ) -> None:
     lines = [
         "# E2E SLO Throughput Frontier",
@@ -807,7 +817,7 @@ def _write_report(
     lines.extend(
         [
             "",
-            "## Current vs Candidate",
+            f"## Current vs {candidate_policy}",
             "",
             "| Workload | Interarrival | SLO scale | Miss delta | Goodput change | Throughput change | P95 latency change | Bucket change |",
             "|---|---:|---:|---:|---:|---:|---:|---:|",
@@ -1176,8 +1186,10 @@ def _write_readme(
     scales: list[float],
     repeats: list[int],
     policies: list[str],
+    candidate_policy: str,
     comparison: list[dict[str, Any]],
 ) -> None:
+    comparison_file_name = _comparison_file_name(candidate_policy)
     lines = [
         "# E2E SLO Throughput Frontier",
         "",
@@ -1193,7 +1205,7 @@ def _write_readme(
         f"- Repeats: `{', '.join(str(repeat) for repeat in repeats)}`",
         f"- Policies: `{', '.join(policies)}`",
         "",
-        "## Current vs Candidate",
+        f"## Current vs {candidate_policy}",
         "",
         "| Workload | Interarrival | SLO scale | Miss delta | Goodput change | Throughput change | P95 latency change | Bucket change |",
         "|---|---:|---:|---:|---:|---:|---:|---:|",
@@ -1219,7 +1231,7 @@ def _write_readme(
             "- `frontier_summary.json`: structured summary from the raw output directory.",
             "- `frontier_table.csv`: aggregate policy x workload x load x scale table.",
             "- `frontier_by_threshold.csv`: best throughput under configured miss-rate thresholds.",
-            "- `current_vs_slo_no_preemption_lookup.csv`: relative deltas against `current`.",
+            f"- `{comparison_file_name}`: relative deltas against `current`.",
             "- `miss_by_shape.csv`: shape-level miss rate and latency.",
             "- `bucket_size_distribution.csv`: denoise bucket size counts from step profiles.",
             "- `stagepool_replica_distribution.csv`: selected replica counts from StagePool profiles.",
@@ -1261,13 +1273,15 @@ def package(args: argparse.Namespace) -> None:
     aggregate = list(summary.get("aggregate") or [])
     comparison = list(summary.get("comparison") or [])
     frontier = list(summary.get("frontier") or [])
+    candidate_policy = str(summary.get("candidate_policy") or args.candidate_policy)
+    comparison_file_name = str(summary.get("comparison_file") or _comparison_file_name(candidate_policy))
 
     shutil.copy2(summary_path, bundle_dir / "frontier_summary.json")
     for name in (
         "frontier_report.md",
         "frontier_table.csv",
         "frontier_by_threshold.csv",
-        "current_vs_slo_no_preemption_lookup.csv",
+        comparison_file_name,
     ):
         src = output_dir / name
         if src.exists():
@@ -1334,6 +1348,7 @@ def package(args: argparse.Namespace) -> None:
         scales=scales,
         repeats=repeats,
         policies=policies,
+        candidate_policy=candidate_policy,
         comparison=comparison,
     )
     status = {
@@ -1343,6 +1358,8 @@ def package(args: argparse.Namespace) -> None:
         "workloads": workloads,
         "interarrivals": interarrivals,
         "policies": policies,
+        "candidate_policy": candidate_policy,
+        "comparison_file": comparison_file_name,
         "scales": scales,
         "repeats": repeats,
     }

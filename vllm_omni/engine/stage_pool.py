@@ -250,6 +250,10 @@ class StagePool:
         self._slo_stagepool_laxity_window_ms = max(laxity_window_ms or 0.0, 0.0)
         pack_min_laxity_ms = _optional_float(slo_config.get("stagepool_pack_min_laxity_ms"))
         self._slo_stagepool_pack_min_laxity_ms = 0.0 if pack_min_laxity_ms is None else pack_min_laxity_ms
+        pack_max_queue_length = _optional_float(slo_config.get("stagepool_pack_max_queue_length"))
+        self._slo_stagepool_pack_max_queue_length = int(max(pack_max_queue_length or 0.0, 0.0))
+        pack_max_matching_bucket_size = _optional_float(slo_config.get("stagepool_pack_max_matching_bucket_size"))
+        self._slo_stagepool_pack_max_matching_bucket_size = int(max(pack_max_matching_bucket_size or 0.0, 0.0))
         self._scheduler_snapshot_ttl_s = (
             0.0
             if self._slo_stagepool_laxity_window_ms > 0
@@ -927,9 +931,19 @@ class StagePool:
         matching_bucket_laxity_ms = (
             _optional_float(matching_bucket.get("min_laxity_ms")) if matching_bucket is not None else None
         )
+        pack_queue_limit_exceeded = (
+            self._slo_stagepool_pack_max_queue_length > 0
+            and queue_length >= self._slo_stagepool_pack_max_queue_length
+        )
+        pack_bucket_limit_exceeded = (
+            self._slo_stagepool_pack_max_matching_bucket_size > 0
+            and matching_bucket_size >= self._slo_stagepool_pack_max_matching_bucket_size
+        )
         can_pack_same_key = (
             safe_capacity > 0
             and matching_bucket_size > 0
+            and not pack_queue_limit_exceeded
+            and not pack_bucket_limit_exceeded
             and predicted_laxity_ms >= self._slo_stagepool_pack_min_laxity_ms
             and (
                 matching_bucket_laxity_ms is None
@@ -947,6 +961,8 @@ class StagePool:
             "matching_bucket_size": matching_bucket_size,
             "matching_bucket_min_laxity_ms": matching_bucket_laxity_ms,
             "can_pack_same_key": can_pack_same_key,
+            "pack_queue_limit_exceeded": pack_queue_limit_exceeded,
+            "pack_bucket_limit_exceeded": pack_bucket_limit_exceeded,
         }
         if input_addr is not None:
             candidate["input_addr"] = input_addr

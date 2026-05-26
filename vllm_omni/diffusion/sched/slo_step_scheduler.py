@@ -49,6 +49,7 @@ class SloStepScheduler(StepScheduler):
         self.preemption_safe_laxity_ms = 1000.0
         self.enable_step_preemption = True
         self.no_preemption_admission_guard = True
+        self.no_preemption_admission_max_batch_size = 0
         self.ignore_request_reference_cost = False
         self.use_shape_fallback_cost = True
 
@@ -71,6 +72,12 @@ class SloStepScheduler(StepScheduler):
         self.no_preemption_admission_guard = _coerce_bool(
             slo_config.get("no_preemption_admission_guard"),
             True,
+        )
+        self.no_preemption_admission_max_batch_size = int(
+            _coerce_nonnegative_float(
+                slo_config.get("no_preemption_admission_max_batch_size"),
+                0.0,
+            )
         )
         self.ignore_request_reference_cost = _coerce_bool(slo_config.get("ignore_request_reference_cost"), False)
         self.use_shape_fallback_cost = _coerce_bool(slo_config.get("use_shape_fallback_cost"), True)
@@ -188,6 +195,7 @@ class SloStepScheduler(StepScheduler):
             "num_resident_reqs": len(self._resident_sched_req_ids()),
             "max_num_running": self.max_num_running_reqs,
             "safe_admit_capacity": self._safe_admit_capacity(),
+            "no_preemption_admission_max_batch_size": self.no_preemption_admission_max_batch_size,
             "buckets": buckets,
         }
 
@@ -381,6 +389,12 @@ class SloStepScheduler(StepScheduler):
     ) -> list[DiffusionRequestState]:
         for state in waiting:
             if len(selected) >= self.max_num_running_reqs:
+                break
+            if (
+                protect_laxity
+                and self.no_preemption_admission_max_batch_size > 0
+                and len(selected) >= self.no_preemption_admission_max_batch_size
+            ):
                 break
             if not self._can_admit_state(state, resident_ids, new_admissions):
                 continue

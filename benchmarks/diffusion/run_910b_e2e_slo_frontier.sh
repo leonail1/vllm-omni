@@ -19,6 +19,13 @@ SCALES="${SCALES:-4.0,6.0}"
 REPEATS="${REPEATS:-0}"
 WORKLOADS="${WORKLOADS:-current-mix,shape-grouped-current-mix}"
 POLICIES="${POLICIES:-current,slo_no_preemption_lookup}"
+CANDIDATE_POLICY="${CANDIDATE_POLICY:-}"
+if [[ -z "${CANDIDATE_POLICY}" ]]; then
+  CANDIDATE_POLICY="slo_no_preemption_lookup"
+  if [[ ",${POLICIES}," == *",slo_no_preemption_guarded,"* ]]; then
+    CANDIDATE_POLICY="slo_no_preemption_guarded"
+  fi
+fi
 PROFILE_MODE="${PROFILE_MODE:-e2e_slo_frontier}"
 PORT_BASE="${PORT_BASE:-18420}"
 MASTER_PORT_BASE="${MASTER_PORT_BASE:-26420}"
@@ -28,6 +35,10 @@ CONSTANT_STEP_MS="${CONSTANT_STEP_MS:-400}"
 STAGEPOOL_LAXITY_WINDOW_MS="${STAGEPOOL_LAXITY_WINDOW_MS:-1500}"
 STAGEPOOL_PACK_MIN_LAXITY_MS="${STAGEPOOL_PACK_MIN_LAXITY_MS:-1000}"
 NO_PREEMPTION_ADMISSION_GUARD="${NO_PREEMPTION_ADMISSION_GUARD:-1}"
+GUARDED_STAGEPOOL_LAXITY_WINDOW_MS="${GUARDED_STAGEPOOL_LAXITY_WINDOW_MS:-500}"
+GUARDED_STAGEPOOL_PACK_MAX_QUEUE_LENGTH="${GUARDED_STAGEPOOL_PACK_MAX_QUEUE_LENGTH:-2}"
+GUARDED_STAGEPOOL_PACK_MAX_MATCHING_BUCKET_SIZE="${GUARDED_STAGEPOOL_PACK_MAX_MATCHING_BUCKET_SIZE:-2}"
+GUARDED_NO_PREEMPTION_ADMISSION_MAX_BATCH_SIZE="${GUARDED_NO_PREEMPTION_ADMISSION_MAX_BATCH_SIZE:-3}"
 SKIP_EXISTING="${SKIP_EXISTING:-0}"
 ACTIVE_PID_FILE=""
 
@@ -66,7 +77,7 @@ validate_policy() {
   local policy="$1"
   validate_safe_token "policy" "${policy}"
   case "${policy}" in
-    current|stagepool_only|instance_only|constant_cost|formula_cost|full_slo|no_preemption|slo_no_preemption_lookup|alpha0|alpha1) ;;
+    current|stagepool_only|instance_only|constant_cost|formula_cost|full_slo|no_preemption|slo_no_preemption_lookup|slo_no_preemption_guarded|alpha0|alpha1) ;;
     *)
       log "unknown policy: ${policy}"
       exit 2
@@ -120,6 +131,7 @@ validate_matrix_args() {
   for policy in ${POLICIES//,/ }; do
     validate_policy "${policy}"
   done
+  validate_policy "${CANDIDATE_POLICY}"
   local repeat
   for repeat in ${REPEATS//,/ }; do
     validate_repeat "${repeat}"
@@ -280,7 +292,9 @@ make_additional_config() {
   local stagepool_raw="$3"
   python - "${policy}" "${raw}" "${stagepool_raw}" "${COST_MODEL}" "${CONSTANT_STEP_MS}" \
     "${STAGEPOOL_LAXITY_WINDOW_MS}" "${STAGEPOOL_PACK_MIN_LAXITY_MS}" \
-    "${NO_PREEMPTION_ADMISSION_GUARD}" <<'PY'
+    "${NO_PREEMPTION_ADMISSION_GUARD}" "${GUARDED_STAGEPOOL_LAXITY_WINDOW_MS}" \
+    "${GUARDED_STAGEPOOL_PACK_MAX_QUEUE_LENGTH}" "${GUARDED_STAGEPOOL_PACK_MAX_MATCHING_BUCKET_SIZE}" \
+    "${GUARDED_NO_PREEMPTION_ADMISSION_MAX_BATCH_SIZE}" <<'PY'
 import json
 import sys
 
@@ -293,7 +307,11 @@ import sys
     stagepool_laxity_window_ms,
     stagepool_pack_min_laxity_ms,
     no_preemption_admission_guard,
-) = sys.argv[1:9]
+    guarded_stagepool_laxity_window_ms,
+    guarded_stagepool_pack_max_queue_length,
+    guarded_stagepool_pack_max_matching_bucket_size,
+    guarded_no_preemption_admission_max_batch_size,
+) = sys.argv[1:13]
 config = {
     "diffusion_step_profile": {
         "enabled": True,
@@ -357,6 +375,19 @@ elif policy == "slo_no_preemption_lookup":
         "no_preemption_admission_guard": no_preemption_admission_guard.strip().lower() not in {"0", "false", "no"},
         "stagepool_laxity_window_ms": float(stagepool_laxity_window_ms),
         "stagepool_pack_min_laxity_ms": float(stagepool_pack_min_laxity_ms),
+    }
+elif policy == "slo_no_preemption_guarded":
+    config["diffusion_scheduler_policy"] = "slo"
+    config["diffusion_slo_scheduler"] = {
+        **lookup,
+        "enable_stagepool_slo": True,
+        "enable_step_preemption": False,
+        "no_preemption_admission_guard": True,
+        "stagepool_laxity_window_ms": float(guarded_stagepool_laxity_window_ms),
+        "stagepool_pack_min_laxity_ms": float(stagepool_pack_min_laxity_ms),
+        "stagepool_pack_max_queue_length": int(float(guarded_stagepool_pack_max_queue_length)),
+        "stagepool_pack_max_matching_bucket_size": int(float(guarded_stagepool_pack_max_matching_bucket_size)),
+        "no_preemption_admission_max_batch_size": int(float(guarded_no_preemption_admission_max_batch_size)),
     }
 elif policy == "alpha0":
     config["diffusion_scheduler_policy"] = "slo"
@@ -500,6 +531,7 @@ summarize_results() {
   python benchmarks/diffusion/e2e_slo_frontier_experiment.py summarize \
     --output-dir "${OUTDIR}" \
     --policies "${POLICIES}" \
+    --candidate-policy "${CANDIDATE_POLICY}" \
     --scales "${SCALES}" \
     --repeats "${REPEATS}" \
     --workloads "${WORKLOADS}" \
@@ -583,7 +615,7 @@ main() {
   setup_env
   write_deploy_config
   log "output dir: ${OUTDIR}"
-  log "config: model=${MODEL}, replicas=${REPLICAS}, tp=${TP_SIZE}, requests=${NUM_REQUESTS}, interarrivals=${INTERARRIVALS}, workloads=${WORKLOADS}, scales=${SCALES}, repeats=${REPEATS}, policies=${POLICIES}"
+  log "config: model=${MODEL}, replicas=${REPLICAS}, tp=${TP_SIZE}, requests=${NUM_REQUESTS}, interarrivals=${INTERARRIVALS}, workloads=${WORKLOADS}, scales=${SCALES}, repeats=${REPEATS}, policies=${POLICIES}, candidate=${CANDIDATE_POLICY}"
   local policy
   for policy in ${POLICIES//,/ }; do
     run_policy "${policy}" || { write_status failed "${policy} failed"; exit 1; }

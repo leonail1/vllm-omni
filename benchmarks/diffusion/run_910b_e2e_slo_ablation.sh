@@ -28,6 +28,10 @@ CONSTANT_STEP_MS="${CONSTANT_STEP_MS:-400}"
 STAGEPOOL_LAXITY_WINDOW_MS="${STAGEPOOL_LAXITY_WINDOW_MS:-1500}"
 STAGEPOOL_PACK_MIN_LAXITY_MS="${STAGEPOOL_PACK_MIN_LAXITY_MS:-1000}"
 NO_PREEMPTION_ADMISSION_GUARD="${NO_PREEMPTION_ADMISSION_GUARD:-1}"
+GUARDED_STAGEPOOL_LAXITY_WINDOW_MS="${GUARDED_STAGEPOOL_LAXITY_WINDOW_MS:-500}"
+GUARDED_STAGEPOOL_PACK_MAX_QUEUE_LENGTH="${GUARDED_STAGEPOOL_PACK_MAX_QUEUE_LENGTH:-2}"
+GUARDED_STAGEPOOL_PACK_MAX_MATCHING_BUCKET_SIZE="${GUARDED_STAGEPOOL_PACK_MAX_MATCHING_BUCKET_SIZE:-2}"
+GUARDED_NO_PREEMPTION_ADMISSION_MAX_BATCH_SIZE="${GUARDED_NO_PREEMPTION_ADMISSION_MAX_BATCH_SIZE:-3}"
 SKIP_EXISTING="${SKIP_EXISTING:-0}"
 ACTIVE_PID_FILE=""
 
@@ -66,7 +70,7 @@ validate_policy() {
   local policy="$1"
   validate_safe_token "policy" "${policy}"
   case "${policy}" in
-    current|stagepool_only|instance_only|constant_cost|formula_cost|full_slo|no_preemption|slo_no_preemption_lookup|alpha0|alpha1) ;;
+    current|stagepool_only|instance_only|constant_cost|formula_cost|full_slo|no_preemption|slo_no_preemption_lookup|slo_no_preemption_guarded|alpha0|alpha1) ;;
     *)
       log "unknown policy: ${policy}"
       exit 2
@@ -257,7 +261,9 @@ make_additional_config() {
   local stagepool_raw="$3"
   python - "${policy}" "${raw}" "${stagepool_raw}" "${COST_MODEL}" "${CONSTANT_STEP_MS}" \
     "${STAGEPOOL_LAXITY_WINDOW_MS}" "${STAGEPOOL_PACK_MIN_LAXITY_MS}" \
-    "${NO_PREEMPTION_ADMISSION_GUARD}" <<'PY'
+    "${NO_PREEMPTION_ADMISSION_GUARD}" "${GUARDED_STAGEPOOL_LAXITY_WINDOW_MS}" \
+    "${GUARDED_STAGEPOOL_PACK_MAX_QUEUE_LENGTH}" "${GUARDED_STAGEPOOL_PACK_MAX_MATCHING_BUCKET_SIZE}" \
+    "${GUARDED_NO_PREEMPTION_ADMISSION_MAX_BATCH_SIZE}" <<'PY'
 import json
 import sys
 
@@ -270,7 +276,11 @@ import sys
     stagepool_laxity_window_ms,
     stagepool_pack_min_laxity_ms,
     no_preemption_admission_guard,
-) = sys.argv[1:9]
+    guarded_stagepool_laxity_window_ms,
+    guarded_stagepool_pack_max_queue_length,
+    guarded_stagepool_pack_max_matching_bucket_size,
+    guarded_no_preemption_admission_max_batch_size,
+) = sys.argv[1:13]
 config = {
     "diffusion_step_profile": {
         "enabled": True,
@@ -334,6 +344,19 @@ elif policy == "slo_no_preemption_lookup":
         "no_preemption_admission_guard": no_preemption_admission_guard.strip().lower() not in {"0", "false", "no"},
         "stagepool_laxity_window_ms": float(stagepool_laxity_window_ms),
         "stagepool_pack_min_laxity_ms": float(stagepool_pack_min_laxity_ms),
+    }
+elif policy == "slo_no_preemption_guarded":
+    config["diffusion_scheduler_policy"] = "slo"
+    config["diffusion_slo_scheduler"] = {
+        **lookup,
+        "enable_stagepool_slo": True,
+        "enable_step_preemption": False,
+        "no_preemption_admission_guard": True,
+        "stagepool_laxity_window_ms": float(guarded_stagepool_laxity_window_ms),
+        "stagepool_pack_min_laxity_ms": float(stagepool_pack_min_laxity_ms),
+        "stagepool_pack_max_queue_length": int(float(guarded_stagepool_pack_max_queue_length)),
+        "stagepool_pack_max_matching_bucket_size": int(float(guarded_stagepool_pack_max_matching_bucket_size)),
+        "no_preemption_admission_max_batch_size": int(float(guarded_no_preemption_admission_max_batch_size)),
     }
 elif policy == "alpha0":
     config["diffusion_scheduler_policy"] = "slo"

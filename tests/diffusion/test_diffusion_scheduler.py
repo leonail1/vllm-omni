@@ -1223,6 +1223,28 @@ class TestSloStepScheduler:
         assert _cached_ids(second) == [running]
         assert scheduler.get_request_state(urgent).status == DiffusionRequestStatus.WAITING
 
+    def test_no_preemption_admission_max_batch_size_caps_waiting_pack(self) -> None:
+        scheduler = self._make_scheduler(
+            max_num_seqs=4,
+            slo_config={
+                "enable_step_preemption": False,
+                "no_preemption_admission_guard": True,
+                "no_preemption_admission_max_batch_size": 2,
+            },
+        )
+
+        req_ids = [
+            scheduler.add_request(_make_slo_step_request(f"req-{idx}", reference_cost_ms=100, slo_ms=10000))
+            for idx in range(4)
+        ]
+
+        sched_output = scheduler.schedule()
+
+        assert _new_ids(sched_output) == req_ids[:2]
+        assert sched_output.num_running_reqs == 2
+        assert sched_output.num_waiting_reqs == 2
+        assert scheduler.get_load_snapshot()["no_preemption_admission_max_batch_size"] == 2
+
     def test_same_key_batch_formation_preserves_absolute_deadline_guard_priority(self) -> None:
         scheduler = self._make_scheduler(
             max_num_seqs=2,

@@ -450,6 +450,91 @@ async def test_stage_pool_pack_min_laxity_blocks_low_slack_packing() -> None:
 
 
 @pytest.mark.asyncio
+async def test_stage_pool_pack_queue_guard_blocks_busy_packing_replica() -> None:
+    task = _task(deadline_offset_s=3.0)
+    key = StagePool._sampling_key_dict(task["sampling_params"])
+    pool = StagePool(
+        0,
+        [
+            _FakeDiffusionClient(
+                "tcp://host-a:1000/input",
+                _snapshot(
+                    safe_admit_capacity=1,
+                    estimated_step_ms=100.0,
+                    min_remaining_steps=10,
+                    num_waiting=1,
+                    num_running=1,
+                    key=key,
+                    min_laxity_ms=5000.0,
+                ),
+            ),
+            _FakeDiffusionClient(
+                "tcp://host-b:1000/input",
+                {
+                    "policy": "SloStepScheduler",
+                    "timestamp_s": time.time(),
+                    "num_waiting": 0,
+                    "num_running": 0,
+                    "max_num_running": 2,
+                    "safe_admit_capacity": 1,
+                    "buckets": [],
+                },
+            ),
+        ],
+        stage_vllm_config=_stage_config_with_slo_options(
+            {
+                "stagepool_laxity_window_ms": 500.0,
+                "stagepool_pack_max_queue_length": 2,
+            }
+        ),
+    )
+
+    assert await pool._select_slo_aware_local_replica_id(task) == 1
+
+
+@pytest.mark.asyncio
+async def test_stage_pool_pack_bucket_size_guard_blocks_large_bucket() -> None:
+    task = _task(deadline_offset_s=3.0)
+    key = StagePool._sampling_key_dict(task["sampling_params"])
+    pool = StagePool(
+        0,
+        [
+            _FakeDiffusionClient(
+                "tcp://host-a:1000/input",
+                _snapshot(
+                    safe_admit_capacity=1,
+                    estimated_step_ms=100.0,
+                    min_remaining_steps=10,
+                    num_running=2,
+                    key=key,
+                    min_laxity_ms=5000.0,
+                ),
+            ),
+            _FakeDiffusionClient(
+                "tcp://host-b:1000/input",
+                {
+                    "policy": "SloStepScheduler",
+                    "timestamp_s": time.time(),
+                    "num_waiting": 0,
+                    "num_running": 0,
+                    "max_num_running": 2,
+                    "safe_admit_capacity": 1,
+                    "buckets": [],
+                },
+            ),
+        ],
+        stage_vllm_config=_stage_config_with_slo_options(
+            {
+                "stagepool_laxity_window_ms": 500.0,
+                "stagepool_pack_max_matching_bucket_size": 2,
+            }
+        ),
+    )
+
+    assert await pool._select_slo_aware_local_replica_id(task) == 1
+
+
+@pytest.mark.asyncio
 async def test_stage_pool_cost_model_avoids_replica_that_would_hurt_existing_bucket(tmp_path) -> None:
     task = _task(deadline_offset_s=10.0)
     key = StagePool._sampling_key_dict(task["sampling_params"])
