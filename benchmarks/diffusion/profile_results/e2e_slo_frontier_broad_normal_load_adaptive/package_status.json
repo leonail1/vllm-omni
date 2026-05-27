@@ -1,0 +1,8 @@
+{
+  "message": "E2E SLO broad normal-load adaptive queue guard bundle packaged",
+  "output_dir": "benchmark_outputs/e2e_slo_frontier_broad_normal_load_adaptive",
+  "bundle_dir": "benchmarks/diffusion/profile_results/e2e_slo_frontier_broad_normal_load_adaptive",
+  "rows": 24,
+  "aggregate_rows": 24,
+  "omitted_files": 130
+}

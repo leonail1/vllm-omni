@@ -1,0 +1,62 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1180" height="560" viewBox="0 0 1180 560">
+<rect width="100%" height="100%" fill="#fff"/>
+<text x="590.0" y="32" text-anchor="middle" font-family="Arial" font-size="22" font-weight="700">P95 Latency</text>
+<line x1="78" y1="434" x2="1150" y2="434" stroke="#111827"/>
+<line x1="78" y1="64" x2="78" y2="434" stroke="#111827"/>
+<line x1="74" y1="434.0" x2="1150" y2="434.0" stroke="#e5e7eb"/>
+<text x="68" y="438.0" text-anchor="end" font-family="Arial" font-size="11">0.00</text>
+<line x1="74" y1="360.0" x2="1150" y2="360.0" stroke="#e5e7eb"/>
+<text x="68" y="364.0" text-anchor="end" font-family="Arial" font-size="11">41.81</text>
+<line x1="74" y1="286.0" x2="1150" y2="286.0" stroke="#e5e7eb"/>
+<text x="68" y="290.0" text-anchor="end" font-family="Arial" font-size="11">83.62</text>
+<line x1="74" y1="212.0" x2="1150" y2="212.0" stroke="#e5e7eb"/>
+<text x="68" y="216.0" text-anchor="end" font-family="Arial" font-size="11">125.43</text>
+<line x1="74" y1="138.0" x2="1150" y2="138.0" stroke="#e5e7eb"/>
+<text x="68" y="142.0" text-anchor="end" font-family="Arial" font-size="11">167.24</text>
+<line x1="74" y1="64.0" x2="1150" y2="64.0" stroke="#e5e7eb"/>
+<text x="68" y="68.0" text-anchor="end" font-family="Arial" font-size="11">209.04</text>
+<text x="167.3" y="458" text-anchor="middle" font-family="Arial" font-size="11">large-heavy</text>
+<text x="167.3" y="475" text-anchor="middle" font-family="Arial" font-size="11">scale 4</text>
+<rect x="87.0" y="225.3" width="37.9" height="208.7" fill="#2563eb"/>
+<rect x="127.9" y="225.9" width="37.9" height="208.1" fill="#dc2626"/>
+<rect x="168.8" y="227.7" width="37.9" height="206.3" fill="#059669"/>
+<rect x="209.8" y="263.1" width="37.9" height="170.9" fill="#7c3aed"/>
+<text x="346.0" y="458" text-anchor="middle" font-family="Arial" font-size="11">large-heavy</text>
+<text x="346.0" y="475" text-anchor="middle" font-family="Arial" font-size="11">scale 6</text>
+<rect x="265.7" y="112.3" width="37.9" height="321.7" fill="#2563eb"/>
+<rect x="306.6" y="260.6" width="37.9" height="173.4" fill="#dc2626"/>
+<rect x="347.5" y="226.5" width="37.9" height="207.5" fill="#059669"/>
+<rect x="388.4" y="257.5" width="37.9" height="176.5" fill="#7c3aed"/>
+<text x="524.7" y="458" text-anchor="middle" font-family="Arial" font-size="11">rectangular-mix</text>
+<text x="524.7" y="475" text-anchor="middle" font-family="Arial" font-size="11">scale 4</text>
+<rect x="444.3" y="246.5" width="37.9" height="187.5" fill="#2563eb"/>
+<rect x="485.2" y="338.5" width="37.9" height="95.5" fill="#dc2626"/>
+<rect x="526.2" y="336.5" width="37.9" height="97.5" fill="#059669"/>
+<rect x="567.1" y="338.4" width="37.9" height="95.6" fill="#7c3aed"/>
+<text x="703.3" y="458" text-anchor="middle" font-family="Arial" font-size="11">rectangular-mix</text>
+<text x="703.3" y="475" text-anchor="middle" font-family="Arial" font-size="11">scale 6</text>
+<rect x="623.0" y="249.6" width="37.9" height="184.4" fill="#2563eb"/>
+<rect x="663.9" y="355.6" width="37.9" height="78.4" fill="#dc2626"/>
+<rect x="704.8" y="306.6" width="37.9" height="127.4" fill="#059669"/>
+<rect x="745.8" y="333.6" width="37.9" height="100.4" fill="#7c3aed"/>
+<text x="882.0" y="458" text-anchor="middle" font-family="Arial" font-size="11">bursty</text>
+<text x="882.0" y="475" text-anchor="middle" font-family="Arial" font-size="11">scale 4</text>
+<rect x="801.7" y="287.3" width="37.9" height="146.7" fill="#2563eb"/>
+<rect x="842.6" y="291.2" width="37.9" height="142.8" fill="#dc2626"/>
+<rect x="883.5" y="200.9" width="37.9" height="233.1" fill="#059669"/>
+<rect x="924.4" y="279.5" width="37.9" height="154.5" fill="#7c3aed"/>
+<text x="1060.7" y="458" text-anchor="middle" font-family="Arial" font-size="11">bursty</text>
+<text x="1060.7" y="475" text-anchor="middle" font-family="Arial" font-size="11">scale 6</text>
+<rect x="980.3" y="276.4" width="37.9" height="157.6" fill="#2563eb"/>
+<rect x="1021.2" y="271.8" width="37.9" height="162.2" fill="#dc2626"/>
+<rect x="1062.2" y="199.8" width="37.9" height="234.2" fill="#059669"/>
+<rect x="1103.1" y="282.2" width="37.9" height="151.8" fill="#7c3aed"/>
+<rect x="78" y="513" width="12" height="12" fill="#2563eb"/>
+<text x="96" y="524" font-family="Arial" font-size="12">current</text>
+<rect x="338" y="513" width="12" height="12" fill="#dc2626"/>
+<text x="356" y="524" font-family="Arial" font-size="12">slo_no_preemption_lookup</text>
+<rect x="598" y="513" width="12" height="12" fill="#059669"/>
+<text x="616" y="524" font-family="Arial" font-size="12">slo_no_preemption_guarded</text>
+<rect x="858" y="513" width="12" height="12" fill="#7c3aed"/>
+<text x="876" y="524" font-family="Arial" font-size="12">slo_no_preemption_adaptive_guarded</text>
+</svg>

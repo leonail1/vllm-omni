@@ -1,0 +1,7 @@
+{
+  "updated_at": "2026-05-28 04:13:21",
+  "phase": "completed",
+  "message": "E2E SLO frontier completed",
+  "outdir": "/home/lzg/vllm-omni/benchmark_outputs/e2e_slo_frontier_broad_normal_load_adaptive",
+  "has_frontier_summary": true
+}
