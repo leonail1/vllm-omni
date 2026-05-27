@@ -1,0 +1,9 @@
+workload,policy,slo_scale,miss_threshold,status,selected_interarrival_s,selected_load_label,throughput_rps,goodput_rps,slo_miss_rate,latency_p95_s,mean_bucket_size,p5_time_to_deadline_ms
+current-mix,slo_no_preemption_adaptive_guarded,4.0,0.05,no_eligible_run,,,,,,,,
+current-mix,slo_no_preemption_adaptive_guarded,4.0,0.1,ok,4.25,ia_4p25,0.16185871807080268,0.1510681368660825,0.06666666666666665,85.32677093390375,1.1372251705837755,8422.928202152247
+current-mix,slo_no_preemption_adaptive_guarded,6.0,0.05,no_eligible_run,,,,,,,,
+current-mix,slo_no_preemption_adaptive_guarded,6.0,0.1,no_eligible_run,,,,,,,,
+shape-grouped-current-mix,slo_no_preemption_adaptive_guarded,4.0,0.05,ok,4.25,ia_4p25,0.21689391953402692,0.21689391953402692,0.0,26.72743031471036,1.0932944606413995,47565.01005887985
+shape-grouped-current-mix,slo_no_preemption_adaptive_guarded,4.0,0.1,ok,4.25,ia_4p25,0.21689391953402692,0.21689391953402692,0.0,26.72743031471036,1.0932944606413995,47565.01005887985
+shape-grouped-current-mix,slo_no_preemption_adaptive_guarded,6.0,0.05,ok,4.25,ia_4p25,0.21662214790657805,0.21662214790657805,0.0,26.592664988338946,1.0869565217391304,80905.70608377457
+shape-grouped-current-mix,slo_no_preemption_adaptive_guarded,6.0,0.1,ok,2.5,ia_2p5,0.24879432029644796,0.23220803227668477,0.06666666666666665,100.68306313161737,1.9144862795149968,9370.641803741453

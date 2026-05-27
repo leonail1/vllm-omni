@@ -1,0 +1,17 @@
+{
+  "message": "Boundary repeat result bundle packaged from existing completed raw OUTDIR",
+  "raw_outdir": "/home/lzg/vllm-omni/benchmark_outputs/e2e_slo_frontier_adaptive_queue_boundary_repeats",
+  "bundle_dir": "/home/lzg/vllm-omni/benchmarks/diffusion/profile_results/e2e_slo_frontier_adaptive_queue_boundary_repeats",
+  "rows": 8,
+  "benchmark_result_json_found": 8,
+  "raw_files_omitted_manifest_rows": 51,
+  "copied_safe_top_level_files": [
+    "current_vs_slo_no_preemption_adaptive_guarded.csv",
+    "frontier_by_threshold.csv",
+    "frontier_report.md",
+    "frontier_summary.json",
+    "frontier_table.csv",
+    "status.json"
+  ],
+  "no_benchmark_or_service_started": true
+}

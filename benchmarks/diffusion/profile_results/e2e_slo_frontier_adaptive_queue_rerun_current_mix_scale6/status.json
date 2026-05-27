@@ -1,0 +1,25 @@
+{
+  "message": "E2E SLO frontier result bundle packaged",
+  "output_dir": "/home/lzg/vllm-omni/benchmark_outputs/e2e_slo_frontier_adaptive_queue_rerun_current_mix_scale6",
+  "bundle_dir": "/home/lzg/vllm-omni/benchmarks/diffusion/profile_results/e2e_slo_frontier_adaptive_queue_rerun_current_mix_scale6",
+  "workloads": [
+    "current-mix"
+  ],
+  "interarrivals": [
+    4.25,
+    2.5
+  ],
+  "policies": [
+    "slo_no_preemption_guarded",
+    "slo_no_preemption_adaptive_guarded"
+  ],
+  "candidate_policy": "slo_no_preemption_adaptive_guarded",
+  "comparison_file": "current_vs_slo_no_preemption_adaptive_guarded.csv",
+  "scales": [
+    6.0
+  ],
+  "repeats": [
+    1,
+    2
+  ]
+}

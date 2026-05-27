@@ -1,0 +1,52 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1120" height="560" viewBox="0 0 1120 560">
+<rect width="100%" height="100%" fill="#ffffff"/>
+<text x="560.0" y="32" text-anchor="middle" font-family="Arial" font-size="22" font-weight="700">Throughput</text>
+<line x1="72" y1="424" x2="1096" y2="424" stroke="#111827"/>
+<line x1="72" y1="64" x2="72" y2="424" stroke="#111827"/>
+<line x1="68" y1="424.0" x2="1096" y2="424.0" stroke="#e5e7eb"/>
+<text x="62" y="428.0" text-anchor="end" font-family="Arial" font-size="11">0.00</text>
+<line x1="68" y1="352.0" x2="1096" y2="352.0" stroke="#e5e7eb"/>
+<text x="62" y="356.0" text-anchor="end" font-family="Arial" font-size="11">0.06</text>
+<line x1="68" y1="280.0" x2="1096" y2="280.0" stroke="#e5e7eb"/>
+<text x="62" y="284.0" text-anchor="end" font-family="Arial" font-size="11">0.11</text>
+<line x1="68" y1="208.0" x2="1096" y2="208.0" stroke="#e5e7eb"/>
+<text x="62" y="212.0" text-anchor="end" font-family="Arial" font-size="11">0.17</text>
+<line x1="68" y1="136.0" x2="1096" y2="136.0" stroke="#e5e7eb"/>
+<text x="62" y="140.0" text-anchor="end" font-family="Arial" font-size="11">0.22</text>
+<line x1="68" y1="64.0" x2="1096" y2="64.0" stroke="#e5e7eb"/>
+<text x="62" y="68.0" text-anchor="end" font-family="Arial" font-size="11">0.28</text>
+<text x="157.3" y="446" text-anchor="middle" font-family="Arial" font-size="10">bursty</text>
+<text x="157.3" y="462" text-anchor="middle" font-family="Arial" font-size="10">scale 4</text>
+<text x="157.3" y="478" text-anchor="middle" font-family="Arial" font-size="10">2.5s</text>
+<rect x="80.0" y="144.3" width="75.3" height="279.7" fill="#2563eb"/>
+<rect x="159.3" y="153.8" width="75.3" height="270.2" fill="#dc2626"/>
+<text x="328.0" y="446" text-anchor="middle" font-family="Arial" font-size="10">bursty</text>
+<text x="328.0" y="462" text-anchor="middle" font-family="Arial" font-size="10">scale 6</text>
+<text x="328.0" y="478" text-anchor="middle" font-family="Arial" font-size="10">2.5s</text>
+<rect x="250.7" y="111.0" width="75.3" height="313.0" fill="#2563eb"/>
+<rect x="330.0" y="166.5" width="75.3" height="257.5" fill="#dc2626"/>
+<text x="498.7" y="446" text-anchor="middle" font-family="Arial" font-size="10">large-heavy</text>
+<text x="498.7" y="462" text-anchor="middle" font-family="Arial" font-size="10">scale 4</text>
+<text x="498.7" y="478" text-anchor="middle" font-family="Arial" font-size="10">2.5s</text>
+<rect x="421.3" y="215.2" width="75.3" height="208.8" fill="#2563eb"/>
+<rect x="500.7" y="198.5" width="75.3" height="225.5" fill="#dc2626"/>
+<text x="669.3" y="446" text-anchor="middle" font-family="Arial" font-size="10">large-heavy</text>
+<text x="669.3" y="462" text-anchor="middle" font-family="Arial" font-size="10">scale 6</text>
+<text x="669.3" y="478" text-anchor="middle" font-family="Arial" font-size="10">2.5s</text>
+<rect x="592.0" y="215.6" width="75.3" height="208.4" fill="#2563eb"/>
+<rect x="671.3" y="224.3" width="75.3" height="199.7" fill="#dc2626"/>
+<text x="840.0" y="446" text-anchor="middle" font-family="Arial" font-size="10">rectangular-mix</text>
+<text x="840.0" y="462" text-anchor="middle" font-family="Arial" font-size="10">scale 4</text>
+<text x="840.0" y="478" text-anchor="middle" font-family="Arial" font-size="10">2.5s</text>
+<rect x="762.7" y="135.9" width="75.3" height="288.1" fill="#2563eb"/>
+<rect x="842.0" y="178.9" width="75.3" height="245.1" fill="#dc2626"/>
+<text x="1010.7" y="446" text-anchor="middle" font-family="Arial" font-size="10">rectangular-mix</text>
+<text x="1010.7" y="462" text-anchor="middle" font-family="Arial" font-size="10">scale 6</text>
+<text x="1010.7" y="478" text-anchor="middle" font-family="Arial" font-size="10">2.5s</text>
+<rect x="933.3" y="138.2" width="75.3" height="285.8" fill="#2563eb"/>
+<rect x="1012.7" y="208.1" width="75.3" height="215.9" fill="#dc2626"/>
+<rect x="72" y="514" width="12" height="12" fill="#2563eb"/>
+<text x="90" y="524" font-family="Arial" font-size="12">slo_no_preemption_adaptive_guarded</text>
+<rect x="322" y="514" width="12" height="12" fill="#dc2626"/>
+<text x="340" y="524" font-family="Arial" font-size="12">slo_no_preemption_guarded</text>
+</svg>
