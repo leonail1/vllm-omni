@@ -1,0 +1,27 @@
+{
+  "message": "E2E SLO frontier broad current/lookup baseline bundle packaged",
+  "output_dir": "/home/lzg/vllm-omni/benchmark_outputs/e2e_slo_frontier_broad_current_lookup_baseline",
+  "bundle_dir": "/home/lzg/vllm-omni/benchmarks/diffusion/profile_results/e2e_slo_frontier_broad_current_lookup_baseline",
+  "profile_mode": "e2e_slo_frontier_broad_current_lookup_baseline",
+  "workloads": [
+    "large-heavy",
+    "rectangular-mix",
+    "bursty"
+  ],
+  "interarrivals": [
+    2.5
+  ],
+  "policies": [
+    "current",
+    "slo_no_preemption_lookup"
+  ],
+  "scales": [
+    4.0,
+    6.0
+  ],
+  "repeats": [
+    0
+  ],
+  "rows": 12,
+  "packaged_at_utc": "2026-05-27T17:13:02.366877+00:00"
+}
