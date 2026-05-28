@@ -6,7 +6,7 @@ from typing import Any
 import pytest
 
 from vllm_omni.distributed.omni_coordinator import ReplicaInfo, ReplicaStatus
-from vllm_omni.engine.stage_pool import StagePool
+from vllm_omni.engine.stage_pool import StagePool, _task_area_ratio
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams
 
 pytestmark = [pytest.mark.cpu]
@@ -606,6 +606,56 @@ def test_stage_pool_queue_guard_keeps_much_safer_candidate() -> None:
     ]
 
     assert pool._choose_stagepool_slo_candidate(candidates)["replica_id"] == 0
+
+
+def test_stage_pool_small_shape_queue_guard_uses_area_ratio() -> None:
+    pool = StagePool(
+        0,
+        [],
+        stage_vllm_config=_stage_config_with_slo_options(
+            {
+                "stagepool_queue_guard_window_ms": 1000.0,
+                "stagepool_queue_guard_max_queue_length": 4,
+                "stagepool_small_shape_queue_guard_max_area_ratio": 0.6,
+                "stagepool_small_shape_queue_guard_window_ms": 2000.0,
+            }
+        ),
+    )
+    candidates = [
+        {
+            "candidate_index": 0,
+            "replica_id": 0,
+            "predicted_laxity_ms": 10000.0,
+            "safe_capacity": 1,
+            "queue_length": 5,
+            "tie_rank": 0,
+            "matching_bucket_size": 0,
+            "can_pack_same_key": False,
+        },
+        {
+            "candidate_index": 1,
+            "replica_id": 1,
+            "predicted_laxity_ms": 8500.0,
+            "safe_capacity": 1,
+            "queue_length": 2,
+            "tie_rank": 1,
+            "matching_bucket_size": 0,
+            "can_pack_same_key": False,
+        },
+    ]
+
+    small_task = _task()
+    small_task["sampling_params"].width = 768
+    small_task["sampling_params"].height = 768
+    large_task = _task()
+    assert pool._choose_stagepool_slo_candidate(
+        candidates,
+        task_area_ratio=_task_area_ratio(large_task),
+    )["replica_id"] == 0
+    assert pool._choose_stagepool_slo_candidate(
+        candidates,
+        task_area_ratio=_task_area_ratio(small_task),
+    )["replica_id"] == 1
 
 
 def test_stage_pool_queue_guard_treats_limit_as_full() -> None:

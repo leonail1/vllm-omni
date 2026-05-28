@@ -137,6 +137,16 @@ def _task_effective_size(task: Task | None) -> float:
     )
 
 
+def _task_area_ratio(task: Task | None) -> float | None:
+    sampling_params = None if task is None else task.get("sampling_params")
+    width, height = _sampling_dimensions(sampling_params)
+    if width is None or height is None or width <= 0 or height <= 0:
+        return None
+    num_frames = _optional_float(_sampling_get(sampling_params, "num_frames")) or 1.0
+    num_frames = max(num_frames, 1.0)
+    return _task_prompt_count(task) * width * height * num_frames / (1024.0 * 1024.0)
+
+
 def _snapshot_incremental_step_ms(
     bucket: dict[str, Any],
     incoming_eff: float,
@@ -258,6 +268,26 @@ class StagePool:
         self._slo_stagepool_queue_guard_window_ms = max(queue_guard_window_ms or 0.0, 0.0)
         queue_guard_max_queue_length = _optional_float(slo_config.get("stagepool_queue_guard_max_queue_length"))
         self._slo_stagepool_queue_guard_max_queue_length = int(max(queue_guard_max_queue_length or 0.0, 0.0))
+        small_shape_queue_guard_max_area_ratio = _optional_float(
+            slo_config.get("stagepool_small_shape_queue_guard_max_area_ratio")
+        )
+        self._slo_stagepool_small_shape_queue_guard_max_area_ratio = max(
+            small_shape_queue_guard_max_area_ratio or 0.0,
+            0.0,
+        )
+        small_shape_queue_guard_window_ms = _optional_float(
+            slo_config.get("stagepool_small_shape_queue_guard_window_ms")
+        )
+        self._slo_stagepool_small_shape_queue_guard_window_ms = max(
+            small_shape_queue_guard_window_ms or 0.0,
+            0.0,
+        )
+        small_shape_queue_guard_max_queue_length = _optional_float(
+            slo_config.get("stagepool_small_shape_queue_guard_max_queue_length")
+        )
+        self._slo_stagepool_small_shape_queue_guard_max_queue_length = int(
+            max(small_shape_queue_guard_max_queue_length or 0.0, 0.0)
+        )
         self._scheduler_snapshot_ttl_s = (
             0.0
             if self._slo_stagepool_laxity_window_ms > 0
@@ -854,7 +884,10 @@ class StagePool:
         if not scored:
             self._write_stagepool_profile("distributed_slo_select", task, None, profile_candidates, now_s)
             return None
-        selected = self._choose_stagepool_slo_candidate(scored)
+        selected = self._choose_stagepool_slo_candidate(
+            scored,
+            task_area_ratio=_task_area_ratio(task),
+        )
         selected_idx = int(selected["candidate_index"])
         self._slo_tie_break_cursor = (selected_idx + 1) % len(candidates)
         self._scheduler_snapshot_cache.pop(candidates[selected_idx][1], None)
@@ -902,7 +935,10 @@ class StagePool:
         if not scored:
             self._write_stagepool_profile("local_slo_select", task, None, profile_candidates, now_s)
             return None
-        selected = self._choose_stagepool_slo_candidate(scored)
+        selected = self._choose_stagepool_slo_candidate(
+            scored,
+            task_area_ratio=_task_area_ratio(task),
+        )
         selected_replica_id = int(selected["replica_id"])
         selected_live_idx = live.index(selected_replica_id)
         self._slo_tie_break_cursor = (selected_live_idx + 1) % len(live)
@@ -976,12 +1012,17 @@ class StagePool:
         self,
         candidates: list[dict[str, Any]],
         best: dict[str, Any],
+        *,
+        task_area_ratio: float | None = None,
     ) -> dict[str, Any]:
-        if self._slo_stagepool_queue_guard_window_ms <= 0:
+        queue_guard_window_ms, queue_guard_max_queue_length = self._stagepool_queue_guard_limits(
+            task_area_ratio
+        )
+        if queue_guard_window_ms <= 0:
             return best
-        if self._slo_stagepool_queue_guard_max_queue_length <= 0:
+        if queue_guard_max_queue_length <= 0:
             return best
-        if int(best["queue_length"]) < self._slo_stagepool_queue_guard_max_queue_length:
+        if int(best["queue_length"]) < queue_guard_max_queue_length:
             return best
 
         best_laxity_ms = float(best["predicted_laxity_ms"])
@@ -989,12 +1030,12 @@ class StagePool:
             return best
         laxity_floor_ms = max(
             self._slo_stagepool_pack_min_laxity_ms,
-            best_laxity_ms - self._slo_stagepool_queue_guard_window_ms,
+            best_laxity_ms - queue_guard_window_ms,
         )
         eligible = [
             candidate
             for candidate in candidates
-            if int(candidate["queue_length"]) < self._slo_stagepool_queue_guard_max_queue_length
+            if int(candidate["queue_length"]) < queue_guard_max_queue_length
             and float(candidate["predicted_laxity_ms"]) >= laxity_floor_ms
         ]
         if not eligible:
@@ -1011,7 +1052,39 @@ class StagePool:
 
         return min(eligible, key=queue_first)
 
-    def _choose_stagepool_slo_candidate(self, candidates: list[dict[str, Any]]) -> dict[str, Any]:
+    def _stagepool_queue_guard_limits(
+        self,
+        task_area_ratio: float | None,
+    ) -> tuple[float, int]:
+        queue_guard_window_ms = self._slo_stagepool_queue_guard_window_ms
+        queue_guard_max_queue_length = self._slo_stagepool_queue_guard_max_queue_length
+        if (
+            task_area_ratio is not None
+            and self._slo_stagepool_small_shape_queue_guard_max_area_ratio > 0
+            and task_area_ratio <= self._slo_stagepool_small_shape_queue_guard_max_area_ratio
+        ):
+            queue_guard_window_ms = max(
+                queue_guard_window_ms,
+                self._slo_stagepool_small_shape_queue_guard_window_ms,
+            )
+            if self._slo_stagepool_small_shape_queue_guard_max_queue_length > 0:
+                if queue_guard_max_queue_length > 0:
+                    queue_guard_max_queue_length = min(
+                        queue_guard_max_queue_length,
+                        self._slo_stagepool_small_shape_queue_guard_max_queue_length,
+                    )
+                else:
+                    queue_guard_max_queue_length = (
+                        self._slo_stagepool_small_shape_queue_guard_max_queue_length
+                    )
+        return queue_guard_window_ms, queue_guard_max_queue_length
+
+    def _choose_stagepool_slo_candidate(
+        self,
+        candidates: list[dict[str, Any]],
+        *,
+        task_area_ratio: float | None = None,
+    ) -> dict[str, Any]:
         def laxity_first(candidate: dict[str, Any]) -> tuple[float, int, int, int, int]:
             return (
                 -float(candidate["predicted_laxity_ms"]),
@@ -1022,7 +1095,11 @@ class StagePool:
             )
 
         best = min(candidates, key=laxity_first)
-        best = self._choose_stagepool_queue_guard_candidate(candidates, best)
+        best = self._choose_stagepool_queue_guard_candidate(
+            candidates,
+            best,
+            task_area_ratio=task_area_ratio,
+        )
         if self._slo_stagepool_laxity_window_ms <= 0:
             return best
 
@@ -1039,11 +1116,14 @@ class StagePool:
             for candidate in candidates
             if float(candidate["predicted_laxity_ms"]) >= laxity_floor_ms
         ]
-        if self._slo_stagepool_queue_guard_window_ms > 0 and self._slo_stagepool_queue_guard_max_queue_length > 0:
+        queue_guard_window_ms, queue_guard_max_queue_length = self._stagepool_queue_guard_limits(
+            task_area_ratio
+        )
+        if queue_guard_window_ms > 0 and queue_guard_max_queue_length > 0:
             queue_eligible = [
                 candidate
                 for candidate in eligible
-                if int(candidate["queue_length"]) < self._slo_stagepool_queue_guard_max_queue_length
+                if int(candidate["queue_length"]) < queue_guard_max_queue_length
             ]
             if queue_eligible:
                 eligible = queue_eligible
