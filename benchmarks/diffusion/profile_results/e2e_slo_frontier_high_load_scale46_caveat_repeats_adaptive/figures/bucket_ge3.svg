@@ -1,0 +1,44 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1120" height="520" viewBox="0 0 1120 520">
+<rect width="100%" height="100%" fill="#ffffff"/>
+<text x="560.0" y="32" text-anchor="middle" font-family="Arial" font-size="22" font-weight="700">Combined Repeat0-2 Bucket &gt;=3 Share</text>
+<line x1="78" y1="408" x2="1096" y2="408" stroke="#111827"/>
+<line x1="78" y1="58" x2="78" y2="408" stroke="#111827"/>
+<line x1="74" y1="408.0" x2="1096" y2="408.0" stroke="#e5e7eb"/>
+<text x="68" y="412.0" text-anchor="end" font-family="Arial" font-size="11">0%</text>
+<line x1="74" y1="338.0" x2="1096" y2="338.0" stroke="#e5e7eb"/>
+<text x="68" y="342.0" text-anchor="end" font-family="Arial" font-size="11">9%</text>
+<line x1="74" y1="268.0" x2="1096" y2="268.0" stroke="#e5e7eb"/>
+<text x="68" y="272.0" text-anchor="end" font-family="Arial" font-size="11">18%</text>
+<line x1="74" y1="198.0" x2="1096" y2="198.0" stroke="#e5e7eb"/>
+<text x="68" y="202.0" text-anchor="end" font-family="Arial" font-size="11">27%</text>
+<line x1="74" y1="128.0" x2="1096" y2="128.0" stroke="#e5e7eb"/>
+<text x="68" y="132.0" text-anchor="end" font-family="Arial" font-size="11">35%</text>
+<line x1="74" y1="58.0" x2="1096" y2="58.0" stroke="#e5e7eb"/>
+<text x="68" y="62.0" text-anchor="end" font-family="Arial" font-size="11">44%</text>
+<text x="205.2" y="432" text-anchor="middle" font-family="Arial" font-size="11">large-heavy</text>
+<text x="205.2" y="448" text-anchor="middle" font-family="Arial" font-size="11">scale 4</text>
+<rect x="90.0" y="243.4" width="73.5" height="164.6" fill="#2563eb"/>
+<rect x="168.5" y="187.4" width="73.5" height="220.6" fill="#059669"/>
+<rect x="247.0" y="111.4" width="73.5" height="296.6" fill="#dc2626"/>
+<text x="459.8" y="432" text-anchor="middle" font-family="Arial" font-size="11">large-heavy</text>
+<text x="459.8" y="448" text-anchor="middle" font-family="Arial" font-size="11">scale 6</text>
+<rect x="344.5" y="245.2" width="73.5" height="162.8" fill="#2563eb"/>
+<rect x="423.0" y="214.7" width="73.5" height="193.3" fill="#059669"/>
+<rect x="501.5" y="175.1" width="73.5" height="232.9" fill="#dc2626"/>
+<text x="714.2" y="432" text-anchor="middle" font-family="Arial" font-size="11">rectangular-mix</text>
+<text x="714.2" y="448" text-anchor="middle" font-family="Arial" font-size="11">scale 4</text>
+<rect x="599.0" y="354.9" width="73.5" height="53.1" fill="#2563eb"/>
+<rect x="677.5" y="379.3" width="73.5" height="28.7" fill="#059669"/>
+<rect x="756.0" y="347.9" width="73.5" height="60.1" fill="#dc2626"/>
+<text x="968.8" y="432" text-anchor="middle" font-family="Arial" font-size="11">rectangular-mix</text>
+<text x="968.8" y="448" text-anchor="middle" font-family="Arial" font-size="11">scale 6</text>
+<rect x="853.5" y="338.9" width="73.5" height="69.1" fill="#2563eb"/>
+<rect x="932.0" y="351.3" width="73.5" height="56.7" fill="#059669"/>
+<rect x="1010.5" y="358.4" width="73.5" height="49.6" fill="#dc2626"/>
+<rect x="78" y="478" width="12" height="12" fill="#2563eb"/>
+<text x="96" y="488" font-family="Arial" font-size="12">lookup</text>
+<rect x="298" y="478" width="12" height="12" fill="#059669"/>
+<text x="316" y="488" font-family="Arial" font-size="12">guarded</text>
+<rect x="518" y="478" width="12" height="12" fill="#dc2626"/>
+<text x="536" y="488" font-family="Arial" font-size="12">adaptive</text>
+</svg>
