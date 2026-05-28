@@ -1,0 +1,13 @@
+workload,interarrival_s,load_label,policy,repeat,slo_scale,bucket_size,count
+large-heavy,2.5,ia_2p5,slo_no_preemption_adaptive_guarded,0,3.0,1,407
+large-heavy,2.5,ia_2p5,slo_no_preemption_adaptive_guarded,0,3.0,2,473
+large-heavy,2.5,ia_2p5,slo_no_preemption_adaptive_guarded,0,3.0,3,549
+large-heavy,2.5,ia_2p5,slo_no_preemption_shape_guarded,0,3.0,1,558
+large-heavy,2.5,ia_2p5,slo_no_preemption_shape_guarded,0,3.0,2,552
+large-heavy,2.5,ia_2p5,slo_no_preemption_shape_guarded,0,3.0,3,446
+rectangular-mix,2.5,ia_2p5,slo_no_preemption_adaptive_guarded,0,3.0,1,1415
+rectangular-mix,2.5,ia_2p5,slo_no_preemption_adaptive_guarded,0,3.0,2,551
+rectangular-mix,2.5,ia_2p5,slo_no_preemption_adaptive_guarded,0,3.0,3,161
+rectangular-mix,2.5,ia_2p5,slo_no_preemption_shape_guarded,0,3.0,1,1513
+rectangular-mix,2.5,ia_2p5,slo_no_preemption_shape_guarded,0,3.0,2,424
+rectangular-mix,2.5,ia_2p5,slo_no_preemption_shape_guarded,0,3.0,3,213
