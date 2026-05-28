@@ -1,0 +1,44 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1120" height="560" viewBox="0 0 1120 560">
+<rect width="100%" height="100%" fill="#ffffff"/>
+<text x="560.0" y="32" text-anchor="middle" font-family="Arial" font-size="22" font-weight="700">P95 Latency</text>
+<line x1="72" y1="424" x2="1096" y2="424" stroke="#111827"/>
+<line x1="72" y1="64" x2="72" y2="424" stroke="#111827"/>
+<line x1="68" y1="424.0" x2="1096" y2="424.0" stroke="#e5e7eb"/>
+<text x="62" y="428.0" text-anchor="end" font-family="Arial" font-size="11">0.00</text>
+<line x1="68" y1="352.0" x2="1096" y2="352.0" stroke="#e5e7eb"/>
+<text x="62" y="356.0" text-anchor="end" font-family="Arial" font-size="11">63.04</text>
+<line x1="68" y1="280.0" x2="1096" y2="280.0" stroke="#e5e7eb"/>
+<text x="62" y="284.0" text-anchor="end" font-family="Arial" font-size="11">126.09</text>
+<line x1="68" y1="208.0" x2="1096" y2="208.0" stroke="#e5e7eb"/>
+<text x="62" y="212.0" text-anchor="end" font-family="Arial" font-size="11">189.13</text>
+<line x1="68" y1="136.0" x2="1096" y2="136.0" stroke="#e5e7eb"/>
+<text x="62" y="140.0" text-anchor="end" font-family="Arial" font-size="11">252.17</text>
+<line x1="68" y1="64.0" x2="1096" y2="64.0" stroke="#e5e7eb"/>
+<text x="62" y="68.0" text-anchor="end" font-family="Arial" font-size="11">315.22</text>
+<text x="328.0" y="446" text-anchor="middle" font-family="Arial" font-size="10">large-heavy</text>
+<text x="328.0" y="462" text-anchor="middle" font-family="Arial" font-size="10">scale 3</text>
+<text x="328.0" y="478" text-anchor="middle" font-family="Arial" font-size="10">2.5s</text>
+<rect x="80.0" y="175.0" width="96.0" height="249.0" fill="#2563eb"/>
+<rect x="180.0" y="152.6" width="96.0" height="271.4" fill="#dc2626"/>
+<rect x="280.0" y="205.3" width="96.0" height="218.7" fill="#059669"/>
+<rect x="380.0" y="111.0" width="96.0" height="313.0" fill="#7c3aed"/>
+<rect x="480.0" y="158.1" width="96.0" height="265.9" fill="#f59e0b"/>
+<text x="840.0" y="446" text-anchor="middle" font-family="Arial" font-size="10">rectangular-mix</text>
+<text x="840.0" y="462" text-anchor="middle" font-family="Arial" font-size="10">scale 3</text>
+<text x="840.0" y="478" text-anchor="middle" font-family="Arial" font-size="10">2.5s</text>
+<rect x="592.0" y="149.6" width="96.0" height="274.4" fill="#2563eb"/>
+<rect x="692.0" y="284.6" width="96.0" height="139.4" fill="#dc2626"/>
+<rect x="792.0" y="243.1" width="96.0" height="180.9" fill="#059669"/>
+<rect x="892.0" y="201.0" width="96.0" height="223.0" fill="#7c3aed"/>
+<rect x="992.0" y="259.1" width="96.0" height="164.9" fill="#f59e0b"/>
+<rect x="72" y="514" width="12" height="12" fill="#2563eb"/>
+<text x="90" y="524" font-family="Arial" font-size="12">current</text>
+<rect x="322" y="514" width="12" height="12" fill="#dc2626"/>
+<text x="340" y="524" font-family="Arial" font-size="12">slo_no_preemption_adaptive_guarded</text>
+<rect x="572" y="514" width="12" height="12" fill="#059669"/>
+<text x="590" y="524" font-family="Arial" font-size="12">slo_no_preemption_guarded</text>
+<rect x="822" y="514" width="12" height="12" fill="#7c3aed"/>
+<text x="840" y="524" font-family="Arial" font-size="12">slo_no_preemption_lookup</text>
+<rect x="1072" y="514" width="12" height="12" fill="#f59e0b"/>
+<text x="1090" y="524" font-family="Arial" font-size="12">slo_no_preemption_shape_guarded</text>
+</svg>
