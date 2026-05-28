@@ -1,0 +1,17 @@
+repeats_included,workload,interarrival_s,slo_scale,policy,policy_label,mean_bucket_size_mean,p95_bucket_size_mean,bucket_ge3_count,bucket_total_count,bucket_ge3_share
+1;2,large-heavy,2.5,3.0,current,current,1.3986629134412385,3.0,400,4293,0.09317493594223154
+1;2,large-heavy,2.5,3.0,slo_no_preemption_lookup,lookup,1.928088803088803,4.0,758,3034,0.24983520105471324
+1;2,large-heavy,2.5,3.0,slo_no_preemption_guarded,guarded,1.7461036677990398,3.0,783,3440,0.22761627906976745
+1;2,large-heavy,2.5,3.0,slo_no_preemption_adaptive_guarded,adaptive,1.9433237082557506,3.0,1021,3090,0.33042071197411005
+1;2,rectangular-mix,2.5,3.0,current,current,1.043557168784029,1.5,50,5750,0.008695652173913044
+1;2,rectangular-mix,2.5,3.0,slo_no_preemption_lookup,lookup,1.3644320873236535,2.5,219,4399,0.049784041827688114
+1;2,rectangular-mix,2.5,3.0,slo_no_preemption_guarded,guarded,1.3882335745459953,2.5,278,4331,0.0641884091433849
+1;2,rectangular-mix,2.5,3.0,slo_no_preemption_adaptive_guarded,adaptive,1.3441186678531416,2.0,134,4464,0.030017921146953404
+0;1;2,large-heavy,2.5,3.0,current,current,1.441088941276865,3.0,700,6259,0.11183895190925068
+0;1;2,large-heavy,2.5,3.0,slo_no_preemption_lookup,lookup,1.909612260735856,4.0,1100,4636,0.2372735116479724
+0;1;2,large-heavy,2.5,3.0,slo_no_preemption_guarded,guarded,1.7444521646808842,3.0,1274,5163,0.24675576215378656
+0;1;2,large-heavy,2.5,3.0,slo_no_preemption_adaptive_guarded,adaptive,2.00656384117508,3.0,1565,4473,0.3498770400178851
+0;1;2,rectangular-mix,2.5,3.0,current,current,1.0405323653962493,1.3333333333333333,50,8650,0.005780346820809248
+0;1;2,rectangular-mix,2.5,3.0,slo_no_preemption_lookup,lookup,1.3268095434055898,2.3333333333333335,279,6796,0.04105356091818717
+0;1;2,rectangular-mix,2.5,3.0,slo_no_preemption_guarded,guarded,1.4035315063494125,2.6666666666666665,480,6388,0.07514088916718847
+0;1;2,rectangular-mix,2.5,3.0,slo_no_preemption_adaptive_guarded,adaptive,1.34693573949452,2.0,212,6682,0.03172702783597725

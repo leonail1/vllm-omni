@@ -1,0 +1,44 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1040" height="560" viewBox="0 0 1040 560">
+<rect width="100%" height="100%" fill="#ffffff"/>
+<text x="520.0" y="32" text-anchor="middle" font-family="Arial" font-size="22" font-weight="700">Combined Repeat0-2 SLO Miss Rate</text>
+<line x1="72" y1="432" x2="1012" y2="432" stroke="#111827"/>
+<line x1="72" y1="62" x2="72" y2="432" stroke="#111827"/>
+<line x1="68" y1="432.0" x2="1012" y2="432.0" stroke="#e5e7eb"/>
+<text x="62" y="436.0" text-anchor="end" font-family="Arial" font-size="11">0%</text>
+<line x1="68" y1="358.0" x2="1012" y2="358.0" stroke="#e5e7eb"/>
+<text x="62" y="362.0" text-anchor="end" font-family="Arial" font-size="11">18%</text>
+<line x1="68" y1="284.0" x2="1012" y2="284.0" stroke="#e5e7eb"/>
+<text x="62" y="288.0" text-anchor="end" font-family="Arial" font-size="11">36%</text>
+<line x1="68" y1="210.0" x2="1012" y2="210.0" stroke="#e5e7eb"/>
+<text x="62" y="214.0" text-anchor="end" font-family="Arial" font-size="11">55%</text>
+<line x1="68" y1="136.0" x2="1012" y2="136.0" stroke="#e5e7eb"/>
+<text x="62" y="140.0" text-anchor="end" font-family="Arial" font-size="11">73%</text>
+<line x1="68" y1="62.0" x2="1012" y2="62.0" stroke="#e5e7eb"/>
+<text x="62" y="66.0" text-anchor="end" font-family="Arial" font-size="11">91%</text>
+<text x="307.0" y="462" text-anchor="middle" font-family="Arial" font-size="13" font-weight="700">large-heavy</text>
+<rect x="98.0" y="118.4" width="98.5" height="313.6" fill="#4b5563"/>
+<text x="147.2" y="112.4" text-anchor="middle" font-family="Arial" font-size="10">77.2%</text>
+<rect x="204.5" y="197.4" width="98.5" height="234.6" fill="#2563eb"/>
+<text x="253.8" y="191.4" text-anchor="middle" font-family="Arial" font-size="10">57.8%</text>
+<rect x="311.0" y="213.2" width="98.5" height="218.8" fill="#059669"/>
+<text x="360.2" y="207.2" text-anchor="middle" font-family="Arial" font-size="10">53.9%</text>
+<rect x="417.5" y="240.3" width="98.5" height="191.7" fill="#dc2626"/>
+<text x="466.8" y="234.3" text-anchor="middle" font-family="Arial" font-size="10">47.2%</text>
+<text x="777.0" y="462" text-anchor="middle" font-family="Arial" font-size="13" font-weight="700">rectangular-mix</text>
+<rect x="568.0" y="147.8" width="98.5" height="284.2" fill="#4b5563"/>
+<text x="617.2" y="141.8" text-anchor="middle" font-family="Arial" font-size="10">70.0%</text>
+<rect x="674.5" y="233.5" width="98.5" height="198.5" fill="#2563eb"/>
+<text x="723.8" y="227.5" text-anchor="middle" font-family="Arial" font-size="10">48.9%</text>
+<rect x="781.0" y="226.7" width="98.5" height="205.3" fill="#059669"/>
+<text x="830.2" y="220.7" text-anchor="middle" font-family="Arial" font-size="10">50.6%</text>
+<rect x="887.5" y="224.5" width="98.5" height="207.5" fill="#dc2626"/>
+<text x="936.8" y="218.5" text-anchor="middle" font-family="Arial" font-size="10">51.1%</text>
+<rect x="72" y="506" width="12" height="12" fill="#4b5563"/>
+<text x="90" y="516" font-family="Arial" font-size="12">current</text>
+<rect x="307" y="506" width="12" height="12" fill="#2563eb"/>
+<text x="325" y="516" font-family="Arial" font-size="12">lookup</text>
+<rect x="542" y="506" width="12" height="12" fill="#059669"/>
+<text x="560" y="516" font-family="Arial" font-size="12">guarded</text>
+<rect x="777" y="506" width="12" height="12" fill="#dc2626"/>
+<text x="795" y="516" font-family="Arial" font-size="12">adaptive</text>
+</svg>
