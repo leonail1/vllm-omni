@@ -1,0 +1,55 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="980" height="360" viewBox="0 0 980 360" role="img" aria-label="adaptive_high_load_miss_rank">
+<style>
+text { font-family: Arial, sans-serif; font-size: 12px; fill: #20242a; }
+.title { font-size: 18px; font-weight: 700; }
+.axis { stroke: #9aa3ad; stroke-width: 1; }
+.grid { stroke: #e5e7eb; stroke-width: 1; }
+.note { font-size: 11px; fill: #5b6470; }
+</style>
+<text class="title" x="24" y="28">Adaptive miss rank across high-load regions</text>
+<text class="note" x="24" y="346">Rank 1 is best by miss within the source slice. Scale4/6 caveats are repeated separately.</text>
+<line class="grid" x1="210.0" y1="42" x2="210.0" y2="322"/>
+<text x="206.0" y="338">1</text>
+<line class="grid" x1="290.0" y1="42" x2="290.0" y2="322"/>
+<text x="286.0" y="338">2</text>
+<line class="grid" x1="370.0" y1="42" x2="370.0" y2="322"/>
+<text x="366.0" y="338">3</text>
+<line class="grid" x1="450.0" y1="42" x2="450.0" y2="322"/>
+<text x="446.0" y="338">4</text>
+<text x="24" y="61">large-heavy s3.0</text>
+<rect x="210" y="48" width="16.0" height="18" fill="#2f80ed" rx="2"/>
+<text x="234.0" y="61">rank 1, miss 47.2%</text>
+<text x="24" y="87">rectangular-mix s3.0</text>
+<rect x="210" y="74" width="176.0" height="18" fill="#d05c5c" rx="2"/>
+<text x="394.0" y="87">rank 3, miss 51.1%</text>
+<text x="24" y="113">bursty s3.0</text>
+<rect x="210" y="100" width="16.0" height="18" fill="#2f80ed" rx="2"/>
+<text x="234.0" y="113">rank 1, miss 38.3%</text>
+<text x="24" y="139">large-heavy s3.5</text>
+<rect x="210" y="126" width="16.0" height="18" fill="#2f80ed" rx="2"/>
+<text x="234.0" y="139">rank 1, miss 45.0%</text>
+<text x="24" y="165">rectangular-mix s3.5</text>
+<rect x="210" y="152" width="16.0" height="18" fill="#2f80ed" rx="2"/>
+<text x="234.0" y="165">rank 1, miss 46.7%</text>
+<text x="24" y="191">bursty s3.5</text>
+<rect x="210" y="178" width="16.0" height="18" fill="#2f80ed" rx="2"/>
+<text x="234.0" y="191">rank 1, miss 38.3%</text>
+<text x="24" y="217">large-heavy s4.0</text>
+<rect x="210" y="204" width="96.0" height="18" fill="#f2a93b" rx="2"/>
+<text x="314.0" y="217">rank 2, miss 45.0%</text>
+<text x="24" y="243">rectangular-mix s4.0</text>
+<rect x="210" y="230" width="16.0" height="18" fill="#2f80ed" rx="2"/>
+<text x="234.0" y="243">rank 1, miss 38.3%</text>
+<text x="24" y="269">bursty s4.0</text>
+<rect x="210" y="256" width="16.0" height="18" fill="#2f80ed" rx="2"/>
+<text x="234.0" y="269">rank 1, miss 36.7%</text>
+<text x="24" y="295">large-heavy s6.0</text>
+<rect x="210" y="282" width="16.0" height="18" fill="#2f80ed" rx="2"/>
+<text x="234.0" y="295">rank 1, miss 23.3%</text>
+<text x="24" y="321">rectangular-mix s6.0</text>
+<rect x="210" y="308" width="176.0" height="18" fill="#d05c5c" rx="2"/>
+<text x="394.0" y="321">rank 3, miss 23.3%</text>
+<text x="24" y="347">bursty s6.0</text>
+<rect x="210" y="334" width="16.0" height="18" fill="#2f80ed" rx="2"/>
+<text x="234.0" y="347">rank 1, miss 8.3%</text>
+</svg>

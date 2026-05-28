@@ -1,0 +1,5 @@
+source_package,workload,interarrival_s,scale,policy,miss_rate,goodput_rps,throughput_rps,latency_p95_s,note
+e2e_slo_frontier_bursty_normal_scale4_repeats,bursty,4.25,4.0,current,20.0%,0.1438,0.1794,108.2,repeat0-2 normal-load bursty scale4 context
+e2e_slo_frontier_bursty_normal_scale4_repeats,bursty,4.25,4.0,lookup,13.3%,0.1781,0.2056,96.2,repeat0-2 normal-load bursty scale4 context
+e2e_slo_frontier_bursty_normal_scale4_repeats,bursty,4.25,4.0,guarded,17.8%,0.1546,0.1877,125.2,repeat0-2 normal-load bursty scale4 context
+e2e_slo_frontier_bursty_normal_scale4_repeats,bursty,4.25,4.0,adaptive,8.9%,0.1859,0.2040,86.0,repeat0-2 normal-load bursty scale4 context

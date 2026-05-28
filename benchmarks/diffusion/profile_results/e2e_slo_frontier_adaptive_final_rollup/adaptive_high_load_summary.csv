@@ -1,0 +1,13 @@
+workload,interarrival_s,scale,repeat_scope,source_package,adaptive_miss_rate,adaptive_goodput_rps,adaptive_throughput_rps,adaptive_latency_p95_s,adaptive_bucket_ge3_rate,best_baseline_by_miss,best_baseline_miss_rate,adaptive_delta_vs_best_baseline_miss_pp,adaptive_rank_by_miss,notes
+large-heavy,2.5,3.0,repeat0-2 combined,e2e_slo_frontier_boundary_scale3_repeats_adaptive,47.2%,0.0866,0.1648,223.6,35.0%,guarded,53.9%,-6.7,1,"repeat0-2: adaptive has best miss/goodput but large-heavy remains a high-miss, high-bucket boundary"
+rectangular-mix,2.5,3.0,repeat0-2 combined,e2e_slo_frontier_boundary_scale3_repeats_adaptive,51.1%,0.1063,0.2186,122.5,3.2%,lookup,48.9%,2.2,3,repeat0-2: adaptive improves latency/throughput but trails lookup/guarded on miss
+bursty,2.5,3.0,repeat0,e2e_slo_frontier_boundary_high_load_adaptive,38.3%,0.1451,0.2353,132.6,22.1%,guarded,48.3%,-10.0,1,adaptive is best by miss in this source slice
+large-heavy,2.5,3.5,repeat0,e2e_slo_frontier_boundary_high_load_adaptive,45.0%,0.1061,0.1929,198.5,35.8%,guarded,46.7%,-1.7,1,adaptive is best by miss in this source slice
+rectangular-mix,2.5,3.5,repeat0,e2e_slo_frontier_boundary_high_load_adaptive,46.7%,0.1073,0.2013,121.5,3.4%,lookup,46.7%,0.0,1,adaptive is best by miss in this source slice
+bursty,2.5,3.5,repeat0,e2e_slo_frontier_boundary_high_load_adaptive,38.3%,0.1545,0.2505,117.4,19.6%,current,48.3%,-10.0,1,adaptive is best by miss in this source slice
+large-heavy,2.5,4.0,repeat0,e2e_slo_frontier_high_load_scale46_adaptive_full,45.0%,0.0832,0.1513,232.7,40.9%,lookup,41.7%,3.3,2,"repeat0 trails lookup by miss; repeat0-2 caveat validation flips adaptive to best miss/goodput/P95, with high bucket>=3"
+rectangular-mix,2.5,4.0,repeat0,e2e_slo_frontier_high_load_scale46_adaptive_full,38.3%,0.1033,0.1674,218.6,10.9%,guarded,41.7%,-3.3,1,adaptive is best by miss in this source slice
+bursty,2.5,4.0,repeat0,e2e_slo_frontier_high_load_scale46_adaptive_full,36.7%,0.1234,0.1948,162.2,23.3%,current,40.0%,-3.3,1,adaptive is best by miss in this source slice
+large-heavy,2.5,6.0,repeat0,e2e_slo_frontier_high_load_scale46_adaptive_full,23.3%,0.1435,0.1872,218.1,38.3%,lookup,31.7%,-8.3,1,adaptive is best by miss in this source slice
+rectangular-mix,2.5,6.0,repeat0,e2e_slo_frontier_high_load_scale46_adaptive_full,23.3%,0.1697,0.2213,158.4,8.5%,guarded,18.3%,5.0,3,"repeat0 trails guarded/lookup by miss; repeat0-2 validation flips adaptive to best miss/goodput/P95, with guarded only slightly higher throughput"
+bursty,2.5,6.0,repeat0,e2e_slo_frontier_high_load_scale46_adaptive_full,8.3%,0.2389,0.2607,118.8,21.2%,guarded,20.0%,-11.7,1,adaptive is the clear repeat0 winner across miss/goodput/throughput/P95
