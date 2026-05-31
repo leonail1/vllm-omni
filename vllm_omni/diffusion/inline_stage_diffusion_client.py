@@ -141,6 +141,7 @@ class InlineStageDiffusionClient(StageClientBase):
             self._output_queue.put_nowait(result)
         except DiffusionRequestAbortedError as e:
             logger.info("request_id: %s aborted: %s", request_id, str(e))
+            self._output_queue.put_nowait(OmniRequestOutput.from_error(request_id, str(e)))
         except Exception as e:
             logger.exception("Diffusion request %s failed: %s", request_id, e)
             error_output = OmniRequestOutput.from_diffusion(
@@ -247,6 +248,7 @@ class InlineStageDiffusionClient(StageClientBase):
             self._output_queue.put_nowait(result)
         except DiffusionRequestAbortedError as e:
             logger.info("request_id: %s aborted: %s", request_id, str(e))
+            self._output_queue.put_nowait(OmniRequestOutput.from_error(request_id, str(e)))
         except Exception as e:
             logger.exception("Batch diffusion request %s failed: %s", request_id, e)
             error_output = OmniRequestOutput.from_diffusion(

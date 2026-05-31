@@ -391,6 +391,15 @@ class StageDiffusionProc:
                     request_id,
                     str(e),
                 )
+                await response_socket.send(
+                    encoder.encode(
+                        {
+                            "type": "error",
+                            "request_id": request_id,
+                            "error": str(e),
+                        }
+                    )
+                )
             except Exception as e:
                 logger.exception("Diffusion request %s failed: %s", request_id, e)
                 await response_socket.send(
@@ -473,6 +482,15 @@ class StageDiffusionProc:
                                 "request_id: %s aborted: %s",
                                 rid,
                                 str(e),
+                            )
+                            await response_socket.send(
+                                encoder.encode(
+                                    {
+                                        "type": "error",
+                                        "request_id": rid,
+                                        "error": str(e),
+                                    }
+                                )
                             )
                         except Exception as e:
                             logger.exception("Batch diffusion request %s failed: %s", rid, e)

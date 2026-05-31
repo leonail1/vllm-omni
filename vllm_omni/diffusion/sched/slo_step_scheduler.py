@@ -52,6 +52,13 @@ class SloStepScheduler(StepScheduler):
         self.no_preemption_admission_max_batch_size = 0
         self.ignore_request_reference_cost = False
         self.use_shape_fallback_cost = True
+        self.pard_oracle_enabled = False
+        self.pard_oracle_snapshot_enabled = False
+        self.pard_oracle_laxity_margin_ms = 0.0
+        self.pard_oracle_max_records = 16
+        self.pard_drop_mode = "off"
+        self.pard_drop_laxity_margin_ms = 0.0
+        self.pard_drop_max_per_schedule = 0
 
     def initialize(self, od_config) -> None:
         super().initialize(od_config)
@@ -81,6 +88,24 @@ class SloStepScheduler(StepScheduler):
         )
         self.ignore_request_reference_cost = _coerce_bool(slo_config.get("ignore_request_reference_cost"), False)
         self.use_shape_fallback_cost = _coerce_bool(slo_config.get("use_shape_fallback_cost"), True)
+        self.pard_oracle_enabled = _coerce_bool(slo_config.get("pard_oracle_enabled"), False)
+        self.pard_oracle_snapshot_enabled = _coerce_bool(
+            slo_config.get("pard_oracle_snapshot_enabled"),
+            False,
+        )
+        self.pard_oracle_laxity_margin_ms = _coerce_float(
+            slo_config.get("pard_oracle_laxity_margin_ms")
+        ) or 0.0
+        self.pard_oracle_max_records = int(
+            _coerce_nonnegative_float(slo_config.get("pard_oracle_max_records"), 16.0)
+        )
+        self.pard_drop_mode = _coerce_pard_drop_mode(slo_config.get("pard_drop_mode"))
+        self.pard_drop_laxity_margin_ms = _coerce_float(
+            slo_config.get("pard_drop_laxity_margin_ms")
+        ) or 0.0
+        self.pard_drop_max_per_schedule = int(
+            _coerce_nonnegative_float(slo_config.get("pard_drop_max_per_schedule"), 0.0)
+        )
         self.cost_model = DiffusionStepCostModel.from_config(
             slo_config,
             default_step_ms=self.default_step_ms,
@@ -91,11 +116,17 @@ class SloStepScheduler(StepScheduler):
             return super().schedule()
 
         now_s = time.time()
+        pard_drop_debug = self._apply_pard_drops(now_s)
+        if pard_drop_debug is not None and not self._has_any_deadline():
+            return super().schedule()
         bucket = self._select_bucket(now_s)
         if bucket is None:
             return self._empty_schedule()
 
         selected_key, selected_ids, debug_info = bucket
+        pard_oracle_debug = (
+            self._pard_oracle_debug(now_s, selected_ids) if self.pard_oracle_enabled else None
+        )
         selected_set = set(selected_ids)
         original_running = list(self._running)
         original_running_set = set(original_running)
@@ -139,6 +170,10 @@ class SloStepScheduler(StepScheduler):
         debug_info = dict(debug_info)
         debug_info["resident_reqs"] = len(self._resident_sched_req_ids())
         debug_info["safe_admit_capacity"] = self._safe_admit_capacity()
+        if pard_oracle_debug is not None:
+            debug_info["pard_oracle"] = pard_oracle_debug
+        if pard_drop_debug is not None:
+            debug_info["pard_drop"] = pard_drop_debug
 
         scheduler_output = DiffusionSchedulerOutput(
             step_id=self._step_id,
@@ -181,13 +216,13 @@ class SloStepScheduler(StepScheduler):
                         "height": height,
                         "num_frames": frames,
                     },
-                    "min_laxity_ms": self._bucket_min_laxity_ms(states, step_ms, now_s),
+                    "min_laxity_ms": _json_float(self._bucket_min_laxity_ms(states, step_ms, now_s)),
                     "min_remaining_steps": min(self._remaining_steps(state) for state in states),
                     "max_remaining_steps": max(self._remaining_steps(state) for state in states),
                     "oldest_arrival_time_s": min(state.arrival_time_s for state in states),
                 }
             )
-        return {
+        snapshot = {
             "policy": self.__class__.__name__,
             "timestamp_s": now_s,
             "num_waiting": len(self._waiting),
@@ -198,6 +233,9 @@ class SloStepScheduler(StepScheduler):
             "no_preemption_admission_max_batch_size": self.no_preemption_admission_max_batch_size,
             "buckets": buckets,
         }
+        if self.pard_oracle_enabled and self.pard_oracle_snapshot_enabled:
+            snapshot["pard_oracle"] = self._pard_oracle_debug(now_s, [])
+        return snapshot
 
     def _empty_schedule(self) -> DiffusionSchedulerOutput:
         output = DiffusionSchedulerOutput(
@@ -264,8 +302,8 @@ class SloStepScheduler(StepScheduler):
                 {
                     "key": None if key is None else asdict(key),
                     "sched_req_ids": list(sched_req_ids),
-                    "score": list(score),
-                    "min_laxity_ms": score[3],
+                    "score": [_json_float(value) for value in score],
+                    "min_laxity_ms": _json_float(score[3]),
                     "batch_size": len(sched_req_ids),
                 }
             )
@@ -468,6 +506,200 @@ class SloStepScheduler(StepScheduler):
         has_deadline = 0.0 if math.isfinite(laxity_ms) else 1.0
         return (has_deadline, laxity_ms, state.arrival_time_s)
 
+    def _apply_pard_drops(self, now_s: float) -> dict[str, Any] | None:
+        if self.pard_drop_mode == "off":
+            return None
+
+        resident_ids = self._resident_sched_req_ids()
+        drop_ids: list[str] = []
+        records: list[dict[str, Any]] = []
+        for sched_req_id in [*self._waiting, *self._running]:
+            if self.pard_drop_max_per_schedule > 0 and len(drop_ids) >= self.pard_drop_max_per_schedule:
+                break
+            state = self._request_states.get(sched_req_id)
+            if state is None or state.is_finished() or state.deadline_time_s is None:
+                continue
+
+            is_resident = sched_req_id in resident_ids
+            if self.pard_drop_mode == "admission_only" and is_resident:
+                continue
+
+            single_step_ms = self._estimate_step_ms([state])
+            optimistic_laxity_ms = self._state_laxity_ms(state, single_step_ms, now_s)
+            if (
+                not math.isfinite(optimistic_laxity_ms)
+                or optimistic_laxity_ms >= self.pard_drop_laxity_margin_ms
+            ):
+                continue
+
+            drop_ids.append(sched_req_id)
+            progress = self._request_progress.get(sched_req_id)
+            records.append(
+                {
+                    "sched_req_id": sched_req_id,
+                    "status": state.status.name,
+                    "resident": is_resident,
+                    "remaining_steps": self._remaining_steps(state),
+                    "current_step": None if progress is None else progress.current_step,
+                    "total_steps": None if progress is None else progress.total_steps,
+                    "single_step_ms": single_step_ms,
+                    "optimistic_laxity_ms": _json_float(optimistic_laxity_ms),
+                    "deadline_time_s": state.deadline_time_s,
+                    "time_to_deadline_ms": _json_float((state.deadline_time_s - now_s) * 1000.0),
+                }
+            )
+
+        if drop_ids:
+            self._finish_requests(
+                {sched_req_id: DiffusionRequestStatus.FINISHED_ABORTED for sched_req_id in drop_ids}
+            )
+
+        return {
+            "enabled": True,
+            "mode": self.pard_drop_mode,
+            "laxity_margin_ms": self.pard_drop_laxity_margin_ms,
+            "max_per_schedule": self.pard_drop_max_per_schedule,
+            "dropped_req_count": len(drop_ids),
+            "dropped_req_ids": drop_ids[: self.pard_oracle_max_records],
+            "records": records[: self.pard_oracle_max_records],
+        }
+
+    def _pard_oracle_debug(self, now_s: float, selected_req_ids: list[str]) -> dict[str, Any]:
+        selected_set = set(selected_req_ids)
+        selected_states = [
+            state
+            for sched_req_id in selected_req_ids
+            if (state := self._request_states.get(sched_req_id)) is not None and not state.is_finished()
+        ]
+        selected_step_ms = self._estimate_step_ms(selected_states) if selected_states else None
+
+        bucket_step_by_req: dict[str, float] = {}
+        bucket_ids_by_req: dict[str, list[str]] = {}
+        candidate_buckets = []
+        for key, states in self._candidate_batches(now_s):
+            if not states:
+                continue
+            step_ms = self._estimate_step_ms(states)
+            sched_req_ids = [state.sched_req_id for state in states]
+            for state in states:
+                bucket_step_by_req[state.sched_req_id] = step_ms
+                bucket_ids_by_req[state.sched_req_id] = sched_req_ids
+            candidate_buckets.append(
+                {
+                    "key": None if key is None else asdict(key),
+                    "sched_req_ids": sched_req_ids,
+                    "estimated_step_ms": step_ms,
+                    "min_laxity_ms": _json_float(self._bucket_min_laxity_ms(states, step_ms, now_s)),
+                    "batch_size": len(states),
+                }
+            )
+
+        resident_ids = self._resident_sched_req_ids()
+        records: list[dict[str, Any]] = []
+        admission_would_drop_req_ids: list[str] = []
+        step_would_drop_req_ids: list[str] = []
+        projected_miss_req_ids: list[str] = []
+        seen_req_ids: set[str] = set()
+        for sched_req_id in [*self._running, *self._waiting]:
+            if sched_req_id in seen_req_ids:
+                continue
+            seen_req_ids.add(sched_req_id)
+            state = self._request_states.get(sched_req_id)
+            if state is None or state.is_finished():
+                continue
+
+            single_step_ms = self._estimate_step_ms([state])
+            if selected_step_ms is not None and sched_req_id in selected_set:
+                projected_step_ms = selected_step_ms
+                projected_step_source = "selected_bucket"
+            elif sched_req_id in bucket_step_by_req:
+                projected_step_ms = bucket_step_by_req[sched_req_id]
+                projected_step_source = "candidate_bucket"
+            else:
+                projected_step_ms = single_step_ms
+                projected_step_source = "single_request"
+
+            optimistic_laxity_ms = self._state_laxity_ms(state, single_step_ms, now_s)
+            projected_laxity_ms = self._state_laxity_ms(state, projected_step_ms, now_s)
+            optimistic_miss = (
+                math.isfinite(optimistic_laxity_ms)
+                and optimistic_laxity_ms < self.pard_oracle_laxity_margin_ms
+            )
+            projected_miss = (
+                math.isfinite(projected_laxity_ms)
+                and projected_laxity_ms < self.pard_oracle_laxity_margin_ms
+            )
+            is_resident = sched_req_id in resident_ids
+            would_drop_admission = (not is_resident) and optimistic_miss
+            would_drop_step = is_resident and optimistic_miss
+            if would_drop_admission:
+                admission_would_drop_req_ids.append(sched_req_id)
+            if would_drop_step:
+                step_would_drop_req_ids.append(sched_req_id)
+            if projected_miss:
+                projected_miss_req_ids.append(sched_req_id)
+
+            progress = self._request_progress.get(sched_req_id)
+            records.append(
+                {
+                    "sched_req_id": sched_req_id,
+                    "status": state.status.name,
+                    "resident": is_resident,
+                    "in_selected_bucket": sched_req_id in selected_set,
+                    "candidate_bucket_req_ids": bucket_ids_by_req.get(sched_req_id, [sched_req_id]),
+                    "current_step": None if progress is None else progress.current_step,
+                    "total_steps": None if progress is None else progress.total_steps,
+                    "remaining_steps": self._remaining_steps(state),
+                    "single_step_ms": single_step_ms,
+                    "projected_step_ms": projected_step_ms,
+                    "projected_step_source": projected_step_source,
+                    "deadline_time_s": state.deadline_time_s,
+                    "time_to_deadline_ms": _json_float(
+                        (state.deadline_time_s - now_s) * 1000.0
+                        if state.deadline_time_s is not None
+                        else math.inf
+                    ),
+                    "optimistic_laxity_ms": _json_float(optimistic_laxity_ms),
+                    "projected_laxity_ms": _json_float(projected_laxity_ms),
+                    "optimistic_miss": optimistic_miss,
+                    "projected_miss": projected_miss,
+                    "would_drop_admission": would_drop_admission,
+                    "would_drop_step": would_drop_step,
+                }
+            )
+
+        records.sort(
+            key=lambda record: (
+                not (record["would_drop_admission"] or record["would_drop_step"]),
+                not record["projected_miss"],
+                _sort_laxity(record.get("optimistic_laxity_ms")),
+                str(record["sched_req_id"]),
+            )
+        )
+        omitted_records = max(0, len(records) - self.pard_oracle_max_records)
+        records = records[: self.pard_oracle_max_records]
+        would_drop_req_ids = [*admission_would_drop_req_ids, *step_would_drop_req_ids]
+
+        return {
+            "enabled": True,
+            "dry_run_only": True,
+            "phase": "step_boundary",
+            "laxity_margin_ms": self.pard_oracle_laxity_margin_ms,
+            "selected_req_ids": list(selected_req_ids),
+            "admission_would_drop_req_count": len(admission_would_drop_req_ids),
+            "step_would_drop_req_count": len(step_would_drop_req_ids),
+            "projected_miss_req_count": len(projected_miss_req_ids),
+            "would_drop_req_count": len(would_drop_req_ids),
+            "admission_would_drop_req_ids": admission_would_drop_req_ids[: self.pard_oracle_max_records],
+            "step_would_drop_req_ids": step_would_drop_req_ids[: self.pard_oracle_max_records],
+            "projected_miss_req_ids": projected_miss_req_ids[: self.pard_oracle_max_records],
+            "would_drop_req_ids": would_drop_req_ids[: self.pard_oracle_max_records],
+            "num_active_reqs": len(seen_req_ids),
+            "num_omitted_records": omitted_records,
+            "records": records,
+            "candidate_buckets": candidate_buckets[:8],
+        }
+
     @staticmethod
     def _has_deadline(states: list[DiffusionRequestState]) -> bool:
         return any(state.deadline_time_s is not None for state in states)
@@ -662,3 +894,21 @@ def _coerce_bool(value: Any, default: bool) -> bool:
     if isinstance(value, str):
         return value.strip().lower() in {"1", "true", "yes", "on"}
     return default
+
+
+def _coerce_pard_drop_mode(value: Any) -> str:
+    if value is None:
+        return "off"
+    mode = str(value).strip().lower()
+    if mode in {"admission_only", "step_boundary"}:
+        return mode
+    return "off"
+
+
+def _json_float(value: float) -> float | None:
+    return value if math.isfinite(value) else None
+
+
+def _sort_laxity(value: Any) -> float:
+    parsed = _coerce_float(value)
+    return parsed if parsed is not None else math.inf

@@ -24,6 +24,12 @@ if [[ -z "${CANDIDATE_POLICY}" ]]; then
   CANDIDATE_POLICY="slo_no_preemption_lookup"
   if [[ ",${POLICIES}," == *",slo_no_preemption_shape_guarded,"* ]]; then
     CANDIDATE_POLICY="slo_no_preemption_shape_guarded"
+  elif [[ ",${POLICIES}," == *",slo_no_preemption_pard_step_drop,"* ]]; then
+    CANDIDATE_POLICY="slo_no_preemption_pard_step_drop"
+  elif [[ ",${POLICIES}," == *",slo_no_preemption_pard_admission_drop,"* ]]; then
+    CANDIDATE_POLICY="slo_no_preemption_pard_admission_drop"
+  elif [[ ",${POLICIES}," == *",slo_no_preemption_pard_dry_run,"* ]]; then
+    CANDIDATE_POLICY="slo_no_preemption_pard_dry_run"
   elif [[ ",${POLICIES}," == *",slo_no_preemption_adaptive_guarded,"* ]]; then
     CANDIDATE_POLICY="slo_no_preemption_adaptive_guarded"
   elif [[ ",${POLICIES}," == *",slo_no_preemption_guarded,"* ]]; then
@@ -48,6 +54,10 @@ ADAPTIVE_STAGEPOOL_QUEUE_GUARD_MAX_QUEUE_LENGTH="${ADAPTIVE_STAGEPOOL_QUEUE_GUAR
 SHAPE_GUARDED_SMALL_SHAPE_MAX_AREA_RATIO="${SHAPE_GUARDED_SMALL_SHAPE_MAX_AREA_RATIO:-0.6}"
 SHAPE_GUARDED_SMALL_SHAPE_QUEUE_GUARD_WINDOW_MS="${SHAPE_GUARDED_SMALL_SHAPE_QUEUE_GUARD_WINDOW_MS:-20000}"
 SHAPE_GUARDED_SMALL_SHAPE_QUEUE_GUARD_MAX_QUEUE_LENGTH="${SHAPE_GUARDED_SMALL_SHAPE_QUEUE_GUARD_MAX_QUEUE_LENGTH:-4}"
+PARD_ORACLE_LAXITY_MARGIN_MS="${PARD_ORACLE_LAXITY_MARGIN_MS:-0}"
+PARD_ORACLE_MAX_RECORDS="${PARD_ORACLE_MAX_RECORDS:-16}"
+PARD_DROP_LAXITY_MARGIN_MS="${PARD_DROP_LAXITY_MARGIN_MS:-0}"
+PARD_DROP_MAX_PER_SCHEDULE="${PARD_DROP_MAX_PER_SCHEDULE:-0}"
 SKIP_EXISTING="${SKIP_EXISTING:-0}"
 ACTIVE_PID_FILE=""
 
@@ -86,7 +96,7 @@ validate_policy() {
   local policy="$1"
   validate_safe_token "policy" "${policy}"
   case "${policy}" in
-    current|stagepool_only|instance_only|constant_cost|formula_cost|full_slo|no_preemption|slo_no_preemption_lookup|slo_no_preemption_guarded|slo_no_preemption_adaptive_guarded|slo_no_preemption_shape_guarded|alpha0|alpha1) ;;
+    current|stagepool_only|instance_only|constant_cost|formula_cost|full_slo|no_preemption|slo_no_preemption_lookup|slo_no_preemption_guarded|slo_no_preemption_adaptive_guarded|slo_no_preemption_shape_guarded|slo_no_preemption_pard_dry_run|slo_no_preemption_pard_admission_drop|slo_no_preemption_pard_step_drop|alpha0|alpha1) ;;
     *)
       log "unknown policy: ${policy}"
       exit 2
@@ -307,7 +317,9 @@ make_additional_config() {
     "${ADAPTIVE_STAGEPOOL_QUEUE_GUARD_MAX_QUEUE_LENGTH}" \
     "${SHAPE_GUARDED_SMALL_SHAPE_MAX_AREA_RATIO}" \
     "${SHAPE_GUARDED_SMALL_SHAPE_QUEUE_GUARD_WINDOW_MS}" \
-    "${SHAPE_GUARDED_SMALL_SHAPE_QUEUE_GUARD_MAX_QUEUE_LENGTH}" <<'PY'
+    "${SHAPE_GUARDED_SMALL_SHAPE_QUEUE_GUARD_MAX_QUEUE_LENGTH}" \
+    "${PARD_ORACLE_LAXITY_MARGIN_MS}" "${PARD_ORACLE_MAX_RECORDS}" \
+    "${PARD_DROP_LAXITY_MARGIN_MS}" "${PARD_DROP_MAX_PER_SCHEDULE}" <<'PY'
 import json
 import sys
 
@@ -329,7 +341,11 @@ import sys
     shape_guarded_small_shape_max_area_ratio,
     shape_guarded_small_shape_queue_guard_window_ms,
     shape_guarded_small_shape_queue_guard_max_queue_length,
-) = sys.argv[1:18]
+    pard_oracle_laxity_margin_ms,
+    pard_oracle_max_records,
+    pard_drop_laxity_margin_ms,
+    pard_drop_max_per_schedule,
+) = sys.argv[1:22]
 config = {
     "diffusion_step_profile": {
         "enabled": True,
@@ -421,6 +437,49 @@ elif policy == "slo_no_preemption_adaptive_guarded":
         "stagepool_queue_guard_window_ms": float(adaptive_stagepool_queue_guard_window_ms),
         "stagepool_queue_guard_max_queue_length": int(float(adaptive_stagepool_queue_guard_max_queue_length)),
         "no_preemption_admission_max_batch_size": int(float(guarded_no_preemption_admission_max_batch_size)),
+    }
+elif policy == "slo_no_preemption_pard_dry_run":
+    config["diffusion_scheduler_policy"] = "slo"
+    config["diffusion_slo_scheduler"] = {
+        **lookup,
+        "enable_stagepool_slo": True,
+        "enable_step_preemption": False,
+        "no_preemption_admission_guard": True,
+        "stagepool_laxity_window_ms": float(guarded_stagepool_laxity_window_ms),
+        "stagepool_pack_min_laxity_ms": float(stagepool_pack_min_laxity_ms),
+        "stagepool_pack_max_queue_length": int(float(guarded_stagepool_pack_max_queue_length)),
+        "stagepool_pack_max_matching_bucket_size": int(float(guarded_stagepool_pack_max_matching_bucket_size)),
+        "stagepool_queue_guard_window_ms": float(adaptive_stagepool_queue_guard_window_ms),
+        "stagepool_queue_guard_max_queue_length": int(float(adaptive_stagepool_queue_guard_max_queue_length)),
+        "no_preemption_admission_max_batch_size": int(float(guarded_no_preemption_admission_max_batch_size)),
+        "pard_oracle_enabled": True,
+        "pard_oracle_laxity_margin_ms": float(pard_oracle_laxity_margin_ms),
+        "pard_oracle_max_records": int(float(pard_oracle_max_records)),
+    }
+elif policy in {"slo_no_preemption_pard_admission_drop", "slo_no_preemption_pard_step_drop"}:
+    config["diffusion_scheduler_policy"] = "slo"
+    config["diffusion_slo_scheduler"] = {
+        **lookup,
+        "enable_stagepool_slo": True,
+        "enable_step_preemption": False,
+        "no_preemption_admission_guard": True,
+        "stagepool_laxity_window_ms": float(guarded_stagepool_laxity_window_ms),
+        "stagepool_pack_min_laxity_ms": float(stagepool_pack_min_laxity_ms),
+        "stagepool_pack_max_queue_length": int(float(guarded_stagepool_pack_max_queue_length)),
+        "stagepool_pack_max_matching_bucket_size": int(float(guarded_stagepool_pack_max_matching_bucket_size)),
+        "stagepool_queue_guard_window_ms": float(adaptive_stagepool_queue_guard_window_ms),
+        "stagepool_queue_guard_max_queue_length": int(float(adaptive_stagepool_queue_guard_max_queue_length)),
+        "no_preemption_admission_max_batch_size": int(float(guarded_no_preemption_admission_max_batch_size)),
+        "pard_oracle_enabled": True,
+        "pard_oracle_laxity_margin_ms": float(pard_oracle_laxity_margin_ms),
+        "pard_oracle_max_records": int(float(pard_oracle_max_records)),
+        "pard_drop_mode": (
+            "admission_only"
+            if policy == "slo_no_preemption_pard_admission_drop"
+            else "step_boundary"
+        ),
+        "pard_drop_laxity_margin_ms": float(pard_drop_laxity_margin_ms),
+        "pard_drop_max_per_schedule": int(float(pard_drop_max_per_schedule)),
     }
 elif policy == "slo_no_preemption_shape_guarded":
     config["diffusion_scheduler_policy"] = "slo"

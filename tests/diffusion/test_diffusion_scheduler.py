@@ -5,6 +5,7 @@ import asyncio
 import json
 import queue
 import threading
+import time
 from types import SimpleNamespace
 
 import pytest
@@ -739,6 +740,23 @@ class TestStepScheduler:
         assert finished == {req_id}
         assert self.scheduler.get_request_state(req_id).status == DiffusionRequestStatus.FINISHED_ABORTED
 
+    def test_unscheduled_finished_ids_are_returned_after_non_empty_step(self) -> None:
+        req_id_a = self.scheduler.add_request(_make_step_request("a", num_inference_steps=2))
+        req_id_b = self.scheduler.add_request(_make_step_request("b", num_inference_steps=2))
+        self.scheduler.finish_requests(req_id_b, DiffusionRequestStatus.FINISHED_ABORTED)
+
+        sched_output = self.scheduler.schedule()
+        assert _new_ids(sched_output) == [req_id_a]
+        assert sched_output.finished_req_ids == {req_id_b}
+
+        finished = self.scheduler.update_from_output(
+            sched_output,
+            _make_step_output(req_id_a, step_index=1),
+        )
+
+        assert finished == {req_id_b}
+        assert self.scheduler.get_request_state(req_id_b).status == DiffusionRequestStatus.FINISHED_ABORTED
+
     def test_batches_compatible_step_requests(self) -> None:
         scheduler = StepScheduler()
         scheduler.initialize(SimpleNamespace(max_num_seqs=2))
@@ -1244,6 +1262,185 @@ class TestSloStepScheduler:
         assert sched_output.num_running_reqs == 2
         assert sched_output.num_waiting_reqs == 2
         assert scheduler.get_load_snapshot()["no_preemption_admission_max_batch_size"] == 2
+
+    def test_pard_dry_run_oracle_reports_admission_and_step_drop_candidates(self) -> None:
+        scheduler = self._make_scheduler(
+            max_num_seqs=2,
+            slo_config={
+                "default_step_ms": 100.0,
+                "batch_growth_alpha": 0.0,
+                "enable_step_preemption": False,
+                "pard_oracle_enabled": True,
+                "pard_oracle_laxity_margin_ms": 0.0,
+            },
+        )
+
+        running = scheduler.add_request(
+            _make_slo_step_request(
+                "running",
+                reference_cost_ms=1000,
+                slo_ms=150,
+                num_inference_steps=10,
+            )
+        )
+        first = scheduler.schedule()
+
+        first_oracle = first.debug_info["pard_oracle"]
+        assert first_oracle["dry_run_only"] is True
+        assert first_oracle["admission_would_drop_req_count"] == 1
+        assert first_oracle["admission_would_drop_req_ids"] == [running]
+        assert _new_ids(first) == [running]
+
+        scheduler.update_from_output(first, _make_step_output(running, step_index=1))
+        second = scheduler.schedule()
+
+        second_oracle = second.debug_info["pard_oracle"]
+        assert second_oracle["step_would_drop_req_count"] == 1
+        assert second_oracle["step_would_drop_req_ids"] == [running]
+        assert second_oracle["would_drop_req_ids"] == [running]
+        assert _cached_ids(second) == [running]
+
+    def test_pard_dry_run_oracle_is_disabled_by_default(self) -> None:
+        scheduler = self._make_scheduler(max_num_seqs=2)
+        scheduler.add_request(_make_slo_step_request("a", reference_cost_ms=100, slo_ms=1000))
+
+        sched_output = scheduler.schedule()
+
+        assert sched_output.debug_info is not None
+        assert "pard_oracle" not in sched_output.debug_info
+        assert "pard_oracle" not in scheduler.get_load_snapshot()
+
+    def test_pard_dry_run_oracle_debug_is_json_safe_and_truncated(self) -> None:
+        scheduler = self._make_scheduler(
+            max_num_seqs=4,
+            slo_config={
+                "default_step_ms": 100.0,
+                "batch_growth_alpha": 0.0,
+                "enable_step_preemption": False,
+                "pard_oracle_enabled": True,
+                "pard_oracle_snapshot_enabled": True,
+                "pard_oracle_laxity_margin_ms": 0.0,
+                "pard_oracle_max_records": 1,
+            },
+        )
+        for idx in range(3):
+            scheduler.add_request(
+                _make_slo_step_request(
+                    f"req-{idx}",
+                    reference_cost_ms=1000,
+                    slo_ms=150,
+                    num_inference_steps=10,
+                )
+            )
+        scheduler.add_request(
+            _make_step_request(
+                "no-deadline",
+                sampling_params=OmniDiffusionSamplingParams(
+                    height=768,
+                    width=768,
+                    num_inference_steps=10,
+                ),
+            )
+        )
+
+        sched_output = scheduler.schedule()
+        oracle = sched_output.debug_info["pard_oracle"]
+
+        assert len(oracle["records"]) == 1
+        assert oracle["num_omitted_records"] == 3
+        assert oracle["admission_would_drop_req_count"] == 3
+        assert oracle["would_drop_req_count"] == 3
+        assert len(oracle["admission_would_drop_req_ids"]) == 1
+        assert len(oracle["would_drop_req_ids"]) == 1
+        json.dumps(sched_output.debug_info, allow_nan=False)
+        json.dumps(scheduler.get_load_snapshot(), allow_nan=False)
+
+    def test_pard_admission_drop_aborts_only_waiting_requests(self) -> None:
+        scheduler = self._make_scheduler(
+            max_num_seqs=2,
+            slo_config={
+                "default_step_ms": 100.0,
+                "batch_growth_alpha": 0.0,
+                "enable_step_preemption": False,
+                "pard_drop_mode": "admission_only",
+                "pard_drop_laxity_margin_ms": 0.0,
+            },
+        )
+        doomed = scheduler.add_request(
+            _make_slo_step_request(
+                "doomed",
+                reference_cost_ms=1000,
+                slo_ms=150,
+                num_inference_steps=10,
+            )
+        )
+
+        sched_output = scheduler.schedule()
+
+        assert sched_output.finished_req_ids == {doomed}
+        assert sched_output.is_empty
+        state = scheduler.get_request_state(doomed)
+        assert state.status == DiffusionRequestStatus.FINISHED_ABORTED
+
+    def test_pard_admission_drop_keeps_doomed_resident_request(self) -> None:
+        scheduler = self._make_scheduler(
+            max_num_seqs=2,
+            slo_config={
+                "default_step_ms": 100.0,
+                "batch_growth_alpha": 0.0,
+                "enable_step_preemption": False,
+                "pard_drop_mode": "admission_only",
+                "pard_drop_laxity_margin_ms": 0.0,
+            },
+        )
+        running = scheduler.add_request(
+            _make_slo_step_request(
+                "running",
+                reference_cost_ms=1000,
+                slo_ms=10000,
+                num_inference_steps=10,
+            )
+        )
+        first = scheduler.schedule()
+        assert _new_ids(first) == [running]
+        assert scheduler.update_from_output(first, _make_step_output(running, step_index=1)) == set()
+        scheduler.get_request_state(running).deadline_time_s = time.time() - 1.0
+
+        second = scheduler.schedule()
+
+        assert second.finished_req_ids == set()
+        assert _cached_ids(second) == [running]
+        assert scheduler.get_request_state(running).status == DiffusionRequestStatus.RUNNING
+
+    def test_pard_step_boundary_drop_aborts_resident_request(self) -> None:
+        scheduler = self._make_scheduler(
+            max_num_seqs=2,
+            slo_config={
+                "default_step_ms": 100.0,
+                "batch_growth_alpha": 0.0,
+                "enable_step_preemption": False,
+                "pard_drop_mode": "step_boundary",
+                "pard_drop_laxity_margin_ms": 0.0,
+            },
+        )
+        running = scheduler.add_request(
+            _make_slo_step_request(
+                "running",
+                reference_cost_ms=1000,
+                slo_ms=10000,
+                num_inference_steps=10,
+            )
+        )
+        first = scheduler.schedule()
+        assert _new_ids(first) == [running]
+        assert scheduler.update_from_output(first, _make_step_output(running, step_index=1)) == set()
+        scheduler.get_request_state(running).deadline_time_s = time.time() - 1.0
+
+        second = scheduler.schedule()
+
+        assert second.finished_req_ids == {running}
+        assert second.is_empty
+        assert scheduler.get_request_state(running).status == DiffusionRequestStatus.FINISHED_ABORTED
 
     def test_same_key_batch_formation_preserves_absolute_deadline_guard_priority(self) -> None:
         scheduler = self._make_scheduler(
