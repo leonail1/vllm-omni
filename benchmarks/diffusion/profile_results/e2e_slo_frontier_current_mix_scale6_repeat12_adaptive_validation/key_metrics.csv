@@ -1,0 +1,5 @@
+workload,interarrival_s,slo_scale,policy,repeats,missing_runs,slo_miss_rate,goodput_rps,throughput_rps,latency_p95_s,mean_bucket_size,p95_bucket_size,bucket_ge3_count,bucket_total_count,bucket_ge3_fraction
+current-mix,2.5,6.0,current,2,0,0.200000,0.159023,0.198778,153.935539,1.300337,2.500000,216,4622,0.046733
+current-mix,2.5,6.0,slo_no_preemption_lookup,2,0,0.150000,0.193783,0.227980,157.433716,1.693496,4.000000,687,3543,0.193903
+current-mix,2.5,6.0,slo_no_preemption_guarded,2,0,0.175000,0.178193,0.216069,138.151643,1.727419,3.000000,783,3474,0.225389
+current-mix,2.5,6.0,slo_no_preemption_adaptive_guarded,2,0,0.116667,0.216359,0.244935,127.122090,1.742304,3.000000,696,3449,0.201798
