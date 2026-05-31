@@ -1,0 +1,35 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="920" height="460" viewBox="0 0 920 460">
+<rect width="100%" height="100%" fill="#ffffff"/>
+<text x="460.0" y="34" text-anchor="middle" font-family="Arial" font-size="20" font-weight="700" fill="#1f2937">Shape-Level Miss Rate</text>
+<text x="20" y="215.0" transform="rotate(-90 20 215.0)" text-anchor="middle" font-family="Arial" font-size="12" fill="#475569">miss rate</text>
+<line x1="80" y1="360.00" x2="890" y2="360.00" stroke="#e5e7eb" stroke-width="1"/>
+<text x="70" y="364.00" text-anchor="end" font-family="Arial" font-size="11" fill="#64748b">0.0%</text>
+<line x1="80" y1="287.50" x2="890" y2="287.50" stroke="#e5e7eb" stroke-width="1"/>
+<text x="70" y="291.50" text-anchor="end" font-family="Arial" font-size="11" fill="#64748b">23.3%</text>
+<line x1="80" y1="215.00" x2="890" y2="215.00" stroke="#e5e7eb" stroke-width="1"/>
+<text x="70" y="219.00" text-anchor="end" font-family="Arial" font-size="11" fill="#64748b">46.7%</text>
+<line x1="80" y1="142.50" x2="890" y2="142.50" stroke="#e5e7eb" stroke-width="1"/>
+<text x="70" y="146.50" text-anchor="end" font-family="Arial" font-size="11" fill="#64748b">70.0%</text>
+<line x1="80" y1="70.00" x2="890" y2="70.00" stroke="#e5e7eb" stroke-width="1"/>
+<text x="70" y="74.00" text-anchor="end" font-family="Arial" font-size="11" fill="#64748b">93.3%</text>
+<line x1="80" y1="360" x2="890" y2="360" stroke="#334155" stroke-width="1"/>
+<rect x="177.00" y="265.06" width="34.00" height="94.94" rx="3" fill="#2563eb"/>
+<text x="194.00" y="260.06" text-anchor="middle" font-family="Arial" font-size="10" fill="#334155">30.6%</text>
+<rect x="219.00" y="252.11" width="34.00" height="107.89" rx="3" fill="#f97316"/>
+<text x="236.00" y="247.11" text-anchor="middle" font-family="Arial" font-size="10" fill="#334155">34.7%</text>
+<text x="215.00" y="388" text-anchor="middle" font-family="Arial" font-size="12" fill="#334155">1024x1024</text>
+<rect x="447.00" y="217.59" width="34.00" height="142.41" rx="3" fill="#2563eb"/>
+<text x="464.00" y="212.59" text-anchor="middle" font-family="Arial" font-size="10" fill="#334155">45.8%</text>
+<rect x="489.00" y="101.07" width="34.00" height="258.93" rx="3" fill="#f97316"/>
+<text x="506.00" y="96.07" text-anchor="middle" font-family="Arial" font-size="10" fill="#334155">83.3%</text>
+<text x="485.00" y="388" text-anchor="middle" font-family="Arial" font-size="12" fill="#334155">512x512</text>
+<rect x="717.00" y="114.02" width="34.00" height="245.98" rx="3" fill="#2563eb"/>
+<text x="734.00" y="109.02" text-anchor="middle" font-family="Arial" font-size="10" fill="#334155">79.2%</text>
+<rect x="759.00" y="256.43" width="34.00" height="103.57" rx="3" fill="#f97316"/>
+<text x="776.00" y="251.43" text-anchor="middle" font-family="Arial" font-size="10" fill="#334155">33.3%</text>
+<text x="755.00" y="388" text-anchor="middle" font-family="Arial" font-size="12" fill="#334155">768x768</text>
+<rect x="80" y="424" width="14" height="14" rx="2" fill="#2563eb"/>
+<text x="100" y="436" font-family="Arial" font-size="12" fill="#334155">q3</text>
+<rect x="310" y="424" width="14" height="14" rx="2" fill="#f97316"/>
+<text x="330" y="436" font-family="Arial" font-size="12" fill="#334155">default adaptive</text>
+</svg>

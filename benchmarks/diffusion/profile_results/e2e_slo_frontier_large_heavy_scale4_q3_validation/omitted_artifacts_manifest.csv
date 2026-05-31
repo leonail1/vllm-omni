@@ -1,0 +1,15 @@
+source_path,artifact_type,reason
+/home/lzg/vllm-omni/benchmark_outputs/e2e_slo_frontier_large_heavy_scale4_q3_validation/runner.log,log,raw runtime log omitted from GitHub-safe package
+/home/lzg/vllm-omni/benchmark_outputs/e2e_slo_frontier_large_heavy_scale4_q3_validation/status.json,status_json,status JSON omitted; completion summarized in README
+/home/lzg/vllm-omni/benchmark_outputs/e2e_slo_frontier_large_heavy_scale4_q3_validation/frontier_summary.json,summary_json,raw JSON omitted; derived CSVs included
+/home/lzg/vllm-omni/benchmark_outputs/e2e_slo_frontier_large_heavy_scale4_q3_validation/frontier_summary.stdout.json,summary_json,raw JSON omitted; derived CSVs included
+/home/lzg/vllm-omni/benchmark_outputs/e2e_slo_frontier_large_heavy_scale4_q3_validation/qwen_image_4replicas_tp2.yaml,runtime_config,runtime config omitted; command captured in README
+/home/lzg/vllm-omni/benchmark_outputs/e2e_slo_frontier_large_heavy_scale4_q3_validation/large-heavy/ia_2p5/slo_no_preemption_adaptive_guarded/repeat_2/scale_4/benchmark_result.json,benchmark_result_json,raw per-request benchmark payload omitted
+/home/lzg/vllm-omni/benchmark_outputs/e2e_slo_frontier_large_heavy_scale4_q3_validation/large-heavy/ia_2p5/slo_no_preemption_adaptive_guarded/repeat_2/scale_4/client.log,log,client log omitted; key metrics captured in CSV
+/home/lzg/vllm-omni/benchmark_outputs/e2e_slo_frontier_large_heavy_scale4_q3_validation/large-heavy/ia_2p5/slo_no_preemption_adaptive_guarded/repeat_2/scale_4/trace.txt,trace,request trace omitted
+/home/lzg/vllm-omni/benchmark_outputs/e2e_slo_frontier_large_heavy_scale4_q3_validation/large-heavy/ia_2p5/slo_no_preemption_adaptive_guarded/repeat_2/scale_4/trace.txt.manifest.json,trace_manifest_json,trace manifest omitted
+/home/lzg/vllm-omni/benchmark_outputs/e2e_slo_frontier_large_heavy_scale4_q3_validation/slo_no_preemption_adaptive_guarded/server.log,log,server log omitted; shutdown warning summarized in README
+/home/lzg/vllm-omni/benchmark_outputs/e2e_slo_frontier_large_heavy_scale4_q3_validation/slo_no_preemption_adaptive_guarded/stagepool_profile.jsonl,raw_profile_jsonl,raw profile omitted; derived distribution CSV included
+/home/lzg/vllm-omni/benchmark_outputs/e2e_slo_frontier_large_heavy_scale4_q3_validation/slo_no_preemption_adaptive_guarded/step_cost_raw*.jsonl,raw_profile_jsonl,raw step profiles omitted; derived bucket metrics included
+/home/lzg/vllm-omni/benchmark_outputs/e2e_slo_frontier_large_heavy_adaptive_q3_pilot/large-heavy/ia_2p5/slo_no_preemption_adaptive_guarded/repeat_1/scale_4/benchmark_result.json,benchmark_result_json,q3 repeat1 raw benchmark payload omitted; top-line read from committed partial CSV
+/home/lzg/vllm-omni/benchmark_outputs/e2e_slo_frontier_large_heavy_adaptive_q3_pilot/slo_no_preemption_adaptive_guarded/stagepool_profile.jsonl,raw_profile_jsonl,q3 repeat1 raw profile omitted; derived drilldowns only

@@ -1,0 +1,19 @@
+group,source,workload,policy,repeat,slo_scale,shape,requests,misses,miss_rate,default_miss_rate,q3_minus_default_miss_rate_pp,source_note
+q3,committed_q3_partial_package,large-heavy,slo_no_preemption_adaptive_guarded,1,4.0,1024x1024,36,9,0.25,,,repeat1 top-line from partial package; drilldown reconstructed from matching benchmark output summary
+q3,committed_q3_partial_package,large-heavy,slo_no_preemption_adaptive_guarded,1,4.0,512x512,12,7,0.5833333333333334,,,repeat1 top-line from partial package; drilldown reconstructed from matching benchmark output summary
+q3,committed_q3_partial_package,large-heavy,slo_no_preemption_adaptive_guarded,1,4.0,768x768,12,10,0.8333333333333334,,,repeat1 top-line from partial package; drilldown reconstructed from matching benchmark output summary
+q3,validation_outdir_repeat2,large-heavy,slo_no_preemption_adaptive_guarded,2,4.0,1024x1024,36,13,0.3611111111111111,,,validation outdir summary
+q3,validation_outdir_repeat2,large-heavy,slo_no_preemption_adaptive_guarded,2,4.0,512x512,12,4,0.3333333333333333,,,validation outdir summary
+q3,validation_outdir_repeat2,large-heavy,slo_no_preemption_adaptive_guarded,2,4.0,768x768,12,9,0.75,,,validation outdir summary
+default_adaptive,committed_high_load_scale46_caveat_repeat1_2,large-heavy,slo_no_preemption_adaptive_guarded,1,4.0,1024x1024,36,12,0.3333333333333333,,,committed default adaptive package
+default_adaptive,committed_high_load_scale46_caveat_repeat1_2,large-heavy,slo_no_preemption_adaptive_guarded,1,4.0,512x512,12,12,1.0,,,committed default adaptive package
+default_adaptive,committed_high_load_scale46_caveat_repeat1_2,large-heavy,slo_no_preemption_adaptive_guarded,1,4.0,768x768,12,2,0.16666666666666666,,,committed default adaptive package
+default_adaptive,committed_high_load_scale46_caveat_repeat1_2,large-heavy,slo_no_preemption_adaptive_guarded,2,4.0,1024x1024,36,13,0.3611111111111111,,,committed default adaptive package
+default_adaptive,committed_high_load_scale46_caveat_repeat1_2,large-heavy,slo_no_preemption_adaptive_guarded,2,4.0,512x512,12,8,0.6666666666666666,,,committed default adaptive package
+default_adaptive,committed_high_load_scale46_caveat_repeat1_2,large-heavy,slo_no_preemption_adaptive_guarded,2,4.0,768x768,12,6,0.5,,,committed default adaptive package
+q3_combined,q3_repeat1_2,large-heavy,slo_no_preemption_adaptive_guarded,1;2,4.0,1024x1024,72,22,0.3055555555555556,0.3472222222222222,-4.1666666666666625,combined counts across repeats
+q3_combined,q3_repeat1_2,large-heavy,slo_no_preemption_adaptive_guarded,1;2,4.0,512x512,24,11,0.4583333333333333,0.8333333333333334,-37.50000000000001,combined counts across repeats
+q3_combined,q3_repeat1_2,large-heavy,slo_no_preemption_adaptive_guarded,1;2,4.0,768x768,24,19,0.7916666666666666,0.3333333333333333,45.83333333333333,combined counts across repeats
+default_adaptive_combined,default_adaptive_repeat1_2,large-heavy,slo_no_preemption_adaptive_guarded,1;2,4.0,1024x1024,72,25,0.3472222222222222,,,combined counts across repeats
+default_adaptive_combined,default_adaptive_repeat1_2,large-heavy,slo_no_preemption_adaptive_guarded,1;2,4.0,512x512,24,20,0.8333333333333334,,,combined counts across repeats
+default_adaptive_combined,default_adaptive_repeat1_2,large-heavy,slo_no_preemption_adaptive_guarded,1;2,4.0,768x768,24,8,0.3333333333333333,,,combined counts across repeats
