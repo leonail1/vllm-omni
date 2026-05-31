@@ -1,0 +1,30 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="820" height="420" viewBox="0 0 820 420">
+<rect width="100%" height="100%" fill="#ffffff"/>
+<text x="410.0" y="30" text-anchor="middle" font-family="Arial" font-size="20" font-weight="700">q3 partial: miss rate and bucket &gt;=3</text>
+<line x1="82" y1="306" x2="732" y2="306" stroke="#111827"/>
+<line x1="82" y1="56" x2="82" y2="306" stroke="#111827"/>
+<line x1="78" y1="306.0" x2="732" y2="306.0" stroke="#e5e7eb"/>
+<text x="72" y="310.0" text-anchor="end" font-family="Arial" font-size="11">0%</text>
+<line x1="78" y1="256.0" x2="732" y2="256.0" stroke="#e5e7eb"/>
+<text x="72" y="260.0" text-anchor="end" font-family="Arial" font-size="11">10%</text>
+<line x1="78" y1="206.0" x2="732" y2="206.0" stroke="#e5e7eb"/>
+<text x="72" y="210.0" text-anchor="end" font-family="Arial" font-size="11">20%</text>
+<line x1="78" y1="156.0" x2="732" y2="156.0" stroke="#e5e7eb"/>
+<text x="72" y="160.0" text-anchor="end" font-family="Arial" font-size="11">30%</text>
+<line x1="78" y1="106.0" x2="732" y2="106.0" stroke="#e5e7eb"/>
+<text x="72" y="110.0" text-anchor="end" font-family="Arial" font-size="11">40%</text>
+<line x1="78" y1="56.0" x2="732" y2="56.0" stroke="#e5e7eb"/>
+<text x="72" y="60.0" text-anchor="end" font-family="Arial" font-size="11">50%</text>
+<rect x="178.5" y="88.6" width="58" height="217.4" fill="#2563eb"/>
+<text x="207.5" y="82.6" text-anchor="middle" font-family="Arial" font-size="11">43.3%</text>
+<rect x="244.5" y="167.7" width="58" height="138.3" fill="#dc2626"/>
+<text x="273.5" y="161.7" text-anchor="middle" font-family="Arial" font-size="11">27.6%</text>
+<text x="244.5" y="334" text-anchor="middle" font-family="Arial" font-size="12">scale 4</text>
+<rect x="503.5" y="147.1" width="58" height="158.9" fill="#2563eb"/>
+<text x="532.5" y="141.1" text-anchor="middle" font-family="Arial" font-size="11">31.7%</text>
+<rect x="569.5" y="137.0" width="58" height="169.0" fill="#dc2626"/>
+<text x="598.5" y="131.0" text-anchor="middle" font-family="Arial" font-size="11">33.7%</text>
+<text x="569.5" y="334" text-anchor="middle" font-family="Arial" font-size="12">scale 6</text>
+<rect x="82" y="370" width="12" height="12" fill="#2563eb"/><text x="100" y="380" font-family="Arial" font-size="12">miss rate</text>
+<rect x="212" y="370" width="12" height="12" fill="#dc2626"/><text x="230" y="380" font-family="Arial" font-size="12">bucket &gt;=3</text>
+</svg>
