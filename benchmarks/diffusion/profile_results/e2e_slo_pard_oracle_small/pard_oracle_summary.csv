@@ -1,5 +1,0 @@
-workload,interarrival_s,policy,repeat,slo_scale,profile_steps,oracle_steps,admission_would_drop_total,step_would_drop_total,would_drop_total,projected_miss_total,admission_would_drop_event_steps,step_would_drop_event_steps,would_drop_event_steps,projected_miss_event_steps,max_active_reqs
-current-mix,2.5,slo_no_preemption_pard_dry_run,0,4.0,1941,1941,447,719,1166,1179,351,523,642,642,9
-current-mix,2.5,slo_no_preemption_pard_dry_run,0,6.0,1729,1729,273,264,537,602,195,197,343,359,8
-shape-grouped-current-mix,2.5,slo_no_preemption_pard_dry_run,0,4.0,1571,1571,211,346,557,588,141,199,291,322,7
-shape-grouped-current-mix,2.5,slo_no_preemption_pard_dry_run,0,6.0,1540,1540,22,196,218,218,14,107,120,120,8

@@ -233,14 +233,11 @@ class _BaseScheduler(SchedulerInterface):
         statuses: dict[str, DiffusionRequestStatus],
         errors: dict[str, str | None] | None = None,
     ) -> set[str]:
-        # schedule() can surface finished ids that were not executed in this
-        # step, for example a waiting request aborted while another request
-        # is still runnable. Preserve those ids so the engine can complete
-        # their futures even when the schedule is otherwise non-empty.
-        finished_req_ids = set(sched_output.finished_req_ids)
-        # A scheduled request may also be aborted after schedule() but before
-        # update_from_output() processes the runner output.
-        finished_req_ids |= {
+        # A scheduled request may be aborted after schedule() but before
+        # update_from_output() processes the runner output. It is already
+        # marked finished at that point, but we still need to surface its id
+        # in this update so the engine can observe the terminal state.
+        finished_req_ids = {
             sched_req_id for sched_req_id in sched_output.scheduled_req_ids if sched_req_id in self._finished_req_ids
         }
         finished_req_ids |= self._finish_requests(statuses, errors)

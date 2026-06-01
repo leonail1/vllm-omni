@@ -1,9 +1,0 @@
-policy,workload,interarrival_s,slo_scale,profile_drop_events,profile_drop_req_records,waiting_drop_records,resident_drop_records,min_optimistic_laxity_ms,mean_optimistic_laxity_ms,max_optimistic_laxity_ms
-slo_no_preemption_pard_admission_drop,current-mix,2.5,4.0,2,2,2,0,-498.4155371785164,-286.23268473893404,-74.04983229935169
-slo_no_preemption_pard_admission_drop,current-mix,2.5,6.0,1,1,1,0,-505.0736144185066,-505.0736144185066,-505.0736144185066
-slo_no_preemption_pard_admission_drop,shape-grouped-current-mix,2.5,4.0,1,1,1,0,-357.77231492102146,-357.77231492102146,-357.77231492102146
-slo_no_preemption_pard_admission_drop,shape-grouped-current-mix,2.5,6.0,2,2,2,0,-1217.7089471369982,-635.4091186076403,-53.109290078282356
-slo_no_preemption_pard_step_drop,current-mix,2.5,4.0,2,2,2,0,-763.6061925441027,-438.8811606913805,-114.15612883865833
-slo_no_preemption_pard_step_drop,current-mix,2.5,6.0,1,1,1,0,-873.1609061360359,-873.1609061360359,-873.1609061360359
-slo_no_preemption_pard_step_drop,shape-grouped-current-mix,2.5,4.0,1,1,1,0,-433.0869931727648,-433.0869931727648,-433.0869931727648
-slo_no_preemption_pard_step_drop,shape-grouped-current-mix,2.5,6.0,1,1,1,0,-82.28767104446888,-82.28767104446888,-82.28767104446888
