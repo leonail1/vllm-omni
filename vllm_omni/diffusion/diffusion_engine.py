@@ -32,6 +32,7 @@ from vllm_omni.diffusion.registry import (
 )
 from vllm_omni.diffusion.request import OmniDiffusionRequest
 from vllm_omni.diffusion.sched import RequestScheduler, SchedulerInterface, SloStepScheduler, StepScheduler
+from vllm_omni.diffusion.sched.base_scheduler import qwen_image_dynamic_step_batching_enabled
 from vllm_omni.diffusion.sched.interface import DiffusionRequestStatus
 from vllm_omni.diffusion.worker.utils import BatchRunnerOutput, RunnerOutput
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams, OmniTextPrompt
@@ -180,6 +181,17 @@ class DiffusionEngine:
                 or additional_config.get("scheduler_policy")
             )
             if isinstance(policy, str) and policy.lower() in {"slo", "slo_aware", "bucket_slo"}:
+                if (
+                    getattr(od_config, "step_execution", False)
+                    and getattr(od_config, "model_class_name", None) == "QwenImagePipeline"
+                    and qwen_image_dynamic_step_batching_enabled(od_config)
+                ):
+                    raise ValueError(
+                        "Qwen-Image dynamic step batching cannot be combined with the current "
+                        "shape-bucket SLO scheduler. Use the non-SLO pr4024_dynamic baseline, "
+                        "or disable diffusion_dynamic_step_batching_enabled until token-level "
+                        "SLO cost estimation is implemented."
+                    )
                 return SloStepScheduler()
         return StepScheduler()
 

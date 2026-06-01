@@ -1,0 +1,5 @@
+run,workload,interarrival_s,policy,replicas,tp_size,max_num_seqs,requests,successful_requests,miss_rate,goodput_rps,throughput_rps,latency_p95_s,status,note
+smoke_without_cli_eager,current-mix,2.5,current,4,1,4,12,12,0.000000,0.149632,0.149632,46.950521,ok,baseline current run
+smoke_without_cli_eager,current-mix,2.5,pr4024_dynamic,4,1,4,12,12,0.000000,0.145585,0.145585,52.797939,ok,PR4024 policy did not enter dynamic batch because serve lacked CLI --enforce-eager before the script fix.
+forced_cli_eager_default_backend,current-mix,0.1,pr4024_dynamic,1,1,4,8,0,,,,,blocked_startup,Qwen-Image dynamic step batching requires FlashAttention backend
+forced_cli_eager_flash_backend,current-mix,0.1,pr4024_dynamic,1,1,4,4,0,,,,,blocked_startup,FlashAttentionBackend NPU implementation requires MindIE-SD

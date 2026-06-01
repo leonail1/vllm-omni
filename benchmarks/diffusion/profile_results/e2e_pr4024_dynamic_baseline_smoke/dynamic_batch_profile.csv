@@ -1,0 +1,5 @@
+run,policy,profile_rows,max_batch_size,batch_size_distribution
+smoke_without_cli_eager,current,550,2,"{""1"": 496, ""2"": 54}"
+smoke_without_cli_eager,pr4024_dynamic,604,1,"{""1"": 604}"
+forced_cli_eager_default_backend,pr4024_dynamic,0,n/a,n/a: startup blocked before benchmark result
+forced_cli_eager_flash_backend,pr4024_dynamic,0,n/a,n/a: startup blocked before benchmark result

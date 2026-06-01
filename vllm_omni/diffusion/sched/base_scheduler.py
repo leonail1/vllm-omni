@@ -29,17 +29,74 @@ logger = init_logger(__name__)
 _KEY_FIELD_NAMES = frozenset(f.name for f in fields(SamplingParamsKey)) - {"lora_int_id"}
 
 
-def get_sampling_params_key(request: OmniDiffusionRequest) -> SamplingParamsKey | None:
+def get_sampling_params_key(
+    request: OmniDiffusionRequest,
+    od_config: OmniDiffusionConfig | None = None,
+) -> SamplingParamsKey | None:
     """Build a batch-compatibility key from the request's sampling params."""
     if len(request.prompts) != 1:
         return None
 
     sampling = request.sampling_params
     lora_request = getattr(sampling, "lora_request", None)
+    do_classifier_free_guidance = getattr(sampling, "do_classifier_free_guidance", False)
+
+    key_values = {name: getattr(sampling, name) for name in _KEY_FIELD_NAMES}
+    if (
+        od_config is not None
+        and getattr(od_config, "step_execution", False)
+        and getattr(od_config, "model_class_name", None) == "QwenImagePipeline"
+        and qwen_image_dynamic_step_batching_enabled(od_config)
+    ):
+        true_cfg_scale = getattr(sampling, "true_cfg_scale", None)
+        true_cfg_scale = 4.0 if true_cfg_scale is None else true_cfg_scale
+        has_negative_prompt = any(
+            not isinstance(prompt, str) and prompt.get("negative_prompt") is not None for prompt in request.prompts
+        )
+        do_classifier_free_guidance = true_cfg_scale > 1 and has_negative_prompt
+        key_values = {
+            "do_classifier_free_guidance": do_classifier_free_guidance,
+            "lora_scale": getattr(sampling, "lora_scale", 1.0),
+        }
+    else:
+        key_values["do_classifier_free_guidance"] = do_classifier_free_guidance
+
     return SamplingParamsKey(
         lora_int_id=lora_request.lora_int_id if lora_request is not None else None,
-        **{name: getattr(sampling, name) for name in _KEY_FIELD_NAMES},
+        **key_values,
     )
+
+
+def qwen_image_dynamic_step_batching_enabled(od_config: OmniDiffusionConfig) -> bool:
+    additional_config = getattr(od_config, "additional_config", None)
+    value = None
+    if isinstance(additional_config, dict):
+        value = additional_config.get("diffusion_dynamic_step_batching_enabled")
+        if value is None:
+            value = additional_config.get("dynamic_step_batching_enabled")
+    if isinstance(value, str):
+        value = value.strip().lower() not in {"0", "false", "no", "off"}
+    if not bool(value):
+        return False
+
+    if not getattr(od_config, "enforce_eager", False):
+        return False
+    if getattr(od_config, "cache_backend", "none") not in (None, "none"):
+        return False
+    if getattr(od_config, "diffusion_kv_cache_dtype", None) is not None:
+        return False
+
+    parallel_config = getattr(od_config, "parallel_config", None)
+    if parallel_config is not None:
+        if getattr(parallel_config, "sequence_parallel_size", 1) not in (None, 1):
+            return False
+        if getattr(parallel_config, "ring_degree", 1) != 1:
+            return False
+        if getattr(parallel_config, "cfg_parallel_size", 1) != 1:
+            return False
+        if getattr(parallel_config, "use_hsdp", False):
+            return False
+    return True
 
 
 class _BaseScheduler(SchedulerInterface):
@@ -268,7 +325,7 @@ class _BaseScheduler(SchedulerInterface):
         return DiffusionRequestState(
             sched_req_id=sched_req_id,
             req=request,
-            sampling_params_key=get_sampling_params_key(request),
+            sampling_params_key=get_sampling_params_key(request, self.od_config),
             arrival_time_s=arrival_time_s,
             deadline_time_s=deadline_time_s,
             reference_cost_ms=reference_cost_ms,

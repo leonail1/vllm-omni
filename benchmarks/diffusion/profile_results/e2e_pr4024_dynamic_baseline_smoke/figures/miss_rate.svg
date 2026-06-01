@@ -1,0 +1,10 @@
+<svg xmlns=http://www.w3.org/2000/svg width=760 height=260 viewBox=0 0 760 260>
+<rect width=100% height=100% fill=white/>
+<text x=24 y=26 font-family=Arial font-size=18 fill=#111>SLO miss rate</text>
+<text x=24 y=74 font-family=Arial font-size=13 fill=#222>current (smoke_without_cli_eager)</text>
+<rect x=240 y=58 width=0.0 height=22 fill=#2563eb/>
+<text x=248.0 y=74 font-family=Arial font-size=13 fill=#222>0.0%</text>
+<text x=24 y=116 font-family=Arial font-size=13 fill=#222>pr4024_dynamic (smoke_without_cli_eager)</text>
+<rect x=240 y=100 width=0.0 height=22 fill=#2563eb/>
+<text x=248.0 y=116 font-family=Arial font-size=13 fill=#222>0.0%</text>
+</svg>

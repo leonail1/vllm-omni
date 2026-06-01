@@ -1,0 +1,9 @@
+{
+  "bundle_dir": "benchmarks/diffusion/profile_results/e2e_pr4024_dynamic_baseline_smoke",
+  "source_runs": [
+    "benchmark_outputs/e2e_pr4024_dynamic_smoke2",
+    "benchmark_outputs/e2e_pr4024_dynamic_forced_batch_eager",
+    "benchmark_outputs/e2e_pr4024_dynamic_forced_flash"
+  ],
+  "status": "blocked_by_npu_flashattention_dependency"
+}

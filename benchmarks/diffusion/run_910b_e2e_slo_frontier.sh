@@ -13,6 +13,7 @@ DEVICES="${DEVICES:-0,1,2,3,4,5,6,7}"
 REPLICAS="${REPLICAS:-4}"
 TP_SIZE="${TP_SIZE:-2}"
 MAX_NUM_SEQS="${MAX_NUM_SEQS:-4}"
+ENFORCE_EAGER="${ENFORCE_EAGER:-false}"
 NUM_REQUESTS="${NUM_REQUESTS:-60}"
 INTERARRIVALS="${INTERARRIVALS:-4.25,2.5}"
 SCALES="${SCALES:-4.0,6.0}"
@@ -77,7 +78,7 @@ validate_policy() {
   local policy="$1"
   validate_safe_token "policy" "${policy}"
   case "${policy}" in
-    current|stagepool_only|instance_only|constant_cost|formula_cost|full_slo|no_preemption|slo_no_preemption_lookup|slo_no_preemption_guarded|alpha0|alpha1) ;;
+    current|stagepool_only|instance_only|constant_cost|formula_cost|full_slo|no_preemption|slo_no_preemption_lookup|slo_no_preemption_guarded|pr4024_dynamic|alpha0|alpha1) ;;
     *)
       log "unknown policy: ${policy}"
       exit 2
@@ -176,10 +177,16 @@ setup_env() {
 }
 
 write_deploy_config() {
-  python - "${DEPLOY_CONFIG}" "${DEVICES}" "${TP_SIZE}" "${MAX_NUM_SEQS}" <<'PY'
+  local policy="${1:-}"
+  local enforce_eager="${ENFORCE_EAGER}"
+  if [[ "${policy}" == "pr4024_dynamic" ]]; then
+    enforce_eager="true"
+  fi
+  python - "${DEPLOY_CONFIG}" "${DEVICES}" "${TP_SIZE}" "${MAX_NUM_SEQS}" "${enforce_eager}" <<'PY'
 import sys
 
-path, devices, tp_size, max_num_seqs = sys.argv[1:5]
+path, devices, tp_size, max_num_seqs, enforce_eager = sys.argv[1:6]
+enforce_eager = enforce_eager.strip().lower() not in {"0", "false", "no", "off"}
 text = f"""async_chunk: false
 trust_remote_code: true
 
@@ -187,7 +194,7 @@ stages:
   - stage_id: 0
     stage_type: diffusion
     max_num_seqs: {int(max_num_seqs)}
-    enforce_eager: false
+    enforce_eager: {str(enforce_eager).lower()}
     distributed_executor_backend: mp
     devices: "{devices}"
     parallel_config:
@@ -313,6 +320,7 @@ import sys
     guarded_no_preemption_admission_max_batch_size,
 ) = sys.argv[1:13]
 config = {
+    "diffusion_dynamic_step_batching_enabled": policy == "pr4024_dynamic",
     "diffusion_step_profile": {
         "enabled": True,
         "output_path": raw,
@@ -333,6 +341,8 @@ lookup = {
 }
 
 if policy == "current":
+    pass
+elif policy == "pr4024_dynamic":
     pass
 elif policy == "stagepool_only":
     config["diffusion_slo_scheduler"] = {**lookup, "enable_stagepool_slo": True}
@@ -428,18 +438,34 @@ start_service() {
 
   local additional_config
   additional_config="$(make_additional_config "${policy}" "${raw}" "${stagepool_raw}")"
+  local extra_server_args=""
+  local extra_server_env=""
+  if [[ "${policy}" == "pr4024_dynamic" ]]; then
+    local dynamic_attention_backend="${PR4024_DYNAMIC_ATTENTION_BACKEND:-FLASH_ATTN}"
+    case "${dynamic_attention_backend}" in
+      FLASH_ATTN|TORCH_SDPA) ;;
+      *)
+        echo "Unsupported PR4024_DYNAMIC_ATTENTION_BACKEND=${dynamic_attention_backend}. Expected FLASH_ATTN or TORCH_SDPA." >&2
+        exit 2
+        ;;
+    esac
+    extra_server_args="--enforce-eager"
+    extra_server_env="DIFFUSION_ATTENTION_BACKEND=${dynamic_attention_backend}"
+  fi
   log "starting ${policy}: port=${port}, replicas=${REPLICAS}, tp=${TP_SIZE}, devices=${DEVICES}"
-  setsid bash -c "exec env \
+  setsid bash -c "exec env -u DIFFUSION_ATTENTION_BACKEND \
     ASCEND_RT_VISIBLE_DEVICES='${DEVICES}' \
     HF_HUB_OFFLINE=1 \
     TRANSFORMERS_OFFLINE=1 \
     HF_HUB_DISABLE_TELEMETRY=1 \
+    ${extra_server_env} \
     python -m vllm_omni.entrypoints.cli.main serve '${MODEL}' \
       --omni \
       --host 127.0.0.1 \
       --port '${port}' \
       --tensor-parallel-size '${TP_SIZE}' \
       --max-num-seqs '${MAX_NUM_SEQS}' \
+      ${extra_server_args} \
       --distributed-executor-backend mp \
       --stage-id 0 \
       --omni-master-address 127.0.0.1 \
@@ -578,6 +604,7 @@ run_policy() {
 
   write_status "starting_${policy}" "Starting ${policy}"
   clean_policy_result_dirs "${policy}"
+  write_deploy_config "${policy}"
   start_service "${policy}" "${port}" "${master_port}"
   ACTIVE_PID_FILE="${pid_file}"
   wait_health "${port}" || { stop_service "${pid_file}"; ACTIVE_PID_FILE=""; return 1; }
@@ -613,7 +640,6 @@ run_policy() {
 main() {
   validate_matrix_args
   setup_env
-  write_deploy_config
   log "output dir: ${OUTDIR}"
   log "config: model=${MODEL}, replicas=${REPLICAS}, tp=${TP_SIZE}, requests=${NUM_REQUESTS}, interarrivals=${INTERARRIVALS}, workloads=${WORKLOADS}, scales=${SCALES}, repeats=${REPEATS}, policies=${POLICIES}, candidate=${CANDIDATE_POLICY}"
   local policy
