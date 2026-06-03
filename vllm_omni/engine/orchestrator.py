@@ -38,6 +38,7 @@ from vllm_omni.distributed.omni_coordinator import (
 )
 from vllm_omni.engine import OmniEngineCoreRequest
 from vllm_omni.engine.cfg_companion_tracker import CfgCompanionTracker
+from vllm_omni.engine.dag_runtime import DagRuntime
 from vllm_omni.engine.messages import (
     AbortRequestMessage,
     AddCompanionRequestMessage,
@@ -134,6 +135,7 @@ class OrchestratorRequestState:
 
     # Per-request pipeline timing accumulator (milliseconds)
     pipeline_timings: dict[str, float] = field(default_factory=dict)
+    dag_context_id: str | None = None
 
 
 @dataclass
@@ -175,6 +177,7 @@ class Orchestrator:
         self.async_chunk = bool(async_chunk)
         self.num_stages = len(stage_pools)
         self.stage_pools: list[StagePool] = stage_pools
+        self.dag_runtime = DagRuntime.from_stage_pools(stage_pools)
 
         # PD disaggregation state
         self._pd_pair: tuple[int, int] | None = None
@@ -214,6 +217,32 @@ class Orchestrator:
             for pool in self.stage_pools:
                 pool.attach_hub(self._hub)
                 pool.attach_load_balancer(factory())
+
+    @staticmethod
+    def _extract_deadline_time_s(prompt: Any, sampling_params_list: list[Any]) -> float | None:
+        """Best-effort deadline extraction for DAG request contexts."""
+        candidates: list[Any] = []
+        for params in sampling_params_list:
+            candidates.append(getattr(params, "deadline_time_s", None))
+            candidates.append(getattr(params, "deadline_s", None))
+            extra_args = getattr(params, "extra_args", None)
+            if isinstance(extra_args, dict):
+                candidates.append(extra_args.get("deadline_time_s"))
+                candidates.append(extra_args.get("deadline_s"))
+        if isinstance(prompt, dict):
+            candidates.append(prompt.get("deadline_time_s"))
+            candidates.append(prompt.get("deadline_s"))
+            additional = prompt.get("additional_information")
+            if isinstance(additional, dict):
+                candidates.append(additional.get("deadline_time_s"))
+                candidates.append(additional.get("deadline_s"))
+        for value in candidates:
+            try:
+                if value is not None:
+                    return float(value)
+            except (TypeError, ValueError):
+                continue
+        return None
 
     async def run(self) -> None:
         """Main entry point for the Orchestrator event loop."""
@@ -393,8 +422,17 @@ class Orchestrator:
             mm_features=getattr(prompt, "mm_features", None),
         )
         self.request_states[request_id] = req_state
+        deadline_time_s = self._extract_deadline_time_s(original_prompt, sampling_params_list)
+        self.dag_runtime.create_request_context(
+            request_id,
+            arrival_time_s=_time.time(),
+            deadline_time_s=deadline_time_s,
+            metadata={"final_stage_id": final_stage_id},
+        )
+        req_state.dag_context_id = request_id
         req_state.streaming.enabled = bool(getattr(prompt, "resumable", False))
         req_state.stage_submit_ts[stage_id] = _time.time()
+        self.dag_runtime.enter_stage(request_id, stage_id)
         enqueue_ts = msg.enqueue_ts
         if enqueue_ts > 0:
             req_state.pipeline_timings["queue_wait_ms"] = (_time.perf_counter() - enqueue_ts) * 1000.0
@@ -442,6 +480,7 @@ class Orchestrator:
 
         req_state.streaming.enabled = True
         req_state.stage_submit_ts[stage_id] = _time.time()
+        self.dag_runtime.enter_stage(request_id, stage_id)
         await self.stage_pools[stage_id].submit_update(
             request_id,
             req_state,
@@ -476,7 +515,14 @@ class Orchestrator:
             final_stage_id=0,
         )
         self.request_states[companion_id] = companion_state
+        self.dag_runtime.create_request_context(
+            companion_id,
+            arrival_time_s=_time.time(),
+            metadata={"parent_id": parent_id, "role": role, "companion": True},
+        )
+        companion_state.dag_context_id = companion_id
         companion_state.stage_submit_ts[0] = _time.time()
+        self.dag_runtime.enter_stage(companion_id, 0)
         companion_replica_id = await self.stage_pools[0].submit_initial(
             companion_id,
             companion_state,
@@ -677,6 +723,15 @@ class Orchestrator:
                     replica_id=replica_id,
                 )
                 stage_metrics.pipeline_timings = dict(req_state.pipeline_timings)
+                self.dag_runtime.finish_stage(
+                    output.request_id,
+                    stage_id,
+                    execution_ms=getattr(stage_metrics, "stage_gen_time_ms", None),
+                    metadata={
+                        "replica_id": replica_id,
+                        "stage_durations": getattr(output, "stage_durations", None),
+                    },
+                )
 
             await self._route_output(stage_id, output, req_state, stage_metrics)
 
@@ -710,6 +765,7 @@ class Orchestrator:
         self._release_request_bindings(request_ids)
         for request_id in request_ids:
             self._pd_kv_params.pop(request_id, None)
+            self.dag_runtime.cleanup_request(request_id)
             self.request_states.pop(request_id, None)
 
     def _maybe_clone_diffusion_params_for_cfg(self, request_id: str, params: Any) -> Any:
@@ -996,6 +1052,7 @@ class Orchestrator:
                     params_override=self._maybe_clone_diffusion_params_for_cfg(req_id, params),
                 )
             req_state.stage_submit_ts[next_logical] = _time.time()
+            self.dag_runtime.enter_stage(req_id, next_logical)
             return
 
         # PD disaggregation: prefill → decode routing uses original prompt + KV transfer params
@@ -1035,6 +1092,7 @@ class Orchestrator:
                     await next_pool.submit_initial(req_id, req_state, request, prompt_text=None)
 
             req_state.stage_submit_ts[next_logical] = _time.time()
+            self.dag_runtime.enter_stage(req_id, next_logical)
             return
 
         if req_state.pd_prefill_multimodal_output is not None:
@@ -1079,6 +1137,7 @@ class Orchestrator:
                 await next_pool.submit_initial(req_id, req_state, request, prompt_text=None)
 
         req_state.stage_submit_ts[next_logical] = _time.time()
+        self.dag_runtime.enter_stage(req_id, next_logical)
 
     async def _prewarm_async_chunk_stages(
         self,
@@ -1103,6 +1162,7 @@ class Orchestrator:
             params = req_state.sampling_params_list[next_stage_id]
 
             req_state.stage_submit_ts[next_stage_id] = _time.time()
+            self.dag_runtime.enter_stage(request_id, next_stage_id)
 
             if next_pool.stage_type == "diffusion":
                 await next_pool.submit_initial(

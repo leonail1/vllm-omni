@@ -1228,6 +1228,11 @@ class AsyncOmniEngine:
                 assert stage_vllm_config is not None
                 output_processor = build_llm_stage_output_processor(plan, stage_vllm_config)
 
+            replica_device_ids = [self._dag_replica_device_ids(replica) for replica in plan.replicas]
+            replica_card_counts = [
+                self._dag_replica_card_count(replica, device_ids)
+                for replica, device_ids in zip(plan.replicas, replica_device_ids, strict=True)
+            ]
             stage_pools.append(
                 StagePool(
                     plan.stage_idx,
@@ -1235,6 +1240,8 @@ class AsyncOmniEngine:
                     output_processor=output_processor,
                     stage_vllm_config=stage_vllm_config,
                     stage_slo_config=stage_slo_config,
+                    replica_device_ids=replica_device_ids,
+                    replica_card_counts=replica_card_counts,
                 )
             )
             default_sampling_params_list.append(first_client.default_sampling_params)
@@ -1249,6 +1256,45 @@ class AsyncOmniEngine:
         self.default_sampling_params_list = list(default_sampling_params_list)
         self.stage_metadata = list(stage_metadata_list)
         return stage_pools
+
+    @staticmethod
+    def _dag_replica_device_ids(replica: ReplicaInitPlan) -> tuple[str, ...]:
+        runtime_cfg = getattr(replica.stage_cfg, "runtime", None)
+        raw_devices = None
+        if isinstance(runtime_cfg, dict):
+            raw_devices = runtime_cfg.get("devices")
+        elif runtime_cfg is not None:
+            raw_devices = getattr(runtime_cfg, "devices", None)
+        if isinstance(raw_devices, str):
+            return tuple(part.strip() for part in raw_devices.split(",") if part.strip())
+        if isinstance(raw_devices, (list, tuple)):
+            return tuple(str(part) for part in raw_devices if str(part) != "")
+        return ()
+
+    @staticmethod
+    def _dag_replica_card_count(replica: ReplicaInitPlan, device_ids: tuple[str, ...]) -> int:
+        if device_ids:
+            return len(device_ids)
+        stage_vllm_config = replica.stage_vllm_config
+        parallel_config = getattr(stage_vllm_config, "parallel_config", None)
+        if parallel_config is None:
+            engine_args = getattr(replica.stage_cfg, "engine_args", None)
+            if isinstance(engine_args, dict):
+                parallel_config = engine_args.get("parallel_config")
+            elif engine_args is not None:
+                parallel_config = getattr(engine_args, "parallel_config", None)
+        for attr in ("world_size", "tensor_parallel_size"):
+            value = None
+            if isinstance(parallel_config, dict):
+                value = parallel_config.get(attr)
+            elif parallel_config is not None:
+                value = getattr(parallel_config, attr, None)
+            try:
+                if value is not None:
+                    return max(1, int(value))
+            except (TypeError, ValueError):
+                continue
+        return 1
 
     def _initialize_stages(self, stage_init_timeout: int) -> None:
         """Initialize stage clients/processors in orchestrator thread and assign to self.

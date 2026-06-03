@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import json
 import time as _time
+from collections.abc import Sequence
 from dataclasses import MISSING, dataclass, fields
 from typing import TYPE_CHECKING, Any, cast
 
@@ -240,6 +241,8 @@ class StagePool:
         output_processor: Any = None,
         stage_vllm_config: Any = None,
         stage_slo_config: Any = None,
+        replica_device_ids: Sequence[Sequence[str]] | None = None,
+        replica_card_counts: Sequence[int] | None = None,
     ) -> None:
         if isinstance(clients, list):
             normalized_clients: list[StagePoolClient] = list(clients)
@@ -255,6 +258,15 @@ class StagePool:
         self._output_processor = output_processor
         self._stage_vllm_config = stage_vllm_config
         self._stage_slo_config = stage_slo_config if stage_slo_config is not None else stage_vllm_config
+        self._dag_replica_device_ids = self._normalize_replica_device_ids(
+            replica_device_ids,
+            len(self.clients),
+        )
+        self._dag_replica_card_counts = self._normalize_replica_card_counts(
+            replica_card_counts,
+            self._dag_replica_device_ids,
+            len(self.clients),
+        )
         self._next_replica_id = 0
         self._request_bindings: dict[str, int] = {}
         self._replica_metrics: list[_ReplicaMetrics] = [_ReplicaMetrics() for _ in self.clients]
@@ -288,6 +300,7 @@ class StagePool:
         self._slo_default_num_inference_steps = int(_optional_float(slo_config.get("default_num_inference_steps")) or 50)
         self._slo_decode_ms = _optional_float(slo_config.get("decode_ms")) or 0.0
         self._slo_ignore_reference_cost = _optional_bool(slo_config.get("ignore_request_reference_cost"), False)
+
         laxity_window_ms = _optional_float(slo_config.get("stagepool_laxity_window_ms"))
         self._slo_stagepool_laxity_window_ms = max(laxity_window_ms or 0.0, 0.0)
         pack_min_laxity_ms = _optional_float(slo_config.get("stagepool_pack_min_laxity_ms"))
@@ -347,6 +360,45 @@ class StagePool:
         profile_config = self._stage_profile_config(self._stage_slo_config)
         self._stagepool_profile_enabled = _optional_bool(profile_config.get("enabled"), False)
         self._stagepool_profile_path = profile_config.get("output_path")
+
+    @staticmethod
+    def _normalize_replica_device_ids(
+        replica_device_ids: Sequence[Sequence[str]] | None,
+        num_slots: int,
+    ) -> tuple[tuple[str, ...], ...]:
+        normalized: list[tuple[str, ...]] = []
+        raw = list(replica_device_ids or [])
+        for replica_id in range(num_slots):
+            values = raw[replica_id] if replica_id < len(raw) else ()
+            normalized.append(tuple(str(v) for v in values if str(v) != ""))
+        return tuple(normalized)
+
+    @staticmethod
+    def _normalize_replica_card_counts(
+        replica_card_counts: Sequence[int] | None,
+        replica_device_ids: tuple[tuple[str, ...], ...],
+        num_slots: int,
+    ) -> tuple[int, ...]:
+        raw = list(replica_card_counts or [])
+        normalized: list[int] = []
+        for replica_id in range(num_slots):
+            if replica_id < len(raw):
+                normalized.append(max(1, int(raw[replica_id])))
+                continue
+            normalized.append(
+                max(1, len(replica_device_ids[replica_id]) if replica_id < len(replica_device_ids) else 0)
+            )
+        return tuple(normalized)
+
+    def dag_replica_device_ids(self, replica_id: int) -> tuple[str, ...]:
+        if 0 <= replica_id < len(self._dag_replica_device_ids):
+            return self._dag_replica_device_ids[replica_id]
+        return ()
+
+    def dag_replica_card_count(self, replica_id: int) -> int:
+        if 0 <= replica_id < len(self._dag_replica_card_counts):
+            return self._dag_replica_card_counts[replica_id]
+        return 1
 
     # ---- Stage-level properties ----
 
