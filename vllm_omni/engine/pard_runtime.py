@@ -8,6 +8,7 @@ from typing import Any, Mapping
 from vllm_omni.engine.dag_runtime import DagRuntime
 from vllm_omni.engine.dag_types import DagRequestContext
 from vllm_omni.engine.pard_broker import PardBrokerDecision, PardRequestBroker, policy_for_alias
+from vllm_omni.engine.pard_cleanup import PardDropCleanupResult, PardDropController
 from vllm_omni.engine.pard_planner import PardPlannerMode, PardStageLatencyLookup, PardStatePlanner
 
 
@@ -49,6 +50,7 @@ class PardRuntime:
     ) -> None:
         self.dag_runtime = dag_runtime
         self.config = config or PardRuntimeConfig()
+        self.drop_controller = PardDropController(dag_runtime)
         self.planner = PardStatePlanner(
             dag_runtime.config,
             latency_lookup,
@@ -86,6 +88,12 @@ class PardRuntime:
             recent_input_work=recent_input_work,
             stage_snapshots=stage_snapshots,
         )
+
+    async def apply_drop_decision(self, decision: PardBrokerDecision) -> PardDropCleanupResult:
+        return await self.drop_controller.apply_drop_decision(decision)
+
+    async def apply_pending_step_boundary(self, request_id: str, stage_id: int) -> PardDropCleanupResult:
+        return await self.drop_controller.apply_pending_step_boundary(request_id, stage_id)
 
     def snapshot(self) -> dict[str, Any]:
         return {

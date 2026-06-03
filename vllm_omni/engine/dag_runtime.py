@@ -10,6 +10,7 @@ from vllm_omni.engine.dag_cache import DagCacheLocation, DagCacheRegistry
 from vllm_omni.engine.dag_types import (
     FULL_DAG_REQUIRED_STAGE_KINDS,
     DagRequestContext,
+    DagStageBatchSpec,
     DagStageKind,
     DagStageResourceSpec,
     DagStageSpec,
@@ -143,7 +144,15 @@ def build_required_full_dag_template(resource_by_kind: dict[DagStageKind, DagSta
         DagStageSpec(0, "text_encoder", DagStageKind.TEXT_ENCODER, (), (3,), resource(DagStageKind.TEXT_ENCODER)),
         DagStageSpec(1, "image_encoder", DagStageKind.IMAGE_ENCODER, (), (2,), resource(DagStageKind.IMAGE_ENCODER)),
         DagStageSpec(2, "vae_encoder", DagStageKind.VAE_ENCODER, (1,), (3,), resource(DagStageKind.VAE_ENCODER)),
-        DagStageSpec(3, "dit_denoise", DagStageKind.DIT_DENOISE, (0, 2), (4, 5), resource(DagStageKind.DIT_DENOISE)),
+        DagStageSpec(
+            3,
+            "dit_denoise",
+            DagStageKind.DIT_DENOISE,
+            (0, 2),
+            (4, 5),
+            resource(DagStageKind.DIT_DENOISE),
+            batch=DagStageBatchSpec(allow_step_boundary_preemption=True),
+        ),
         DagStageSpec(4, "vae_decoder", DagStageKind.VAE_DECODER, (3,), (), resource(DagStageKind.VAE_DECODER)),
         DagStageSpec(5, "audio_decoder", DagStageKind.AUDIO_DECODER, (3,), (), resource(DagStageKind.AUDIO_DECODER)),
     )

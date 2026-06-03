@@ -236,6 +236,7 @@ class DagRequestContext:
         self.drop_stage_id = stage_id
         self.drop_reason = reason
         lifecycle = self.stage_lifecycle.setdefault(stage_id, DagStageLifecycle(stage_id=stage_id))
+        lifecycle.metadata.setdefault("status_before_drop", lifecycle.status.value)
         lifecycle.status = DagStageStatus.DROPPED
         self.trace.append(
             DagTraceEvent(
