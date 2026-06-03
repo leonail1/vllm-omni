@@ -1,0 +1,95 @@
+{
+  "metrics": {
+    "duration": 16.95296325534582,
+    "completed_requests": 2,
+    "failed_requests": 0,
+    "throughput_qps": 0.11797347577977761,
+    "latency_mean": 14.236482712440193,
+    "latency_median": 14.236482712440193,
+    "latency_p99": 14.445355015490204,
+    "latency_p95": 14.428304215241223,
+    "latency_p50": 14.236482712440193,
+    "peak_memory_mb_max": 0,
+    "peak_memory_mb_mean": 0,
+    "peak_memory_mb_median": 0,
+    "stage_durations_mean": {
+      "queue_wait_ms": 0.27603190392255783,
+      "stage_0_gen_ms": 13947.580337524414
+    },
+    "stage_durations_p50": {
+      "queue_wait_ms": 0.27603190392255783,
+      "stage_0_gen_ms": 13947.580337524414
+    },
+    "stage_durations_p99": {
+      "queue_wait_ms": 0.28188684955239296,
+      "stage_0_gen_ms": 14050.800457000732
+    },
+    "slo_attainment_rate": 1.0,
+    "slo_met_success": 2,
+    "slo_scale": 4.0,
+    "endpoint": "/v1/chat/completions",
+    "model": "Qwen/Qwen-Image",
+    "dataset": "trace",
+    "task": "t2i"
+  },
+  "requests": [
+    {
+      "request_id": "current-mix_ia_2p5_slo_token_step_preemptive_r0_scale_4-0000",
+      "response_id": "chatcmpl-ccb24224700649b7",
+      "prompt": "a high quality photo of a tench, detailed, natural lighting",
+      "width": 512,
+      "height": 512,
+      "num_frames": null,
+      "num_inference_steps": 50,
+      "fps": null,
+      "timestamp": 0.0,
+      "reference_cost_ms": 16651.144148781896,
+      "slo_ms": 66604.57659512758,
+      "arrival_time_s": 1780454558.4874766,
+      "deadline_time_s": 1780454625.0920532,
+      "planned_arrival_perf_s": 5489815.815588202,
+      "task_created_perf_s": 5489815.815596193,
+      "send_start_perf_s": 5489815.815692495,
+      "response_end_perf_s": 5489829.839040204,
+      "latency_s": 14.023347709327936,
+      "arrival_to_completion_s": 14.02345200162381,
+      "success": true,
+      "error": "",
+      "slo_achieved": true,
+      "stage_durations": {
+        "queue_wait_ms": 0.27005746960639954,
+        "stage_0_gen_ms": 13842.253684997559
+      },
+      "peak_memory_mb": 0.0
+    },
+    {
+      "request_id": "current-mix_ia_2p5_slo_token_step_preemptive_r0_scale_4-0001",
+      "response_id": "chatcmpl-9436a0bccc724459",
+      "prompt": "a realistic documentary photograph showing a goldfish in its natural environment",
+      "width": 768,
+      "height": 768,
+      "num_frames": null,
+      "num_inference_steps": 50,
+      "fps": null,
+      "timestamp": 2.5,
+      "reference_cost_ms": 16463.377065956593,
+      "slo_ms": 65853.50826382637,
+      "arrival_time_s": 1780454560.9874766,
+      "deadline_time_s": 1780454626.8409848,
+      "planned_arrival_perf_s": 5489818.315588202,
+      "task_created_perf_s": 5489818.318630705,
+      "send_start_perf_s": 5489818.318757198,
+      "response_end_perf_s": 5489832.768374913,
+      "latency_s": 14.44961771555245,
+      "arrival_to_completion_s": 14.45278671104461,
+      "success": true,
+      "error": "",
+      "slo_achieved": true,
+      "stage_durations": {
+        "queue_wait_ms": 0.2820063382387161,
+        "stage_0_gen_ms": 14052.90699005127
+      },
+      "peak_memory_mb": 0.0
+    }
+  ]
+}

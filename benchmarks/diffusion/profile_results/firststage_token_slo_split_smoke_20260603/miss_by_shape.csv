@@ -1,0 +1,5 @@
+workload,interarrival_s,load_label,policy,repeat,slo_scale,shape,requests,misses,miss_rate,latency_mean_s,latency_p95_s
+current-mix,2.5,ia_2p5,slo_no_preemption_token_objective,0,4.0,512x512,1,0,0.0,14.104218021966517,14.104218021966517
+current-mix,2.5,ia_2p5,slo_no_preemption_token_objective,0,4.0,768x768,1,0,0.0,13.67396173067391,13.67396173067391
+current-mix,2.5,ia_2p5,slo_token_step_preemptive,0,4.0,512x512,1,0,0.0,14.023347709327936,14.023347709327936
+current-mix,2.5,ia_2p5,slo_token_step_preemptive,0,4.0,768x768,1,0,0.0,14.44961771555245,14.44961771555245

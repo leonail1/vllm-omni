@@ -1,0 +1,5 @@
+workload,interarrival_s,load_label,policy,repeat,slo_scale,replica_id,count
+current-mix,2.5,ia_2p5,slo_no_preemption_token_objective,0,4.0,0,1
+current-mix,2.5,ia_2p5,slo_no_preemption_token_objective,0,4.0,1,1
+current-mix,2.5,ia_2p5,slo_token_step_preemptive,0,4.0,0,1
+current-mix,2.5,ia_2p5,slo_token_step_preemptive,0,4.0,1,1

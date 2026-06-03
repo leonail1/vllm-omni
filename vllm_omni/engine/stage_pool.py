@@ -18,6 +18,9 @@ from vllm_omni.distributed.omni_coordinator import (
     ReplicaStatus,
 )
 from vllm_omni.distributed.omni_coordinator.load_balancer import Task
+from vllm_omni.diffusion.sched.base_scheduler import (
+    qwen_image_dynamic_step_batching_enabled,
+)
 from vllm_omni.diffusion.sched.interface import SamplingParamsKey
 from vllm_omni.diffusion.sched.step_cost_model import (
     DiffusionStepCostModel,
@@ -152,6 +155,32 @@ def _snapshot_incremental_step_ms(
     return max(incremental, 0.0) * max(float(incoming_eff), 1.0)
 
 
+def _snapshot_token_incremental_step_ms(
+    bucket: dict[str, Any],
+    incoming_tokens: float,
+    incoming_eff: float,
+    current_step_ms: float,
+    batch_growth_alpha: float,
+) -> float | None:
+    bucket_tokens = _optional_float(bucket.get("max_latent_tokens")) or _optional_float(bucket.get("latent_tokens"))
+    existing_work = _optional_float(bucket.get("total_token_work"))
+    if bucket_tokens is None or bucket_tokens <= 0 or existing_work is None or current_step_ms <= 0:
+        return None
+
+    current_max_tokens = max(float(bucket_tokens), 1.0)
+    incoming_tokens = max(float(incoming_tokens), 1.0)
+    incoming_eff = max(float(incoming_eff), 1.0)
+    after_max_tokens = max(current_max_tokens, incoming_tokens)
+    current_eff = max(existing_work / current_max_tokens, 1.0)
+    after_eff = max((existing_work + incoming_tokens * incoming_eff) / after_max_tokens, 1.0)
+    current_scale = 1.0 + batch_growth_alpha * max(current_eff - 1.0, 0.0)
+    after_scale = 1.0 + batch_growth_alpha * max(after_eff - 1.0, 0.0)
+    current_single_step_ms = current_step_ms / max(current_scale, 0.001)
+    token_size_scale = max(after_max_tokens / current_max_tokens, 1.0)
+    after_step_ms = current_single_step_ms * token_size_scale * after_scale
+    return max(after_step_ms - current_step_ms, 0.0)
+
+
 @dataclass
 class _ReplicaMetrics:
     """Per-replica metrics accumulators owned by a stage pool."""
@@ -191,6 +220,17 @@ class StagePool:
     DISPATCH_RETRY_INTERVAL_S: float = 0.1
     SCHEDULER_SNAPSHOT_TTL_S: float = 0.5
     SCHEDULER_SNAPSHOT_RPC_TIMEOUT_S: float = 0.05
+    _STAGEPOOL_SELECTION_OBJECTIVES = {
+        "legacy",
+        "token_slo",
+        "token_slo_objective",
+        "slo_objective",
+        "objective",
+    }
+    _STAGEPOOL_OBJECTIVE_POLICY_ALIASES = {
+        "slo_no_preemption_token_objective",
+        "slo_token_stagepool_objective",
+    }
 
     def __init__(
         self,
@@ -242,6 +282,8 @@ class StagePool:
             self._default_stagepool_slo_enabled(self._stage_slo_config),
         )
         self._slo_default_step_ms = _optional_float(slo_config.get("default_step_ms")) or 1.0
+        batch_growth_alpha = _optional_float(slo_config.get("batch_growth_alpha"))
+        self._slo_batch_growth_alpha = max(0.60 if batch_growth_alpha is None else batch_growth_alpha, 0.0)
         self._slo_cost_model = DiffusionStepCostModel.from_config(slo_config, default_step_ms=1.0)
         self._slo_default_num_inference_steps = int(_optional_float(slo_config.get("default_num_inference_steps")) or 50)
         self._slo_decode_ms = _optional_float(slo_config.get("decode_ms")) or 0.0
@@ -254,6 +296,49 @@ class StagePool:
         self._slo_stagepool_pack_max_queue_length = int(max(pack_max_queue_length or 0.0, 0.0))
         pack_max_matching_bucket_size = _optional_float(slo_config.get("stagepool_pack_max_matching_bucket_size"))
         self._slo_stagepool_pack_max_matching_bucket_size = int(max(pack_max_matching_bucket_size or 0.0, 0.0))
+        profile_reject_laxity_ms = _optional_float(slo_config.get("stagepool_profile_reject_laxity_ms"))
+        self._slo_stagepool_profile_reject_laxity_ms = (
+            0.0 if profile_reject_laxity_ms is None else profile_reject_laxity_ms
+        )
+        selection_objective = slo_config.get("stagepool_selection_objective")
+        if selection_objective is None:
+            policy = self._stage_scheduler_policy(self._stage_slo_config)
+            selection_objective = (
+                "token_slo_objective"
+                if isinstance(policy, str) and policy.lower() in self._STAGEPOOL_OBJECTIVE_POLICY_ALIASES
+                else "legacy"
+            )
+        self._slo_stagepool_selection_objective = str(selection_objective).strip().lower()
+        if self._slo_stagepool_selection_objective not in self._STAGEPOOL_SELECTION_OBJECTIVES:
+            raise ValueError(
+                "Unsupported stagepool_selection_objective="
+                f"{selection_objective!r}. Expected one of {sorted(self._STAGEPOOL_SELECTION_OBJECTIVES)}."
+            )
+        self._slo_stagepool_objective_miss_risk_weight = _optional_float(
+            slo_config.get("stagepool_objective_miss_risk_weight")
+        )
+        if self._slo_stagepool_objective_miss_risk_weight is None:
+            self._slo_stagepool_objective_miss_risk_weight = 1.0
+        self._slo_stagepool_objective_token_pressure_weight = _optional_float(
+            slo_config.get("stagepool_objective_token_pressure_weight")
+        )
+        if self._slo_stagepool_objective_token_pressure_weight is None:
+            self._slo_stagepool_objective_token_pressure_weight = 0.01
+        self._slo_stagepool_objective_queue_weight = _optional_float(
+            slo_config.get("stagepool_objective_queue_weight")
+        )
+        if self._slo_stagepool_objective_queue_weight is None:
+            self._slo_stagepool_objective_queue_weight = 1.0
+        self._slo_stagepool_objective_pack_bonus = _optional_float(
+            slo_config.get("stagepool_objective_pack_bonus")
+        )
+        if self._slo_stagepool_objective_pack_bonus is None:
+            self._slo_stagepool_objective_pack_bonus = 1.0
+        self._slo_stagepool_objective_safe_capacity_bonus = _optional_float(
+            slo_config.get("stagepool_objective_safe_capacity_bonus")
+        )
+        if self._slo_stagepool_objective_safe_capacity_bonus is None:
+            self._slo_stagepool_objective_safe_capacity_bonus = 1.0
         self._scheduler_snapshot_ttl_s = (
             0.0
             if self._slo_stagepool_laxity_window_ms > 0
@@ -828,7 +913,7 @@ class StagePool:
         cursor = self._slo_tie_break_cursor % len(candidates)
         now_s = _time.time()
         sampling_params = None if task is None else task.get("sampling_params")
-        incoming_key = self._sampling_key_dict(sampling_params)
+        incoming_key = self._task_sampling_key_dict(task)
         for idx, ((replica_info, _), snapshot) in enumerate(zip(candidates, snapshots, strict=False)):
             if isinstance(snapshot, BaseException) or snapshot is None:
                 continue
@@ -877,7 +962,7 @@ class StagePool:
         cursor = self._slo_tie_break_cursor % len(live)
         now_s = _time.time()
         sampling_params = None if task is None else task.get("sampling_params")
-        incoming_key = self._sampling_key_dict(sampling_params)
+        incoming_key = self._task_sampling_key_dict(task)
         for idx, (replica_id, snapshot) in enumerate(zip(live, snapshots, strict=False)):
             if isinstance(snapshot, BaseException) or snapshot is None:
                 continue
@@ -924,6 +1009,7 @@ class StagePool:
         queue_length = int(snapshot.get("num_waiting", fallback_queue_length) or 0) + int(
             snapshot.get("num_running", 0) or 0
         )
+        sampling_params = None if task is None else task.get("sampling_params")
         matching_bucket = self._matching_bucket(snapshot, incoming_key)
         matching_bucket_size = (
             int(matching_bucket.get("candidate_batch_size", 0) or 0) if matching_bucket is not None else 0
@@ -937,6 +1023,7 @@ class StagePool:
         )
         pack_bucket_limit_exceeded = (
             self._slo_stagepool_pack_max_matching_bucket_size > 0
+            and matching_bucket_size > 0
             and matching_bucket_size >= self._slo_stagepool_pack_max_matching_bucket_size
         )
         can_pack_same_key = (
@@ -950,6 +1037,25 @@ class StagePool:
                 or matching_bucket_laxity_ms >= self._slo_stagepool_pack_min_laxity_ms
             )
         )
+        token_pressure = self._snapshot_token_pressure(snapshot)
+        matching_token_utilization = self._matching_bucket_token_utilization(matching_bucket)
+        incoming_latent_tokens = self._incoming_latent_tokens(sampling_params) if sampling_params is not None else 0.0
+        incoming_effective_size = _task_effective_size(task)
+        incoming_remaining_steps = (
+            self._task_remaining_steps(sampling_params) if sampling_params is not None else 0
+        )
+        incoming_token_work = incoming_latent_tokens * incoming_effective_size * max(float(incoming_remaining_steps), 1.0)
+        resident_token_work, waiting_token_work = self._snapshot_token_work_breakdown(snapshot)
+        matching_bucket_token_work = self._bucket_token_work(matching_bucket)
+        token_pressure_after = token_pressure + incoming_token_work
+        candidate_min_laxity_ratio = (
+            _optional_float(matching_bucket.get("min_laxity_ratio")) if matching_bucket is not None else None
+        )
+        incoming_laxity_ms = self._predict_incoming_laxity_ms(task, snapshot, now_s=now_s)
+        existing_min_laxity_after_ms = self._estimate_existing_laxity_after_ms(task, snapshot)
+        admission_reject_reason = None
+        if predicted_laxity_ms < self._slo_stagepool_profile_reject_laxity_ms:
+            admission_reject_reason = "predicted_laxity_below_profile_threshold"
         candidate = {
             "candidate_index": candidate_index,
             "replica_id": replica_id,
@@ -963,12 +1069,44 @@ class StagePool:
             "can_pack_same_key": can_pack_same_key,
             "pack_queue_limit_exceeded": pack_queue_limit_exceeded,
             "pack_bucket_limit_exceeded": pack_bucket_limit_exceeded,
+            "token_pressure": token_pressure,
+            "matching_bucket_token_utilization": matching_token_utilization,
+            "incoming_latent_tokens": incoming_latent_tokens,
+            "incoming_token_work": incoming_token_work,
+            "incoming_remaining_steps": incoming_remaining_steps,
+            "incoming_effective_size": incoming_effective_size,
+            "token_pressure_before": token_pressure,
+            "token_pressure_after": token_pressure_after,
+            "resident_token_work": resident_token_work,
+            "waiting_token_work": waiting_token_work,
+            "matching_bucket_token_work": matching_bucket_token_work,
+            "candidate_min_laxity_ratio": candidate_min_laxity_ratio,
+            "existing_min_laxity_after_ms": existing_min_laxity_after_ms,
+            "incoming_laxity_ms": incoming_laxity_ms,
+            "admission_decision": "profile_only",
+            "admission_reject_reason": admission_reject_reason,
         }
+        if self._uses_stagepool_objective():
+            self._annotate_stagepool_objective(candidate)
         if input_addr is not None:
             candidate["input_addr"] = input_addr
         return candidate
 
     def _choose_stagepool_slo_candidate(self, candidates: list[dict[str, Any]]) -> dict[str, Any]:
+        if self._uses_stagepool_objective():
+            for candidate in candidates:
+                self._annotate_stagepool_objective(candidate)
+
+            def objective_first(candidate: dict[str, Any]) -> tuple[float, float, int, int]:
+                return (
+                    float(candidate["stagepool_objective_score"]),
+                    -float(candidate["predicted_laxity_ms"]),
+                    int(candidate["tie_rank"]),
+                    int(candidate["candidate_index"]),
+                )
+
+            return min(candidates, key=objective_first)
+
         def laxity_first(candidate: dict[str, Any]) -> tuple[float, int, int, int, int]:
             return (
                 -float(candidate["predicted_laxity_ms"]),
@@ -1010,6 +1148,44 @@ class StagePool:
             )
 
         return min(eligible, key=packing_first)
+
+    def _uses_stagepool_objective(self) -> bool:
+        return self._slo_stagepool_selection_objective != "legacy"
+
+    def _annotate_stagepool_objective(self, candidate: dict[str, Any]) -> None:
+        predicted_laxity_ms = _optional_float(candidate.get("predicted_laxity_ms")) or 0.0
+        incoming_laxity_ms = _optional_float(candidate.get("incoming_laxity_ms"))
+        existing_laxity_after_ms = _optional_float(candidate.get("existing_min_laxity_after_ms"))
+        miss_risk_ms = max(-predicted_laxity_ms, 0.0)
+        if incoming_laxity_ms is not None:
+            miss_risk_ms = max(miss_risk_ms, -incoming_laxity_ms)
+        if existing_laxity_after_ms is not None:
+            miss_risk_ms = max(miss_risk_ms, -existing_laxity_after_ms)
+        token_pressure_units = max(
+            float(candidate.get("token_pressure_after", candidate.get("token_pressure", 0.0)) or 0.0) / 1024.0,
+            0.0,
+        )
+        queue_cost = max(float(candidate.get("queue_length", 0) or 0), 0.0)
+        pack_bonus = (
+            max(float(candidate.get("matching_bucket_size", 0) or 0), 0.0)
+            if bool(candidate.get("can_pack_same_key"))
+            else 0.0
+        )
+        safe_capacity_bonus = max(float(candidate.get("safe_capacity", 0) or 0), 0.0)
+        score = (
+            self._slo_stagepool_objective_miss_risk_weight * miss_risk_ms
+            + self._slo_stagepool_objective_token_pressure_weight * token_pressure_units
+            + self._slo_stagepool_objective_queue_weight * queue_cost
+            - self._slo_stagepool_objective_pack_bonus * pack_bonus
+            - self._slo_stagepool_objective_safe_capacity_bonus * safe_capacity_bonus
+        )
+        candidate["stagepool_selection_objective"] = self._slo_stagepool_selection_objective
+        candidate["stagepool_objective_score"] = score
+        candidate["stagepool_objective_miss_risk_ms"] = miss_risk_ms
+        candidate["stagepool_objective_token_pressure_units"] = token_pressure_units
+        candidate["stagepool_objective_queue_cost"] = queue_cost
+        candidate["stagepool_objective_pack_bonus"] = pack_bonus
+        candidate["stagepool_objective_safe_capacity_bonus"] = safe_capacity_bonus
 
     def _distributed_candidate_profile(self, candidates: list[tuple[ReplicaInfo, int]]) -> list[dict[str, Any]]:
         return [
@@ -1073,7 +1249,13 @@ class StagePool:
             return False
         if not isinstance(snapshot.get("timestamp_s"), (int, float)):
             return False
-        if snapshot.get("policy") not in {"SloStepScheduler", "StepScheduler"}:
+        if snapshot.get("policy") not in {
+            "SloStepScheduler",
+            "StepScheduler",
+            "TokenSloStepScheduler",
+            "AdaptiveTokenSloStepScheduler",
+            "TokenStepPreemptiveSloStepScheduler",
+        }:
             return False
         buckets = snapshot.get("buckets", [])
         if not isinstance(buckets, list):
@@ -1102,7 +1284,7 @@ class StagePool:
 
         now_s = _time.time() if now_s is None else now_s
         sampling_params = None if task is None else task.get("sampling_params")
-        incoming_key = self._sampling_key_dict(sampling_params)
+        incoming_key = self._task_sampling_key_dict(task)
         incoming_cost_ms = self._estimate_task_remaining_cost_ms(task, snapshot)
         admit_delay_ms = self._estimate_admit_delay_ms(
             snapshot,
@@ -1115,6 +1297,27 @@ class StagePool:
             return incoming_laxity_ms
         return min(incoming_laxity_ms, existing_laxity_after_ms)
 
+    def _predict_incoming_laxity_ms(
+        self,
+        task: Task | None,
+        snapshot: dict[str, Any],
+        *,
+        now_s: float | None = None,
+    ) -> float:
+        deadline_s = self._task_deadline_time_s(task)
+        if deadline_s is None:
+            return 0.0
+
+        now_s = _time.time() if now_s is None else now_s
+        incoming_key = self._task_sampling_key_dict(task)
+        incoming_cost_ms = self._estimate_task_remaining_cost_ms(task, snapshot)
+        admit_delay_ms = self._estimate_admit_delay_ms(
+            snapshot,
+            incoming_key,
+            incoming_effective_size=_task_effective_size(task),
+        )
+        return (deadline_s - now_s) * 1000.0 - admit_delay_ms - incoming_cost_ms
+
     def _estimate_admit_delay_ms(
         self,
         snapshot: dict[str, Any],
@@ -1123,6 +1326,7 @@ class StagePool:
         incoming_effective_size: float = 1.0,
     ) -> float:
         safe_capacity = int(snapshot.get("safe_admit_capacity", 0) or 0)
+        no_preemption_snapshot = self._snapshot_disables_step_preemption(snapshot)
         if safe_capacity > 0 and int(snapshot.get("num_waiting", 0) or 0) <= 0:
             if int(snapshot.get("num_running", 0) or 0) <= 0:
                 return 0.0
@@ -1161,18 +1365,31 @@ class StagePool:
             if not isinstance(bucket, dict):
                 continue
             estimated_step_ms = float(bucket.get("estimated_step_ms", 0.0) or 0.0)
-            min_remaining_steps = float(bucket.get("min_remaining_steps", 1.0) or 1.0)
-            delay_ms = max(estimated_step_ms * max(min_remaining_steps, 1.0), 0.0)
+            remaining_steps_key = "max_remaining_steps" if no_preemption_snapshot else "min_remaining_steps"
+            remaining_steps = float(
+                bucket.get(remaining_steps_key, bucket.get("min_remaining_steps", 1.0)) or 1.0
+            )
+            delay_ms = max(estimated_step_ms * max(remaining_steps, 1.0), 0.0)
             if bucket.get("key") == incoming_key:
                 # Same-key requests can be admitted at a step boundary. If
                 # capacity is available but older waiting requests exist, charge
                 # one representative step instead of the whole bucket tail.
-                if safe_capacity > 0:
+                if safe_capacity > 0 and not no_preemption_snapshot:
                     delay_ms = min(delay_ms, estimated_step_ms)
-                else:
+                elif safe_capacity <= 0 and not no_preemption_snapshot:
                     delay_ms *= 0.95
             candidates.append(delay_ms)
         return min(candidates) if candidates else 0.0
+
+    @staticmethod
+    def _snapshot_disables_step_preemption(snapshot: dict[str, Any]) -> bool:
+        enable_step_preemption = snapshot.get("enable_step_preemption")
+        if isinstance(enable_step_preemption, bool):
+            return not enable_step_preemption
+        return snapshot.get("policy") in {
+            "TokenSloStepScheduler",
+            "AdaptiveTokenSloStepScheduler",
+        }
 
     def _estimate_task_remaining_cost_ms(self, task: Task | None, snapshot: dict[str, Any]) -> float:
         sampling_params = None if task is None else task.get("sampling_params")
@@ -1208,22 +1425,47 @@ class StagePool:
         if self._slo_cost_model is None:
             return None
         width, height = _sampling_dimensions(sampling_params)
+        frames = _sampling_get(sampling_params, "num_frames", 1)
         incoming_eff = max(prompt_count, 1.0) * estimate_request_effective_size(
             sampling_params,
             has_negative_prompt=has_negative_prompt,
         )
         effective_batch_size = incoming_eff
+        incoming_tokens = self._incoming_latent_tokens(sampling_params)
+        max_tokens = incoming_tokens
         batch_size = 1
-        incoming_key = self._sampling_key_dict(sampling_params)
+        incoming_key = self._sampling_key_dict(
+            sampling_params,
+            dynamic_qwen=self._uses_qwen_image_dynamic_step_batching(),
+            has_negative_prompt=has_negative_prompt,
+        )
         bucket = self._matching_bucket(snapshot, incoming_key)
         if bucket is not None:
-            effective_batch_size += float(bucket.get("effective_batch_size", bucket.get("candidate_batch_size", 0)) or 0)
+            bucket_tokens = _optional_float(bucket.get("max_latent_tokens"))
+            if bucket_tokens is not None and bucket_tokens > 0:
+                max_tokens = max(max_tokens, bucket_tokens)
+                existing_work = _optional_float(bucket.get("total_token_work"))
+                bucket_shape = bucket.get("shape")
+                if bucket_tokens >= incoming_tokens and isinstance(bucket_shape, dict):
+                    bucket_width = _optional_float(bucket_shape.get("width"))
+                    bucket_height = _optional_float(bucket_shape.get("height"))
+                    bucket_frames = _optional_float(bucket_shape.get("num_frames"))
+                    if bucket_width is not None and bucket_height is not None:
+                        width = bucket_width
+                        height = bucket_height
+                        frames = bucket_frames or frames
+                if existing_work is not None and max_tokens > 0:
+                    effective_batch_size = (existing_work + incoming_tokens * incoming_eff) / max_tokens
+                else:
+                    effective_batch_size += float(bucket.get("effective_batch_size", bucket.get("candidate_batch_size", 0)) or 0)
+            else:
+                effective_batch_size += float(bucket.get("effective_batch_size", bucket.get("candidate_batch_size", 0)) or 0)
             batch_size += int(bucket.get("candidate_batch_size", 0) or 0)
         return self._slo_cost_model.estimate(
             model=_stage_model_name(self._stage_slo_config),
             width=width,
             height=height,
-            num_frames=_sampling_get(sampling_params, "num_frames", 1),
+            num_frames=frames,
             batch_size=batch_size,
             effective_batch_size=effective_batch_size,
         )
@@ -1236,7 +1478,7 @@ class StagePool:
         sampling_params = None if task is None else task.get("sampling_params")
         if sampling_params is None:
             return None
-        incoming_key = self._sampling_key_dict(sampling_params)
+        incoming_key = self._task_sampling_key_dict(task)
         bucket = self._matching_bucket(snapshot, incoming_key)
         if bucket is None:
             return None
@@ -1256,6 +1498,19 @@ class StagePool:
             width, height = _dimensions_from_key(incoming_key)
         incoming_eff = _task_effective_size(task)
         current_eff = float(bucket.get("effective_batch_size", bucket.get("candidate_batch_size", 0)) or 0)
+        effective_batch_size_after = current_eff + incoming_eff
+        incoming_tokens = self._incoming_latent_tokens(sampling_params)
+        bucket_tokens = _optional_float(bucket.get("max_latent_tokens"))
+        existing_work = _optional_float(bucket.get("total_token_work"))
+        if bucket_tokens is not None and bucket_tokens > 0 and existing_work is not None:
+            max_tokens = max(bucket_tokens, incoming_tokens)
+            effective_batch_size_after = (existing_work + incoming_tokens * incoming_eff) / max_tokens
+            if incoming_tokens > bucket_tokens:
+                incoming_width, incoming_height = _sampling_dimensions(sampling_params)
+                if incoming_width is not None and incoming_height is not None:
+                    width = incoming_width
+                    height = incoming_height
+                    frames = _optional_float(_sampling_get(sampling_params, "num_frames")) or frames
         extra_per_step_ms = None
         if self._slo_cost_model is not None:
             estimate = self._slo_cost_model.estimate(
@@ -1264,15 +1519,24 @@ class StagePool:
                 height=height,
                 num_frames=frames or _sampling_get(sampling_params, "num_frames", 1),
                 batch_size=int(bucket.get("candidate_batch_size", 0) or 0) + 1,
-                effective_batch_size=current_eff + incoming_eff,
+                effective_batch_size=effective_batch_size_after,
             )
             if estimate.source != "default":
                 extra_per_step_ms = max(estimate.step_ms - current_step_ms, 0.0)
         if extra_per_step_ms is None:
+            extra_per_step_ms = _snapshot_token_incremental_step_ms(
+                bucket,
+                incoming_tokens,
+                incoming_eff,
+                current_step_ms,
+                self._slo_batch_growth_alpha,
+            )
+        if extra_per_step_ms is None:
             extra_per_step_ms = _snapshot_incremental_step_ms(bucket, incoming_eff, current_step_ms)
         if extra_per_step_ms is None:
             return None
-        remaining = float(bucket.get("min_remaining_steps", 1.0) or 1.0)
+        remaining_steps_key = "max_remaining_steps" if self._snapshot_disables_step_preemption(snapshot) else "min_remaining_steps"
+        remaining = float(bucket.get(remaining_steps_key, bucket.get("min_remaining_steps", 1.0)) or 1.0)
         return min_laxity_ms - extra_per_step_ms * max(remaining, 1.0)
 
     @staticmethod
@@ -1336,6 +1600,10 @@ class StagePool:
         slo_ms = None if sampling_params is None else _optional_float(_sampling_get(sampling_params, "slo_ms"))
         raw_client_request_id = None if sampling_params is None else _sampling_get(sampling_params, "client_request_id")
         client_request_id = None if raw_client_request_id is None else str(raw_client_request_id)
+        profile_only_reject_reason = self._profile_only_reject_reason(candidates)
+        if profile_only_reject_reason is not None:
+            for candidate in candidates:
+                candidate.setdefault("profile_only_reject_reason", profile_only_reject_reason)
         record = {
             "timestamp_s": timestamp_s,
             "event": event,
@@ -1349,6 +1617,8 @@ class StagePool:
             "reference_cost_ms": reference_cost_ms,
             "slo_ms": slo_ms,
             "enable_stagepool_slo": self._enable_stagepool_slo,
+            "stagepool_selection_objective": self._slo_stagepool_selection_objective,
+            "profile_only_reject_reason": profile_only_reject_reason,
             "candidates": candidates,
         }
         try:
@@ -1356,6 +1626,16 @@ class StagePool:
                 f.write(json.dumps(record, ensure_ascii=False, sort_keys=True) + "\n")
         except Exception as exc:
             logger.debug("[StagePool] failed to write stagepool profile: %s", exc)
+
+    def _profile_only_reject_reason(self, candidates: list[dict[str, Any]]) -> str | None:
+        if not candidates:
+            return None
+        threshold = self._slo_stagepool_profile_reject_laxity_ms
+        laxities = [_optional_float(candidate.get("predicted_laxity_ms")) for candidate in candidates]
+        finite_laxities = [value for value in laxities if value is not None]
+        if finite_laxities and all(value < threshold for value in finite_laxities):
+            return "all_replicas_predicted_below_profile_threshold"
+        return None
 
     @staticmethod
     def _stage_profile_config(stage_vllm_config: Any) -> dict[str, Any]:
@@ -1366,22 +1646,168 @@ class StagePool:
         return raw if isinstance(raw, dict) else {}
 
     @staticmethod
-    def _default_stagepool_slo_enabled(stage_vllm_config: Any) -> bool:
+    def _stage_scheduler_policy(stage_vllm_config: Any) -> str | None:
         additional_config = getattr(stage_vllm_config, "additional_config", None)
         if not isinstance(additional_config, dict):
-            return False
+            return None
         policy = (
             additional_config.get("diffusion_scheduler_policy")
             or additional_config.get("diffusion_step_scheduler_policy")
             or additional_config.get("scheduler_policy")
         )
-        return isinstance(policy, str) and policy.lower() in {"slo", "slo_aware", "bucket_slo"}
+        return policy if isinstance(policy, str) else None
+
+    @classmethod
+    def _default_stagepool_slo_enabled(cls, stage_vllm_config: Any) -> bool:
+        policy = cls._stage_scheduler_policy(stage_vllm_config)
+        if not isinstance(policy, str):
+            return False
+        return policy.lower() in {
+            "slo",
+            "slo_aware",
+            "bucket_slo",
+            "slo_no_preemption_guarded",
+            "token_slo",
+            "slo_token",
+            "slo_token_dynamic",
+            "slo_no_preemption_token_guarded",
+            "slo_no_preemption_token_adaptive",
+            "slo_no_preemption_token_objective",
+            "slo_token_stagepool_objective",
+            "slo_token_step_preemptive",
+            "slo_step_preemptive_token",
+            "slo_token_preemptive",
+            "slo_token_adaptive",
+        }
+
+    def _task_sampling_key_dict(self, task: Task | None) -> dict[str, Any] | None:
+        sampling_params = None if task is None else task.get("sampling_params")
+        return self._sampling_key_dict(
+            sampling_params,
+            dynamic_qwen=self._uses_qwen_image_dynamic_step_batching(),
+            has_negative_prompt=bool(task.get("has_negative_prompt")) if task is not None else False,
+        )
+
+    def _uses_qwen_image_dynamic_step_batching(self) -> bool:
+        try:
+            return (
+                getattr(self._stage_slo_config, "model_class_name", None) == "QwenImagePipeline"
+                and qwen_image_dynamic_step_batching_enabled(self._stage_slo_config)
+            )
+        except Exception:
+            return False
 
     @staticmethod
-    def _sampling_key_dict(sampling_params: Any) -> dict[str, Any] | None:
+    def _snapshot_token_pressure(snapshot: dict[str, Any]) -> float:
+        value = _optional_float(snapshot.get("token_pressure"))
+        if value is not None:
+            return max(value, 0.0)
+        pressure = 0.0
+        buckets = snapshot.get("buckets")
+        if isinstance(buckets, list):
+            for bucket in buckets:
+                if not isinstance(bucket, dict):
+                    continue
+                work = _optional_float(bucket.get("total_token_work"))
+                remaining = (
+                    _optional_float(bucket.get("max_remaining_steps"))
+                    or _optional_float(bucket.get("min_remaining_steps"))
+                    or 1.0
+                )
+                if work is not None:
+                    pressure += max(work, 0.0) * max(remaining, 1.0)
+        if pressure > 0:
+            return pressure
+        return float(snapshot.get("num_waiting", 0) or 0) + float(snapshot.get("num_running", 0) or 0)
+
+    @classmethod
+    def _snapshot_token_work_breakdown(cls, snapshot: dict[str, Any]) -> tuple[float, float]:
+        resident_work = 0.0
+        waiting_work = 0.0
+        buckets = snapshot.get("buckets")
+        if not isinstance(buckets, list):
+            return resident_work, waiting_work
+        for bucket in buckets:
+            if not isinstance(bucket, dict):
+                continue
+            work = cls._bucket_token_work(bucket)
+            if work <= 0:
+                continue
+            running = max(float(bucket.get("num_running", 0) or 0), 0.0)
+            waiting = max(float(bucket.get("num_waiting", 0) or 0), 0.0)
+            total = running + waiting
+            if total <= 0:
+                waiting_work += work
+                continue
+            resident_work += work * (running / total)
+            waiting_work += work * (waiting / total)
+        return resident_work, waiting_work
+
+    @staticmethod
+    def _bucket_token_work(bucket: dict[str, Any] | None) -> float:
+        if bucket is None:
+            return 0.0
+        work = _optional_float(bucket.get("total_token_work"))
+        if work is not None:
+            return max(work, 0.0)
+        max_tokens = _optional_float(bucket.get("max_latent_tokens")) or _optional_float(bucket.get("latent_tokens"))
+        effective_batch_size = _optional_float(bucket.get("effective_batch_size"))
+        if max_tokens is not None and effective_batch_size is not None:
+            return max(max_tokens * effective_batch_size, 0.0)
+        return max(float(bucket.get("candidate_batch_size", 0) or 0), 0.0)
+
+    @staticmethod
+    def _matching_bucket_token_utilization(bucket: dict[str, Any] | None) -> float | None:
+        if bucket is None:
+            return None
+        return _optional_float(bucket.get("token_batch_utilization"))
+
+    def _incoming_latent_tokens(self, sampling_params: Any) -> float:
+        width, height = _sampling_dimensions(sampling_params)
+        if self._slo_cost_model is not None:
+            tokens = self._slo_cost_model.latent_tokens(width, height, _sampling_get(sampling_params, "num_frames", 1))
+            if tokens is not None:
+                return float(tokens)
+        if width is None or height is None:
+            resolution = _optional_float(_sampling_get(sampling_params, "resolution")) or 1024.0
+            width = width or resolution
+            height = height or resolution
+        return max(
+            (float(width) / 16.0)
+            * (float(height) / 16.0)
+            * max(float(_sampling_get(sampling_params, "num_frames", 1) or 1), 1.0),
+            1.0,
+        )
+
+    @staticmethod
+    def _sampling_key_dict(
+        sampling_params: Any,
+        *,
+        dynamic_qwen: bool = False,
+        has_negative_prompt: bool = False,
+    ) -> dict[str, Any] | None:
         if sampling_params is None:
             return None
         lora_request = _sampling_get(sampling_params, "lora_request")
+        if dynamic_qwen:
+            true_cfg_scale = _sampling_get(sampling_params, "true_cfg_scale", None)
+            true_cfg_scale = 4.0 if true_cfg_scale is None else true_cfg_scale
+            do_classifier_free_guidance = float(true_cfg_scale) > 1.0 and has_negative_prompt
+            out: dict[str, Any] = {}
+            for field in fields(SamplingParamsKey):
+                if field.name == "lora_int_id":
+                    out[field.name] = None if lora_request is None else getattr(lora_request, "lora_int_id", None)
+                elif field.name == "do_classifier_free_guidance":
+                    out[field.name] = do_classifier_free_guidance
+                elif field.name == "lora_scale":
+                    out[field.name] = _sampling_get(sampling_params, "lora_scale", 1.0)
+                elif field.default is not MISSING:
+                    out[field.name] = field.default
+                elif field.default_factory is not MISSING:  # type: ignore[attr-defined]
+                    out[field.name] = field.default_factory()  # type: ignore[misc]
+                else:
+                    out[field.name] = None
+            return out
         out: dict[str, Any] = {}
         for field in fields(SamplingParamsKey):
             if field.name == "lora_int_id":

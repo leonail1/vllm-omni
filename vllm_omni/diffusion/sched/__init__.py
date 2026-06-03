@@ -12,6 +12,11 @@ from vllm_omni.diffusion.sched.interface import (
 from vllm_omni.diffusion.sched.request_scheduler import RequestScheduler
 from vllm_omni.diffusion.sched.slo_step_scheduler import SloStepScheduler
 from vllm_omni.diffusion.sched.step_scheduler import StepScheduler
+from vllm_omni.diffusion.sched.token_slo_step_scheduler import (
+    AdaptiveTokenSloStepScheduler,
+    TokenSloStepScheduler,
+    TokenStepPreemptiveSloStepScheduler,
+)
 
 Scheduler = RequestScheduler
 
@@ -26,4 +31,7 @@ __all__ = [
     "SloStepScheduler",
     "StepScheduler",
     "Scheduler",
+    "AdaptiveTokenSloStepScheduler",
+    "TokenSloStepScheduler",
+    "TokenStepPreemptiveSloStepScheduler",
 ]

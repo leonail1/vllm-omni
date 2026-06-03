@@ -1,0 +1,24 @@
+[
+  {
+    "request_id": "current-mix_ia_2p5_slo_token_step_preemptive_r0_scale_4-0000",
+    "workload": "current-mix",
+    "shape": "512x512",
+    "arrival_s": 0.0,
+    "reference_cost_ms": 16651.144148781896,
+    "slo_ms": 66604.57659512758,
+    "deadline_s": 66.60457659512758,
+    "step_cost_ms": 333.0228829756379,
+    "cost_source": "exact_table"
+  },
+  {
+    "request_id": "current-mix_ia_2p5_slo_token_step_preemptive_r0_scale_4-0001",
+    "workload": "current-mix",
+    "shape": "768x768",
+    "arrival_s": 2.5,
+    "reference_cost_ms": 16463.377065956593,
+    "slo_ms": 65853.50826382637,
+    "deadline_s": 68.35350826382637,
+    "step_cost_ms": 329.26754131913185,
+    "cost_source": "exact_table"
+  }
+]

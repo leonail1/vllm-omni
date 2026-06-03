@@ -1,0 +1,5 @@
+workload,policy,slo_scale,miss_threshold,status,selected_interarrival_s,selected_load_label,throughput_rps,goodput_rps,slo_miss_rate,latency_p95_s,mean_bucket_size,p5_time_to_deadline_ms
+current-mix,slo_no_preemption_token_objective,4.0,0.05,ok,2.5,ia_2p5,0.12363107807421142,0.12363107807421142,0.0,14.082705207401887,1.0,53498.75993728638
+current-mix,slo_no_preemption_token_objective,4.0,0.1,ok,2.5,ia_2p5,0.12363107807421142,0.12363107807421142,0.0,14.082705207401887,1.0,53498.75993728638
+current-mix,slo_token_step_preemptive,4.0,0.05,ok,2.5,ia_2p5,0.11797347577977761,0.11797347577977761,0.0,14.428304215241223,1.0,53279.83214855194
+current-mix,slo_token_step_preemptive,4.0,0.1,ok,2.5,ia_2p5,0.11797347577977761,0.11797347577977761,0.0,14.428304215241223,1.0,53279.83214855194

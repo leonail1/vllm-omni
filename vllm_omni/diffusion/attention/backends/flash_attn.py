@@ -195,6 +195,62 @@ class FlashAttentionImpl(AttentionImpl):
         )
         return self._unwrap_flash_output(out)
 
+    @staticmethod
+    def _npu_cu_seqlens_list(
+        cu_seqlens: torch.Tensor,
+        attn_metadata: AttentionMetadata,
+        cache_key: str,
+    ) -> list[int]:
+        cached = attn_metadata.extra.get(cache_key)
+        if isinstance(cached, tuple) and len(cached) == 2 and cached[0] == id(cu_seqlens):
+            return [int(value) for value in cached[1]]
+        if isinstance(cu_seqlens, torch.Tensor):
+            values = [int(value) for value in cu_seqlens.detach().cpu().tolist()]
+        else:
+            values = [int(value) for value in cu_seqlens]
+        attn_metadata.extra[cache_key] = (id(cu_seqlens), values)
+        return values
+
+    def _forward_varlen_flat_npu(
+        self,
+        query: torch.Tensor,
+        key: torch.Tensor,
+        value: torch.Tensor,
+        attn_metadata: AttentionMetadata,
+    ) -> torch.Tensor:
+        """Run MindIE-SD varlen FlashAttention over flat packed dynamic Q/K/V."""
+        try:
+            from mindiesd import attention_forward_varlen
+        except ImportError:
+            raise ImportError(
+                "FlashAttentionBackend NPU varlen implementation requires MindIE-SD. "
+                "Please install MindIE-SD to enable NPU dynamic attention support. "
+                "For installation details, see https://gitcode.com/Ascend/MindIE-SD"
+                " Otherwise, use SDPA backend by setting DIFFUSION_ATTENTION_BACKEND=TORCH_SDPA"
+            )
+
+        if query.ndim != 3 or key.ndim != 3 or value.ndim != 3:
+            raise ValueError("NPU flat varlen FlashAttention expects [total_tokens, heads, head_dim] Q/K/V.")
+        if attn_metadata.attn_mask is not None or attn_metadata.joint_attn_mask is not None:
+            raise ValueError("NPU flat varlen FlashAttention does not accept attention masks.")
+        if attn_metadata.padded_tokens != 0:
+            raise ValueError("NPU flat varlen FlashAttention requires padded_tokens=0.")
+        if attn_metadata.q_cu_seqlens is None or attn_metadata.kv_cu_seqlens is None:
+            raise ValueError("NPU flat varlen FlashAttention requires q_cu_seqlens and kv_cu_seqlens.")
+
+        q_cu_seqlens = self._npu_cu_seqlens_list(attn_metadata.q_cu_seqlens, attn_metadata, "_npu_q_cu_seqlens")
+        kv_cu_seqlens = self._npu_cu_seqlens_list(attn_metadata.kv_cu_seqlens, attn_metadata, "_npu_kv_cu_seqlens")
+        return attention_forward_varlen(
+            q=query,
+            k=key,
+            v=value,
+            cu_seqlens_q=q_cu_seqlens,
+            cu_seqlens_k=kv_cu_seqlens,
+            dropout_p=0.0,
+            softmax_scale=self.softmax_scale,
+            causal=self.causal,
+        )
+
     def forward_cuda(
         self,
         query: torch.Tensor,
@@ -311,7 +367,11 @@ class FlashAttentionImpl(AttentionImpl):
 
         kv_cache_dtype = attn_metadata.extra.get("kv_cache_dtype") if attn_metadata else None
         if kv_cache_dtype is not None:
+            if attn_metadata is not None and attn_metadata.is_varlen:
+                raise ValueError("NPU flat varlen FlashAttention does not support kv_cache_dtype.")
             return self.forward_fa_quant_npu(query, key, value, attn_metadata)
+        if attn_metadata is not None and attn_metadata.is_varlen:
+            return self._forward_varlen_flat_npu(query, key, value, attn_metadata)
         return self.forward_fa_npu(query, key, value, attn_metadata)
 
     def forward_fa_quant_npu(

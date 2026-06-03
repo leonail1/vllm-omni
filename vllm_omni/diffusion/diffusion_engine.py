@@ -31,7 +31,15 @@ from vllm_omni.diffusion.registry import (
     get_diffusion_pre_process_func,
 )
 from vllm_omni.diffusion.request import OmniDiffusionRequest
-from vllm_omni.diffusion.sched import RequestScheduler, SchedulerInterface, SloStepScheduler, StepScheduler
+from vllm_omni.diffusion.sched import (
+    AdaptiveTokenSloStepScheduler,
+    RequestScheduler,
+    SchedulerInterface,
+    SloStepScheduler,
+    StepScheduler,
+    TokenSloStepScheduler,
+    TokenStepPreemptiveSloStepScheduler,
+)
 from vllm_omni.diffusion.sched.base_scheduler import qwen_image_dynamic_step_batching_enabled
 from vllm_omni.diffusion.sched.interface import DiffusionRequestStatus
 from vllm_omni.diffusion.worker.utils import BatchRunnerOutput, RunnerOutput
@@ -180,7 +188,35 @@ class DiffusionEngine:
                 or additional_config.get("diffusion_step_scheduler_policy")
                 or additional_config.get("scheduler_policy")
             )
-            if isinstance(policy, str) and policy.lower() in {"slo", "slo_aware", "bucket_slo"}:
+            token_slo_policies = {
+                "token_slo",
+                "slo_token",
+                "slo_token_dynamic",
+                "slo_no_preemption_token_guarded",
+                "slo_no_preemption_token_objective",
+                "slo_token_stagepool_objective",
+            }
+            adaptive_token_slo_policies = {
+                "slo_no_preemption_token_adaptive",
+                "slo_token_adaptive",
+            }
+            token_step_preemptive_policies = {
+                "slo_token_step_preemptive",
+                "slo_step_preemptive_token",
+                "slo_token_preemptive",
+            }
+            if isinstance(policy, str) and policy.lower() in token_step_preemptive_policies:
+                return TokenStepPreemptiveSloStepScheduler()
+            if isinstance(policy, str) and policy.lower() in adaptive_token_slo_policies:
+                return AdaptiveTokenSloStepScheduler()
+            if isinstance(policy, str) and policy.lower() in token_slo_policies:
+                return TokenSloStepScheduler()
+            if isinstance(policy, str) and policy.lower() in {
+                "slo",
+                "slo_aware",
+                "bucket_slo",
+                "slo_no_preemption_guarded",
+            }:
                 if (
                     getattr(od_config, "step_execution", False)
                     and getattr(od_config, "model_class_name", None) == "QwenImagePipeline"

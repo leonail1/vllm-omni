@@ -52,6 +52,9 @@ class SloStepScheduler(StepScheduler):
         self.no_preemption_admission_max_batch_size = 0
         self.ignore_request_reference_cost = False
         self.use_shape_fallback_cost = True
+        self._step_preemption_count = 0
+        self._preempted_wait_started_s: dict[str, float] = {}
+        self._preempted_extra_wait_ms: dict[str, float] = {}
 
     def initialize(self, od_config) -> None:
         super().initialize(od_config)
@@ -81,6 +84,9 @@ class SloStepScheduler(StepScheduler):
         )
         self.ignore_request_reference_cost = _coerce_bool(slo_config.get("ignore_request_reference_cost"), False)
         self.use_shape_fallback_cost = _coerce_bool(slo_config.get("use_shape_fallback_cost"), True)
+        self._step_preemption_count = 0
+        self._preempted_wait_started_s.clear()
+        self._preempted_extra_wait_ms.clear()
         self.cost_model = DiffusionStepCostModel.from_config(
             slo_config,
             default_step_ms=self.default_step_ms,
@@ -106,6 +112,8 @@ class SloStepScheduler(StepScheduler):
             state = self._request_states.get(sched_req_id)
             if state is not None and not state.is_finished():
                 state.status = DiffusionRequestStatus.PREEMPTED
+                self._preempted_wait_started_s.setdefault(sched_req_id, now_s)
+        self._step_preemption_count += len(preempted_running)
         self._running = [sched_req_id for sched_req_id in original_running if sched_req_id in selected_set]
         self._waiting = deque(
             [
@@ -116,6 +124,8 @@ class SloStepScheduler(StepScheduler):
 
         scheduled_new_reqs: list[NewRequestData] = []
         scheduled_cached_req_ids: list[str] = []
+        resumed_preempted_req_ids: list[str] = []
+        resumed_preempted_extra_wait_ms: dict[str, float] = {}
 
         for sched_req_id in selected_ids:
             state = self._request_states.get(sched_req_id)
@@ -126,12 +136,21 @@ class SloStepScheduler(StepScheduler):
                 continue
 
             was_new_request = state.status == DiffusionRequestStatus.WAITING
+            was_preempted_request = state.status == DiffusionRequestStatus.PREEMPTED
             state.status = DiffusionRequestStatus.RUNNING
             if sched_req_id not in self._running:
                 self._running.append(sched_req_id)
             if was_new_request:
                 scheduled_new_reqs.append(NewRequestData.from_state(state))
             else:
+                if was_preempted_request:
+                    resumed_preempted_req_ids.append(sched_req_id)
+                    started_s = self._preempted_wait_started_s.pop(sched_req_id, now_s)
+                    extra_wait_ms = max((now_s - started_s) * 1000.0, 0.0)
+                    self._preempted_extra_wait_ms[sched_req_id] = (
+                        self._preempted_extra_wait_ms.get(sched_req_id, 0.0) + extra_wait_ms
+                    )
+                    resumed_preempted_extra_wait_ms[sched_req_id] = extra_wait_ms
                 scheduled_cached_req_ids.append(sched_req_id)
 
         self._running_sampling_params_key = selected_key if self._running else None
@@ -139,6 +158,11 @@ class SloStepScheduler(StepScheduler):
         debug_info = dict(debug_info)
         debug_info["resident_reqs"] = len(self._resident_sched_req_ids())
         debug_info["safe_admit_capacity"] = self._safe_admit_capacity()
+        debug_info["step_preemption_count"] = len(preempted_running)
+        debug_info["step_preemption_total_count"] = self._step_preemption_count
+        debug_info["preempted_req_ids"] = list(preempted_running)
+        debug_info["resumed_preempted_req_ids"] = resumed_preempted_req_ids
+        debug_info["resumed_preempted_extra_wait_ms"] = resumed_preempted_extra_wait_ms
 
         scheduler_output = DiffusionSchedulerOutput(
             step_id=self._step_id,
@@ -167,6 +191,7 @@ class SloStepScheduler(StepScheduler):
             buckets.append(
                 {
                     "key": None if key is None else asdict(key),
+                    "sched_req_ids": [state.sched_req_id for state in states],
                     "num_running": sum(1 for state in states if state.sched_req_id in self._running),
                     "num_waiting": sum(1 for state in states if state.sched_req_id in self._waiting),
                     "candidate_batch_size": len(states),
@@ -195,6 +220,10 @@ class SloStepScheduler(StepScheduler):
             "num_resident_reqs": len(self._resident_sched_req_ids()),
             "max_num_running": self.max_num_running_reqs,
             "safe_admit_capacity": self._safe_admit_capacity(),
+            "enable_step_preemption": self.enable_step_preemption,
+            "step_preemption_total_count": self._step_preemption_count,
+            "preempted_waiting_req_ids": list(self._preempted_wait_started_s),
+            "preempted_extra_wait_ms": dict(self._preempted_extra_wait_ms),
             "no_preemption_admission_max_batch_size": self.no_preemption_admission_max_batch_size,
             "buckets": buckets,
         }
@@ -448,6 +477,24 @@ class SloStepScheduler(StepScheduler):
             if state.status in (DiffusionRequestStatus.RUNNING, DiffusionRequestStatus.PREEMPTED):
                 resident_ids.add(sched_req_id)
         return resident_ids
+
+    def _finish_requests(
+        self,
+        statuses: dict[str, DiffusionRequestStatus],
+        errors: dict[str, str | None] | None = None,
+    ) -> set[str]:
+        finished_req_ids = super()._finish_requests(statuses, errors)
+        for sched_req_id in finished_req_ids:
+            self._clear_preemption_tracking(sched_req_id)
+        return finished_req_ids
+
+    def _pop_extra_request_state(self, sched_req_id: str) -> None:
+        super()._pop_extra_request_state(sched_req_id)
+        self._clear_preemption_tracking(sched_req_id)
+
+    def _clear_preemption_tracking(self, sched_req_id: str) -> None:
+        self._preempted_wait_started_s.pop(sched_req_id, None)
+        self._preempted_extra_wait_ms.pop(sched_req_id, None)
 
     def _safe_admit_capacity(self) -> int:
         return max(0, self.max_num_running_reqs - len(self._resident_sched_req_ids()))

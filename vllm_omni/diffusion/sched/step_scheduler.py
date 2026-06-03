@@ -101,6 +101,7 @@ class StepScheduler(_BaseScheduler):
             buckets.append(
                 {
                     "key": None if key is None else asdict(key),
+                    "sched_req_ids": [state.sched_req_id for state in states],
                     "num_running": sum(1 for state in states if state.sched_req_id in self._running),
                     "num_waiting": sum(1 for state in states if state.sched_req_id in self._waiting),
                     "candidate_batch_size": len(states),

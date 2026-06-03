@@ -13,7 +13,9 @@ DEVICES="${DEVICES:-0,1,2,3,4,5,6,7}"
 REPLICAS="${REPLICAS:-4}"
 TP_SIZE="${TP_SIZE:-2}"
 MAX_NUM_SEQS="${MAX_NUM_SEQS:-4}"
+QUANTIZATION_CONFIG="${QUANTIZATION_CONFIG:-}"
 ENFORCE_EAGER="${ENFORCE_EAGER:-false}"
+STATIC_ATTENTION_BACKEND="${STATIC_ATTENTION_BACKEND:-TORCH_SDPA}"
 NUM_REQUESTS="${NUM_REQUESTS:-60}"
 INTERARRIVALS="${INTERARRIVALS:-4.25,2.5}"
 SCALES="${SCALES:-4.0,6.0}"
@@ -25,6 +27,27 @@ if [[ -z "${CANDIDATE_POLICY}" ]]; then
   CANDIDATE_POLICY="slo_no_preemption_lookup"
   if [[ ",${POLICIES}," == *",slo_no_preemption_guarded,"* ]]; then
     CANDIDATE_POLICY="slo_no_preemption_guarded"
+  fi
+  if [[ ",${POLICIES}," == *",slo_no_preemption_token_guarded,"* ]]; then
+    CANDIDATE_POLICY="slo_no_preemption_token_guarded"
+  fi
+  if [[ ",${POLICIES}," == *",slo_no_preemption_token_adaptive,"* ]]; then
+    CANDIDATE_POLICY="slo_no_preemption_token_adaptive"
+  fi
+  if [[ ",${POLICIES}," == *",slo_no_preemption_token_objective,"* ]]; then
+    CANDIDATE_POLICY="slo_no_preemption_token_objective"
+  fi
+  if [[ ",${POLICIES}," == *",slo_token_stagepool_objective,"* ]]; then
+    CANDIDATE_POLICY="slo_token_stagepool_objective"
+  fi
+  if [[ ",${POLICIES}," == *",slo_token_step_preemptive,"* ]]; then
+    CANDIDATE_POLICY="slo_token_step_preemptive"
+  fi
+  if [[ ",${POLICIES}," == *",slo_step_preemptive_token,"* ]]; then
+    CANDIDATE_POLICY="slo_step_preemptive_token"
+  fi
+  if [[ ",${POLICIES}," == *",slo_token_preemptive,"* ]]; then
+    CANDIDATE_POLICY="slo_token_preemptive"
   fi
 fi
 PROFILE_MODE="${PROFILE_MODE:-e2e_slo_frontier}"
@@ -47,7 +70,7 @@ mkdir -p "${OUTDIR}"
 
 LOG="${OUTDIR}/runner.log"
 STATUS_JSON="${OUTDIR}/status.json"
-DEPLOY_CONFIG="${OUTDIR}/qwen_image_4replicas_tp2.yaml"
+DEPLOY_CONFIG="${OUTDIR}/qwen_image_${REPLICAS}replicas_tp${TP_SIZE}.yaml"
 
 log() {
   printf '[%s] %s\n' "$(date '+%F %T')" "$*" | tee -a "${LOG}"
@@ -78,7 +101,7 @@ validate_policy() {
   local policy="$1"
   validate_safe_token "policy" "${policy}"
   case "${policy}" in
-    current|stagepool_only|instance_only|constant_cost|formula_cost|full_slo|no_preemption|slo_no_preemption_lookup|slo_no_preemption_guarded|pr4024_dynamic|alpha0|alpha1) ;;
+    current|stagepool_only|instance_only|constant_cost|formula_cost|full_slo|no_preemption|slo_no_preemption_lookup|slo_no_preemption_guarded|slo_no_preemption_token_guarded|slo_no_preemption_token_adaptive|slo_no_preemption_token_objective|slo_token_stagepool_objective|slo_token_step_preemptive|slo_step_preemptive_token|slo_token_preemptive|pr4024_dynamic|alpha0|alpha1) ;;
     *)
       log "unknown policy: ${policy}"
       exit 2
@@ -174,6 +197,32 @@ setup_env() {
   source /usr/local/Ascend/ascend-toolkit/set_env.sh
   source /usr/local/Ascend/nnal/atb/set_env.sh
   source "${VENV}/bin/activate"
+  local venv_pythonpath=""
+  venv_pythonpath="$(python - <<'PY'
+import sysconfig
+
+paths = []
+for key in ("purelib", "platlib"):
+    path = sysconfig.get_paths().get(key)
+    if path and path not in paths:
+        paths.append(path)
+print(":".join(paths))
+PY
+)"
+  local runtime_pythonpath=""
+  local entry
+  IFS=':' read -r -a pythonpath_entries <<< "${PYTHONPATH:-}"
+  for entry in "${pythonpath_entries[@]}"; do
+    if [[ -z "${entry}" ]]; then
+      continue
+    fi
+    runtime_pythonpath="${runtime_pythonpath}${runtime_pythonpath:+:}${entry}"
+  done
+  local code_pythonpath="${REPO}"
+  if [[ -n "${BENCHMARK_PYTHONPATH:-}" ]]; then
+    code_pythonpath="${BENCHMARK_PYTHONPATH}:${REPO}"
+  fi
+  export PYTHONPATH="${code_pythonpath}${venv_pythonpath:+:${venv_pythonpath}}${runtime_pythonpath:+:${runtime_pythonpath}}"
 }
 
 write_deploy_config() {
@@ -319,8 +368,27 @@ import sys
     guarded_stagepool_pack_max_matching_bucket_size,
     guarded_no_preemption_admission_max_batch_size,
 ) = sys.argv[1:13]
+dynamic_policies = {
+    "pr4024_dynamic",
+    "slo_no_preemption_token_guarded",
+    "slo_no_preemption_token_adaptive",
+    "slo_no_preemption_token_objective",
+    "slo_token_stagepool_objective",
+    "slo_token_step_preemptive",
+    "slo_step_preemptive_token",
+    "slo_token_preemptive",
+}
+token_stagepool_objective_policies = {
+    "slo_no_preemption_token_objective",
+    "slo_token_stagepool_objective",
+}
+token_step_preemptive_policies = {
+    "slo_token_step_preemptive",
+    "slo_step_preemptive_token",
+    "slo_token_preemptive",
+}
 config = {
-    "diffusion_dynamic_step_batching_enabled": policy == "pr4024_dynamic",
+    "diffusion_dynamic_step_batching_enabled": policy in dynamic_policies,
     "diffusion_step_profile": {
         "enabled": True,
         "output_path": raw,
@@ -399,6 +467,64 @@ elif policy == "slo_no_preemption_guarded":
         "stagepool_pack_max_matching_bucket_size": int(float(guarded_stagepool_pack_max_matching_bucket_size)),
         "no_preemption_admission_max_batch_size": int(float(guarded_no_preemption_admission_max_batch_size)),
     }
+elif policy == "slo_no_preemption_token_guarded":
+    config["diffusion_scheduler_policy"] = "slo_no_preemption_token_guarded"
+    config["diffusion_slo_scheduler"] = {
+        **lookup,
+        "enable_stagepool_slo": True,
+        "enable_step_preemption": False,
+        "no_preemption_admission_guard": True,
+        "stagepool_laxity_window_ms": float(guarded_stagepool_laxity_window_ms),
+        "stagepool_pack_min_laxity_ms": float(stagepool_pack_min_laxity_ms),
+        "stagepool_pack_max_queue_length": int(float(guarded_stagepool_pack_max_queue_length)),
+        "stagepool_pack_max_matching_bucket_size": int(float(guarded_stagepool_pack_max_matching_bucket_size)),
+        "no_preemption_admission_max_batch_size": int(float(guarded_no_preemption_admission_max_batch_size)),
+    }
+elif policy == "slo_no_preemption_token_adaptive":
+    config["diffusion_scheduler_policy"] = "slo_no_preemption_token_adaptive"
+    config["diffusion_slo_scheduler"] = {
+        **lookup,
+        "enable_stagepool_slo": True,
+        "enable_step_preemption": False,
+        "no_preemption_admission_guard": True,
+        "stagepool_laxity_window_ms": float(guarded_stagepool_laxity_window_ms),
+        "stagepool_pack_min_laxity_ms": float(stagepool_pack_min_laxity_ms),
+        "stagepool_pack_max_queue_length": int(float(guarded_stagepool_pack_max_queue_length)),
+        "stagepool_pack_max_matching_bucket_size": int(float(guarded_stagepool_pack_max_matching_bucket_size)),
+        "no_preemption_admission_max_batch_size": int(float(guarded_no_preemption_admission_max_batch_size)),
+        "adaptive_min_laxity_ratio": 0.10,
+        "adaptive_high_token_ratio": 0.75,
+        "adaptive_priority_laxity_window_ms": 500.0,
+        "adaptive_priority_ratio_window": 0.25,
+        "stagepool_profile_reject_laxity_ms": 0.0,
+    }
+elif policy in token_stagepool_objective_policies:
+    config["diffusion_scheduler_policy"] = policy
+    config["diffusion_slo_scheduler"] = {
+        **lookup,
+        "enable_stagepool_slo": True,
+        "enable_step_preemption": False,
+        "no_preemption_admission_guard": True,
+        "stagepool_selection_objective": "token_slo_objective",
+        "stagepool_laxity_window_ms": float(guarded_stagepool_laxity_window_ms),
+        "stagepool_pack_min_laxity_ms": float(stagepool_pack_min_laxity_ms),
+        "stagepool_pack_max_queue_length": int(float(guarded_stagepool_pack_max_queue_length)),
+        "stagepool_pack_max_matching_bucket_size": int(float(guarded_stagepool_pack_max_matching_bucket_size)),
+        "no_preemption_admission_max_batch_size": int(float(guarded_no_preemption_admission_max_batch_size)),
+    }
+elif policy in token_step_preemptive_policies:
+    config["diffusion_scheduler_policy"] = policy
+    config["diffusion_slo_scheduler"] = {
+        **lookup,
+        "enable_stagepool_slo": True,
+        "enable_step_preemption": True,
+        "allow_preemptive_admission_swap": True,
+        "no_preemption_admission_guard": True,
+        "stagepool_laxity_window_ms": float(guarded_stagepool_laxity_window_ms),
+        "stagepool_pack_min_laxity_ms": float(stagepool_pack_min_laxity_ms),
+        "stagepool_pack_max_queue_length": int(float(guarded_stagepool_pack_max_queue_length)),
+        "stagepool_pack_max_matching_bucket_size": int(float(guarded_stagepool_pack_max_matching_bucket_size)),
+    }
 elif policy == "alpha0":
     config["diffusion_scheduler_policy"] = "slo"
     config["diffusion_slo_scheduler"] = {
@@ -440,7 +566,14 @@ start_service() {
   additional_config="$(make_additional_config "${policy}" "${raw}" "${stagepool_raw}")"
   local extra_server_args=""
   local extra_server_env=""
-  if [[ "${policy}" == "pr4024_dynamic" ]]; then
+  if [[ "${QUANTIZATION_CONFIG}" == *"'"* ]]; then
+    echo "QUANTIZATION_CONFIG must not contain a single quote." >&2
+    exit 2
+  fi
+  if [[ -n "${QUANTIZATION_CONFIG}" ]]; then
+    extra_server_args="${extra_server_args} --quantization-config '${QUANTIZATION_CONFIG}'"
+  fi
+  if [[ "${policy}" == "pr4024_dynamic" || "${policy}" == "slo_no_preemption_token_guarded" || "${policy}" == "slo_no_preemption_token_adaptive" || "${policy}" == "slo_no_preemption_token_objective" || "${policy}" == "slo_token_stagepool_objective" || "${policy}" == "slo_token_step_preemptive" || "${policy}" == "slo_step_preemptive_token" || "${policy}" == "slo_token_preemptive" ]]; then
     local dynamic_attention_backend="${PR4024_DYNAMIC_ATTENTION_BACKEND:-FLASH_ATTN}"
     case "${dynamic_attention_backend}" in
       FLASH_ATTN|TORCH_SDPA) ;;
@@ -449,8 +582,17 @@ start_service() {
         exit 2
         ;;
     esac
-    extra_server_args="--enforce-eager"
+    extra_server_args="${extra_server_args} --enforce-eager"
     extra_server_env="DIFFUSION_ATTENTION_BACKEND=${dynamic_attention_backend}"
+  elif [[ -n "${STATIC_ATTENTION_BACKEND}" ]]; then
+    case "${STATIC_ATTENTION_BACKEND}" in
+      FLASH_ATTN|TORCH_SDPA) ;;
+      *)
+        echo "Unsupported STATIC_ATTENTION_BACKEND=${STATIC_ATTENTION_BACKEND}. Expected FLASH_ATTN, TORCH_SDPA, or empty." >&2
+        exit 2
+        ;;
+    esac
+    extra_server_env="DIFFUSION_ATTENTION_BACKEND=${STATIC_ATTENTION_BACKEND}"
   fi
   log "starting ${policy}: port=${port}, replicas=${REPLICAS}, tp=${TP_SIZE}, devices=${DEVICES}"
   setsid bash -c "exec env -u DIFFUSION_ATTENTION_BACKEND \
@@ -504,6 +646,7 @@ make_trace() {
   local dir="${OUTDIR}/${workload}/${label}/${policy}/repeat_${repeat}/scale_${scale_label}"
   local trace="${dir}/trace.txt"
   mkdir -p "${dir}"
+  log "making trace ${policy} workload=${workload} interarrival=${interarrival} repeat=${repeat} scale=${scale}"
   python benchmarks/diffusion/e2e_slo_first_experiment.py make-trace \
     --output "${trace}" \
     --trace-id "${workload}_${label}_${policy}_r${repeat}_scale_${scale_label}" \
@@ -515,7 +658,25 @@ make_trace() {
     --num-requests "${NUM_REQUESTS}" \
     --global-interarrival-s "${interarrival}" \
     --slo-scale "${scale}" \
-    --step-cost-model-path "${COST_MODEL}"
+    --step-cost-model-path "${COST_MODEL}" \
+    2>&1 | tee -a "${LOG}"
+}
+
+make_policy_traces() {
+  local policy="$1"
+  local workload
+  local interarrival
+  local repeat
+  local scale
+  for workload in ${WORKLOADS//,/ }; do
+    for interarrival in ${INTERARRIVALS//,/ }; do
+      for repeat in ${REPEATS//,/ }; do
+        for scale in ${SCALES//,/ }; do
+          make_trace "${policy}" "${repeat}" "${scale}" "${workload}" "${interarrival}" || return 1
+        done
+      done
+    done
+  done
 }
 
 run_benchmark() {
@@ -604,6 +765,7 @@ run_policy() {
 
   write_status "starting_${policy}" "Starting ${policy}"
   clean_policy_result_dirs "${policy}"
+  make_policy_traces "${policy}" || return 1
   write_deploy_config "${policy}"
   start_service "${policy}" "${port}" "${master_port}"
   ACTIVE_PID_FILE="${pid_file}"
@@ -616,11 +778,6 @@ run_policy() {
     for interarrival in ${INTERARRIVALS//,/ }; do
       for repeat in ${REPEATS//,/ }; do
         for scale in ${SCALES//,/ }; do
-          make_trace "${policy}" "${repeat}" "${scale}" "${workload}" "${interarrival}" || {
-            stop_service "${pid_file}"
-            ACTIVE_PID_FILE=""
-            return 1
-          }
           run_benchmark "${policy}" "${repeat}" "${scale}" "${port}" "${workload}" "${interarrival}" || {
             stop_service "${pid_file}"
             ACTIVE_PID_FILE=""

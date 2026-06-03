@@ -9,6 +9,9 @@ This script tests two main scenarios:
 2. Case 2: Comparing FlashAttention and SDPA backends for batch_size=2 with padding
 """
 
+import sys
+import types
+
 import pytest
 import torch
 
@@ -265,6 +268,65 @@ def test_fa_vs_sdpa():
     assert mean_diff < 0.001, f"Mean difference {mean_diff} exceeds threshold 0.001"
 
     print("✓ Case 2 PASSED: FA and SDPA outputs are very close!")
+
+
+def test_npu_flat_varlen_uses_mindiesd_varlen(monkeypatch):
+    calls: dict[str, object] = {}
+
+    def fake_attention_forward_varlen(**kwargs):
+        calls.update(kwargs)
+        return kwargs["q"] + 1
+
+    def fake_attention_forward(*args, **kwargs):
+        raise AssertionError("dense MindIE attention should not be used for flat varlen inputs")
+
+    monkeypatch.setitem(
+        sys.modules,
+        "mindiesd",
+        types.SimpleNamespace(
+            attention_forward=fake_attention_forward,
+            attention_forward_varlen=fake_attention_forward_varlen,
+        ),
+    )
+
+    lengths = [2, 3]
+    num_heads = 2
+    head_dim = 4
+    total_tokens = sum(lengths)
+    query = torch.randn(total_tokens, num_heads, head_dim)
+    key = torch.randn_like(query)
+    value = torch.randn_like(query)
+    cu_seqlens = torch.tensor([0, lengths[0], total_tokens], dtype=torch.int32)
+    metadata = AttentionMetadata(
+        q_cu_seqlens=cu_seqlens,
+        kv_cu_seqlens=cu_seqlens,
+        max_q_len=max(lengths),
+        max_kv_len=max(lengths),
+        padded_tokens=0,
+    )
+    impl = FlashAttentionImpl(
+        num_heads=num_heads,
+        head_size=head_dim,
+        softmax_scale=head_dim**-0.5,
+        causal=False,
+        num_kv_heads=num_heads,
+    )
+
+    actual = impl.forward_npu(query, key, value, metadata)
+
+    assert torch.equal(actual, query + 1)
+    assert calls["q"] is query
+    assert calls["k"] is key
+    assert calls["v"] is value
+    assert calls["cu_seqlens_q"] == [0, lengths[0], total_tokens]
+    assert calls["cu_seqlens_k"] == [0, lengths[0], total_tokens]
+    assert metadata.extra["_npu_q_cu_seqlens"] == (id(cu_seqlens), [0, lengths[0], total_tokens])
+    assert metadata.extra["_npu_kv_cu_seqlens"] == (id(cu_seqlens), [0, lengths[0], total_tokens])
+    assert calls["dropout_p"] == 0.0
+    assert calls["softmax_scale"] == head_dim**-0.5
+    assert calls["causal"] is False
+    assert "max_seqlen_q" not in calls
+    assert "max_seqlen_k" not in calls
 
 
 @pytest.mark.skipif(not is_gpu, reason="FlashAttention requires CUDA or XPU")

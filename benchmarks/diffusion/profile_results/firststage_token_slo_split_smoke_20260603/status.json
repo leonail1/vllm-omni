@@ -1,0 +1,24 @@
+{
+  "message": "First-stage token SLO smoke result bundle packaged",
+  "output_dir": "/home/lzg/vllm-omni-pr4024-baseline/benchmark_outputs/codex-firststage-token-slo-split-smoke-20260603-103508",
+  "bundle_dir": "benchmarks/diffusion/profile_results/firststage_token_slo_split_smoke_20260603",
+  "workloads": [
+    "current-mix"
+  ],
+  "interarrivals": [
+    2.5
+  ],
+  "policies": [
+    "slo_no_preemption_token_objective",
+    "slo_token_step_preemptive"
+  ],
+  "candidate_policy": "slo_token_step_preemptive",
+  "comparison_file": "current_vs_slo_token_step_preemptive.csv",
+  "scales": [
+    4.0
+  ],
+  "repeats": [
+    0
+  ],
+  "profile_mode": "firststage_token_slo_smoke"
+}

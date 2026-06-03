@@ -5,6 +5,7 @@ import asyncio
 import json
 import queue
 import threading
+import time
 from types import SimpleNamespace
 
 import pytest
@@ -15,12 +16,15 @@ from vllm_omni.diffusion.data import DiffusionOutput, DiffusionRequestAbortedErr
 from vllm_omni.diffusion.diffusion_engine import DiffusionEngine
 from vllm_omni.diffusion.request import OmniDiffusionRequest
 from vllm_omni.diffusion.sched import (
+    AdaptiveTokenSloStepScheduler,
     DiffusionRequestStatus,
     RequestScheduler,
     Scheduler,
     SchedulerInterface,
     SloStepScheduler,
     StepScheduler,
+    TokenSloStepScheduler,
+    TokenStepPreemptiveSloStepScheduler,
 )
 from vllm_omni.diffusion.sched.interface import CachedRequestData, NewRequestData
 from vllm_omni.diffusion.worker.utils import RunnerOutput
@@ -624,6 +628,61 @@ class TestDiffusionEngine:
         scheduler = engine._make_default_scheduler(self._qwen_dynamic_slo_config(dynamic_enabled=False))
 
         assert isinstance(scheduler, SloStepScheduler)
+
+    def test_allows_qwen_dynamic_batching_with_token_slo_scheduler(self) -> None:
+        engine = DiffusionEngine.__new__(DiffusionEngine)
+        engine.step_execution = True
+        config = self._qwen_dynamic_slo_config(dynamic_enabled=True)
+        config.additional_config["diffusion_scheduler_policy"] = "slo_no_preemption_token_guarded"
+
+        scheduler = engine._make_default_scheduler(config)
+
+        assert isinstance(scheduler, TokenSloStepScheduler)
+
+    def test_allows_qwen_dynamic_batching_with_adaptive_token_slo_scheduler(self) -> None:
+        engine = DiffusionEngine.__new__(DiffusionEngine)
+        engine.step_execution = True
+        config = self._qwen_dynamic_slo_config(dynamic_enabled=True)
+        config.additional_config["diffusion_scheduler_policy"] = "slo_no_preemption_token_adaptive"
+
+        scheduler = engine._make_default_scheduler(config)
+
+        assert isinstance(scheduler, AdaptiveTokenSloStepScheduler)
+
+    @pytest.mark.parametrize(
+        "policy",
+        [
+            "slo_no_preemption_token_objective",
+            "slo_token_stagepool_objective",
+        ],
+    )
+    def test_allows_qwen_dynamic_batching_with_token_objective_scheduler(self, policy: str) -> None:
+        engine = DiffusionEngine.__new__(DiffusionEngine)
+        engine.step_execution = True
+        config = self._qwen_dynamic_slo_config(dynamic_enabled=True)
+        config.additional_config["diffusion_scheduler_policy"] = policy
+
+        scheduler = engine._make_default_scheduler(config)
+
+        assert isinstance(scheduler, TokenSloStepScheduler)
+
+    @pytest.mark.parametrize(
+        "policy",
+        [
+            "slo_token_step_preemptive",
+            "slo_step_preemptive_token",
+            "slo_token_preemptive",
+        ],
+    )
+    def test_allows_qwen_dynamic_batching_with_token_step_preemptive_scheduler(self, policy: str) -> None:
+        engine = DiffusionEngine.__new__(DiffusionEngine)
+        engine.step_execution = True
+        config = self._qwen_dynamic_slo_config(dynamic_enabled=True)
+        config.additional_config["diffusion_scheduler_policy"] = policy
+
+        scheduler = engine._make_default_scheduler(config)
+
+        assert isinstance(scheduler, TokenStepPreemptiveSloStepScheduler)
 
     def test_add_req_and_wait_for_response_single_path(self, mocker: MockerFixture) -> None:
         engine = DiffusionEngine.__new__(DiffusionEngine)
@@ -1933,3 +1992,409 @@ class TestSloStepScheduler:
 
         assert snapshot["buckets"][0]["step_cost_source"] == "legacy"
         assert snapshot["buckets"][0]["estimated_step_ms"] == pytest.approx(100.0)
+
+
+class TestTokenSloStepScheduler:
+    @staticmethod
+    def _qwen_dynamic_config(slo_config: dict | None = None, max_num_seqs: int = 4) -> SimpleNamespace:
+        base_slo_config = {
+            "default_step_ms": 100.0,
+            "batch_growth_alpha": 1.0,
+            "ignore_request_reference_cost": True,
+            "use_shape_fallback_cost": True,
+        }
+        if slo_config:
+            base_slo_config.update(slo_config)
+        return SimpleNamespace(
+            model="Qwen/Qwen-Image",
+            model_class_name="QwenImagePipeline",
+            step_execution=True,
+            max_num_seqs=max_num_seqs,
+            enforce_eager=True,
+            cache_backend="none",
+            diffusion_kv_cache_dtype=None,
+            parallel_config=SimpleNamespace(
+                sequence_parallel_size=1,
+                ring_degree=1,
+                cfg_parallel_size=1,
+                use_hsdp=False,
+            ),
+            additional_config={
+                "diffusion_dynamic_step_batching_enabled": True,
+                "diffusion_slo_scheduler": base_slo_config,
+            },
+        )
+
+    def _make_scheduler(
+        self,
+        max_num_seqs: int = 4,
+        slo_config: dict | None = None,
+        scheduler_cls=TokenSloStepScheduler,
+    ) -> TokenSloStepScheduler:
+        scheduler = scheduler_cls()
+        scheduler.initialize(self._qwen_dynamic_config(slo_config=slo_config, max_num_seqs=max_num_seqs))
+        return scheduler
+
+    @staticmethod
+    def _make_token_request(
+        req_id: str,
+        *,
+        height: int,
+        slo_ms: float = 10000.0,
+        num_inference_steps: int = 10,
+        deadline_time_s: float | None = None,
+        arrival_time_s: float | None = None,
+    ) -> OmniDiffusionRequest:
+        kwargs = {
+            "height": height,
+            "width": height,
+            "num_inference_steps": num_inference_steps,
+            "reference_cost_ms": 1000.0,
+            "slo_ms": slo_ms,
+            "true_cfg_scale": 1.0,
+        }
+        if arrival_time_s is not None:
+            kwargs["arrival_time_s"] = arrival_time_s
+        if deadline_time_s is not None:
+            kwargs["deadline_time_s"] = deadline_time_s
+        sampling_params = OmniDiffusionSamplingParams(**kwargs)
+        return OmniDiffusionRequest(
+            prompts=[{"prompt": f"prompt-{req_id}"}],
+            sampling_params=sampling_params,
+            request_id=req_id,
+        )
+
+    def test_mixed_dynamic_batch_uses_token_weighted_effective_size(self) -> None:
+        scheduler = self._make_scheduler(max_num_seqs=4)
+        scheduler.add_request(self._make_token_request("small", height=512))
+        scheduler.add_request(self._make_token_request("large", height=1024))
+
+        snapshot = scheduler.get_load_snapshot()
+
+        assert snapshot["policy"] == "TokenSloStepScheduler"
+        assert len(snapshot["buckets"]) == 1
+        bucket = snapshot["buckets"][0]
+        assert bucket["candidate_batch_size"] == 2
+        assert bucket["max_latent_tokens"] == 4096
+        assert bucket["total_latent_tokens"] == 5120
+        assert bucket["token_effective_batch_size"] == pytest.approx(1.25)
+        assert bucket["token_batch_utilization"] == pytest.approx(0.625)
+        assert bucket["estimated_step_ms"] == pytest.approx(125.0)
+        assert snapshot["token_pressure"] > 0
+
+    def test_incremental_step_cost_uses_largest_token_shape_with_cost_model(self) -> None:
+        class RecordingCostModel:
+            def __init__(self) -> None:
+                self.calls: list[dict] = []
+
+            def latent_tokens(self, width, height, num_frames=1):
+                return int((float(width) / 16.0) * (float(height) / 16.0) * float(num_frames or 1))
+
+            def estimate(self, **kwargs):
+                self.calls.append(dict(kwargs))
+                return SimpleNamespace(
+                    step_ms=float(kwargs["effective_batch_size"]) * 100.0,
+                    source="recording",
+                    latent_tokens=self.latent_tokens(
+                        kwargs["width"],
+                        kwargs["height"],
+                        kwargs.get("num_frames", 1),
+                    ),
+                )
+
+        scheduler = self._make_scheduler(max_num_seqs=4)
+        recorder = RecordingCostModel()
+        scheduler.cost_model = recorder
+        scheduler.add_request(self._make_token_request("small", height=512))
+        scheduler.add_request(self._make_token_request("large", height=1024))
+
+        bucket = scheduler.get_load_snapshot()["buckets"][0]
+
+        assert bucket["estimated_step_ms"] == pytest.approx(125.0)
+        assert bucket["estimated_step_ms_if_add_one"] == pytest.approx(225.0)
+        assert bucket["incremental_step_ms_if_add_one"] == pytest.approx(100.0)
+        assert recorder.calls[-1]["width"] == 1024
+        assert recorder.calls[-1]["height"] == 1024
+        assert recorder.calls[-1]["batch_size"] == 3
+        assert recorder.calls[-1]["effective_batch_size"] == pytest.approx(2.25)
+
+    def test_snapshot_token_fields_follow_actual_candidate_batch(self) -> None:
+        scheduler = self._make_scheduler(max_num_seqs=1)
+        large_loose = scheduler.add_request(self._make_token_request("large-loose", height=1024, slo_ms=10000.0))
+        small_urgent = scheduler.add_request(self._make_token_request("small-urgent", height=512, slo_ms=300.0))
+
+        snapshot = scheduler.get_load_snapshot()
+
+        assert len(snapshot["buckets"]) == 1
+        bucket = snapshot["buckets"][0]
+        assert bucket["sched_req_ids"] == [small_urgent]
+        assert large_loose not in bucket["sched_req_ids"]
+        assert bucket["candidate_batch_size"] == 1
+        assert bucket["max_latent_tokens"] == 1024
+        assert bucket["total_latent_tokens"] == 1024
+
+    def test_no_preemption_token_guard_blocks_large_admission_that_hurts_resident(self) -> None:
+        scheduler = self._make_scheduler(max_num_seqs=2, slo_config={"min_laxity_guard_ms": 0.0})
+        running = scheduler.add_request(self._make_token_request("running", height=512, slo_ms=300.0))
+        first = scheduler.schedule()
+        assert _new_ids(first) == [running]
+        assert scheduler.update_from_output(first, _make_step_output(running, step_index=1)) == set()
+
+        large = scheduler.add_request(self._make_token_request("large", height=1024, slo_ms=10000.0))
+        second = scheduler.schedule()
+
+        assert _new_ids(second) == []
+        assert _cached_ids(second) == [running]
+        assert scheduler.get_request_state(large).status == DiffusionRequestStatus.WAITING
+
+    def test_token_policy_forces_no_preemption_even_if_config_enables_it(self) -> None:
+        scheduler = self._make_scheduler(
+            max_num_seqs=1,
+            slo_config={"enable_step_preemption": True},
+        )
+        assert scheduler.enable_step_preemption is False
+
+        running = scheduler.add_request(self._make_token_request("running", height=512, slo_ms=10000.0))
+        first = scheduler.schedule()
+        assert _new_ids(first) == [running]
+        assert scheduler.update_from_output(first, _make_step_output(running, step_index=1)) == set()
+
+        urgent = scheduler.add_request(
+            OmniDiffusionRequest(
+                prompts=[{"prompt": "urgent", "negative_prompt": "bad"}],
+                sampling_params=OmniDiffusionSamplingParams(
+                    height=1024,
+                    width=1024,
+                    num_inference_steps=10,
+                    reference_cost_ms=1000.0,
+                    slo_ms=100.0,
+                    true_cfg_scale=4.0,
+                ),
+                request_id="urgent",
+            )
+        )
+
+        second = scheduler.schedule()
+
+        assert _new_ids(second) == []
+        assert _cached_ids(second) == [running]
+        assert scheduler.get_request_state(urgent).status == DiffusionRequestStatus.WAITING
+
+
+class TestAdaptiveTokenSloStepScheduler:
+    def _make_scheduler(
+        self,
+        max_num_seqs: int = 4,
+        slo_config: dict | None = None,
+    ) -> AdaptiveTokenSloStepScheduler:
+        scheduler = AdaptiveTokenSloStepScheduler()
+        scheduler.initialize(
+            TestTokenSloStepScheduler._qwen_dynamic_config(
+                slo_config=slo_config,
+                max_num_seqs=max_num_seqs,
+            )
+        )
+        return scheduler
+
+    _make_token_request = staticmethod(TestTokenSloStepScheduler._make_token_request)
+
+    def test_adaptive_guard_blocks_low_ratio_admission_for_resident(self) -> None:
+        scheduler = self._make_scheduler(
+            max_num_seqs=2,
+            slo_config={
+                "adaptive_min_laxity_ratio": 0.20,
+                "min_laxity_guard_ms": 0.0,
+            },
+        )
+        running = scheduler.add_request(self._make_token_request("large-running", height=1024, slo_ms=1200.0))
+        first = scheduler.schedule()
+        assert _new_ids(first) == [running]
+        assert scheduler.update_from_output(first, _make_step_output(running, step_index=1)) == set()
+
+        small = scheduler.add_request(self._make_token_request("small-waiting", height=512, slo_ms=10000.0))
+        second = scheduler.schedule()
+
+        assert _new_ids(second) == []
+        assert _cached_ids(second) == [running]
+        assert scheduler.get_request_state(small).status == DiffusionRequestStatus.WAITING
+
+    def test_adaptive_priority_prefers_large_token_work_inside_laxity_window(self) -> None:
+        now_s = time.time()
+        scheduler = self._make_scheduler(
+            max_num_seqs=1,
+            slo_config={
+                "adaptive_priority_laxity_window_ms": 500.0,
+                "adaptive_priority_ratio_window": 0.25,
+            },
+        )
+        small = scheduler.add_request(
+            self._make_token_request(
+                "small",
+                height=512,
+                arrival_time_s=now_s,
+                deadline_time_s=now_s + 0.95,
+            )
+        )
+        large = scheduler.add_request(
+            self._make_token_request(
+                "large",
+                height=1024,
+                arrival_time_s=now_s,
+                deadline_time_s=now_s + 1.85,
+            )
+        )
+
+        scheduled = scheduler.schedule()
+
+        assert _new_ids(scheduled) == [large]
+        assert scheduler.get_request_state(small).status == DiffusionRequestStatus.WAITING
+
+    def test_adaptive_snapshot_includes_laxity_ratio(self) -> None:
+        scheduler = self._make_scheduler(max_num_seqs=2)
+        scheduler.add_request(self._make_token_request("small", height=512))
+        scheduler.add_request(self._make_token_request("large", height=1024))
+
+        snapshot = scheduler.get_load_snapshot()
+
+        assert snapshot["policy"] == "AdaptiveTokenSloStepScheduler"
+        assert "min_laxity_ratio" in snapshot["buckets"][0]
+
+    def test_adaptive_does_not_preempt_running_bucket_for_urgent_different_key(self) -> None:
+        scheduler = self._make_scheduler(max_num_seqs=2)
+        running = scheduler.add_request(self._make_token_request("running", height=512, slo_ms=10000.0))
+        first = scheduler.schedule()
+        assert _new_ids(first) == [running]
+        assert scheduler.update_from_output(first, _make_step_output(running, step_index=1)) == set()
+
+        urgent = scheduler.add_request(
+            OmniDiffusionRequest(
+                prompts=[{"prompt": "urgent", "negative_prompt": "bad"}],
+                sampling_params=OmniDiffusionSamplingParams(
+                    height=1024,
+                    width=1024,
+                    num_inference_steps=10,
+                    reference_cost_ms=1000.0,
+                    slo_ms=100.0,
+                    true_cfg_scale=4.0,
+                ),
+                request_id="urgent",
+            )
+        )
+        assert (
+            scheduler.get_request_state(running).sampling_params_key
+            != scheduler.get_request_state(urgent).sampling_params_key
+        )
+        second = scheduler.schedule()
+
+        assert _new_ids(second) == []
+        assert _cached_ids(second) == [running]
+        assert scheduler.get_request_state(urgent).status == DiffusionRequestStatus.WAITING
+
+
+class TestTokenStepPreemptiveSloStepScheduler:
+    def _make_scheduler(
+        self,
+        max_num_seqs: int = 1,
+        slo_config: dict | None = None,
+    ) -> TokenStepPreemptiveSloStepScheduler:
+        scheduler = TokenStepPreemptiveSloStepScheduler()
+        scheduler.initialize(
+            TestTokenSloStepScheduler._qwen_dynamic_config(
+                slo_config=slo_config,
+                max_num_seqs=max_num_seqs,
+            )
+        )
+        return scheduler
+
+    _make_token_request = staticmethod(TestTokenSloStepScheduler._make_token_request)
+
+    def test_step_boundary_preempts_large_for_urgent_small_and_resumes_large(self) -> None:
+        now_s = time.time()
+        scheduler = self._make_scheduler(max_num_seqs=1)
+        large = scheduler.add_request(
+            self._make_token_request(
+                "large",
+                height=1024,
+                arrival_time_s=now_s,
+                deadline_time_s=now_s + 10.0,
+            )
+        )
+        first = scheduler.schedule()
+        assert _new_ids(first) == [large]
+        assert scheduler.update_from_output(first, _make_step_output(large, step_index=1)) == set()
+
+        small = scheduler.add_request(
+            self._make_token_request(
+                "small",
+                height=512,
+                arrival_time_s=now_s + 0.01,
+                deadline_time_s=now_s + 0.30,
+            )
+        )
+        assert (
+            scheduler.get_request_state(large).sampling_params_key
+            == scheduler.get_request_state(small).sampling_params_key
+        )
+
+        second = scheduler.schedule()
+
+        assert _new_ids(second) == [small]
+        assert _cached_ids(second) == []
+        assert scheduler.get_request_state(large).status == DiffusionRequestStatus.PREEMPTED
+        assert second.debug_info["policy"] == "token_step_preemptive_slo"
+        assert second.debug_info["step_preemption_count"] == 1
+        assert second.debug_info["preempted_req_ids"] == [large]
+        assert scheduler.get_load_snapshot()["preempted_waiting_req_ids"] == [large]
+
+        assert scheduler.update_from_output(second, _make_step_output(small, step_index=1, finished=True)) == {small}
+        third = scheduler.schedule()
+
+        assert _new_ids(third) == []
+        assert _cached_ids(third) == [large]
+        assert scheduler.get_request_state(large).status == DiffusionRequestStatus.RUNNING
+        assert third.debug_info["resumed_preempted_req_ids"] == [large]
+        assert third.debug_info["resumed_preempted_extra_wait_ms"][large] >= 0.0
+
+    def test_step_preemptive_snapshot_reports_policy_knobs(self) -> None:
+        scheduler = self._make_scheduler(
+            max_num_seqs=1,
+            slo_config={"allow_preemptive_admission_swap": False},
+        )
+        snapshot = scheduler.get_load_snapshot()
+
+        assert snapshot["policy"] == "TokenStepPreemptiveSloStepScheduler"
+        assert snapshot["enable_step_preemption"] is True
+        assert snapshot["allow_preemptive_admission_swap"] is False
+
+    def test_step_preemptive_can_preserve_resident_capacity_guard(self) -> None:
+        now_s = time.time()
+        scheduler = self._make_scheduler(
+            max_num_seqs=1,
+            slo_config={"allow_preemptive_admission_swap": False},
+        )
+        large = scheduler.add_request(
+            self._make_token_request(
+                "large",
+                height=1024,
+                arrival_time_s=now_s,
+                deadline_time_s=now_s + 10.0,
+            )
+        )
+        first = scheduler.schedule()
+        assert _new_ids(first) == [large]
+        assert scheduler.update_from_output(first, _make_step_output(large, step_index=1)) == set()
+
+        small = scheduler.add_request(
+            self._make_token_request(
+                "small",
+                height=512,
+                arrival_time_s=now_s + 0.01,
+                deadline_time_s=now_s + 0.30,
+            )
+        )
+        second = scheduler.schedule()
+
+        assert _new_ids(second) == []
+        assert _cached_ids(second) == [large]
+        assert scheduler.get_request_state(small).status == DiffusionRequestStatus.WAITING
+        assert second.debug_info["step_preemption_count"] == 0
