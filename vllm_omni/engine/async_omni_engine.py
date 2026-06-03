@@ -63,6 +63,7 @@ from vllm_omni.engine.messages import (
 )
 from vllm_omni.engine.orchestrator import Orchestrator
 from vllm_omni.engine.output_modality import FinalOutputModalityType
+from vllm_omni.engine.pard_runtime import build_pard_runtime_from_stage_pools
 from vllm_omni.engine.serialization import (
     deserialize_additional_information,
     serialize_additional_information,
@@ -1411,6 +1412,7 @@ class AsyncOmniEngine:
                 coordinator_pub_address = self._coordinator_runtime.pub_address
                 load_balancer_factory = build_load_balancer_factory(self._omni_lb_policy)
                 remote_replica_factory = self._build_remote_replica
+            pard_runtime = build_pard_runtime_from_stage_pools(self.stage_pools)
             orchestrator = Orchestrator(
                 request_async_queue=self.request_queue.async_q,
                 output_async_queue=self.output_queue.async_q,
@@ -1421,6 +1423,7 @@ class AsyncOmniEngine:
                 coordinator_pub_address=coordinator_pub_address,
                 load_balancer_factory=load_balancer_factory,
                 remote_replica_factory=remote_replica_factory,
+                pard_runtime=pard_runtime,
             )
             if not startup_future.done():
                 startup_future.set_result(asyncio.get_running_loop())

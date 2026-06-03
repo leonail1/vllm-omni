@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import replace
+from types import SimpleNamespace
 
 import pytest
 
@@ -13,13 +14,19 @@ from vllm_omni.engine.pard_broker import (
     policy_for_alias,
 )
 from vllm_omni.engine.pard_planner import (
+    MissingPardProfilesError,
+    MissingPardStagesError,
     PardPlannerMode,
     PardStageLatencyLookup,
     PardStageLatencyProfile,
     PardStatePlanner,
 )
 from vllm_omni.engine.pard_priority import PardPriorityPolicy
-from vllm_omni.engine.pard_runtime import PardRuntime, PardRuntimeConfig
+from vllm_omni.engine.pard_runtime import (
+    PardRuntime,
+    PardRuntimeConfig,
+    build_pard_runtime_from_stage_pools,
+)
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
@@ -47,6 +54,101 @@ def _profiles() -> dict[DagStageKind, PardStageLatencyProfile]:
     }
 
 
+class _PardConfigPool:
+    def __init__(
+        self,
+        stage_id: int,
+        *,
+        stage_type: str = "llm",
+        model_stage: str,
+        final_output: bool = False,
+        final_output_type: str | None = None,
+        engine_input_source: list[int] | None = None,
+        additional_config: dict | None = None,
+    ) -> None:
+        self.stage_id = stage_id
+        self._stage_type = stage_type
+        self.clients = [
+            SimpleNamespace(
+                model_stage=model_stage,
+                final_output=final_output,
+                final_output_type=final_output_type,
+                engine_input_source=list(engine_input_source or []),
+                devices="",
+            )
+        ]
+        self.stage_vllm_config = SimpleNamespace(max_num_seqs=4, additional_config=additional_config or {})
+        self.stage_slo_config = self.stage_vllm_config
+
+    @property
+    def stage_client(self):
+        return self.clients[0]
+
+    @property
+    def stage_type(self) -> str:
+        return self._stage_type
+
+    @property
+    def final_output(self) -> bool:
+        return bool(self.stage_client.final_output)
+
+    def live_replica_ids(self):
+        return [0]
+
+    def dag_replica_device_ids(self, _replica_id: int):
+        return ()
+
+    def dag_replica_card_count(self, _replica_id: int):
+        return 1
+
+    async def abort_requests(self, _request_ids):
+        return None
+
+    def release_bindings(self, _request_ids):
+        return None
+
+
+def _profile_config(profile: PardStageLatencyProfile) -> dict[str, object]:
+    return {
+        "queue_wait_ms": profile.queue_wait_ms,
+        "batch_wait_ms": profile.batch_wait_ms,
+        "execution_ms": profile.execution_ms,
+        "tail_quantile_ms": profile.tail_quantile_ms,
+        "tail_wait_quantiles_ms": {"0.1": 1.5, "0.9": 4.0},
+        "throughput_work_per_s": profile.throughput_work_per_s,
+        "profile_version": "unit-test",
+    }
+
+
+def _pard_runtime_config(*, include_profiles: bool = True) -> dict[str, object]:
+    raw: dict[str, object] = {
+        "enabled": True,
+        "policy_alias": "dag_pard_lbf",
+        "lambda_quantile": 0.2,
+        "completed_trace_limit": 3,
+    }
+    if include_profiles:
+        raw["profiles"] = {kind.value: _profile_config(profile) for kind, profile in _profiles().items()}
+    return {"dag_pard_runtime": raw}
+
+
+def _full_pard_stage_pools(*, additional_config: dict | None = None) -> list[_PardConfigPool]:
+    return [
+        _PardConfigPool(0, model_stage="text_encoder", engine_input_source=[], additional_config=additional_config),
+        _PardConfigPool(1, model_stage="image_encoder", engine_input_source=[]),
+        _PardConfigPool(2, model_stage="vae_encoder", engine_input_source=[1]),
+        _PardConfigPool(3, stage_type="diffusion", model_stage="diffusion", engine_input_source=[0, 2]),
+        _PardConfigPool(4, model_stage="vae_decoder", final_output=True, engine_input_source=[3]),
+        _PardConfigPool(
+            5,
+            model_stage="audio_decoder",
+            final_output=True,
+            final_output_type="audio",
+            engine_input_source=[3],
+        ),
+    ]
+
+
 def _broker(policy: PardBrokerPolicy | None = None) -> PardRequestBroker:
     config = build_required_full_dag_template({})
     planner = PardStatePlanner(config, PardStageLatencyLookup(_profiles()))
@@ -56,6 +158,52 @@ def _broker(policy: PardBrokerPolicy | None = None) -> PardRequestBroker:
         policy=policy or PardBrokerPolicy(priority_policy=PardPriorityPolicy.ADAPTIVE),
         service_work_per_window=100.0,
     )
+
+
+def test_pard_runtime_builder_is_disabled_without_explicit_config() -> None:
+    assert build_pard_runtime_from_stage_pools(_full_pard_stage_pools()) is None
+
+
+def test_pard_runtime_builder_uses_explicit_full_dag_config() -> None:
+    runtime = build_pard_runtime_from_stage_pools(
+        _full_pard_stage_pools(additional_config=_pard_runtime_config()),
+    )
+
+    assert runtime is not None
+    assert runtime.config.policy_alias == "dag_pard_lbf"
+    assert runtime.config.lambda_quantile == pytest.approx(0.2)
+    assert runtime.dag_runtime.completed_trace_limit == 3
+    assert set(runtime.brokers) == {0, 1, 2, 3, 4, 5}
+    assert {spec.kind for spec in runtime.dag_runtime.config.stage_specs} == set(_profiles())
+
+
+def test_pard_runtime_builder_rejects_missing_enabled_profiles() -> None:
+    with pytest.raises(MissingPardProfilesError):
+        build_pard_runtime_from_stage_pools(
+            _full_pard_stage_pools(additional_config=_pard_runtime_config(include_profiles=False)),
+        )
+
+
+def test_pard_runtime_builder_rejects_configured_profile_gate_bypass() -> None:
+    config = _pard_runtime_config(include_profiles=False)
+    config["dag_pard_runtime"]["require_full_profiles"] = False
+
+    with pytest.raises(ValueError, match="requires complete full-DAG stages and profiles"):
+        build_pard_runtime_from_stage_pools(_full_pard_stage_pools(additional_config=config))
+
+
+def test_pard_runtime_builder_rejects_partial_dag_when_enabled() -> None:
+    with pytest.raises(MissingPardStagesError):
+        build_pard_runtime_from_stage_pools(
+            [
+                _PardConfigPool(
+                    0,
+                    model_stage="text_encoder",
+                    engine_input_source=[],
+                    additional_config=_pard_runtime_config(),
+                )
+            ]
+        )
 
 
 def test_broker_accepts_request_and_enqueues_with_trace() -> None:

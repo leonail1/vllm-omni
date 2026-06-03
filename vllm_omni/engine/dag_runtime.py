@@ -180,13 +180,18 @@ class DagRuntime:
         self.completed_request_traces: OrderedDict[str, list[Any]] = OrderedDict()
 
     @classmethod
-    def from_stage_pools(cls, stage_pools: list[Any]) -> "DagRuntime":
+    def from_stage_pools(
+        cls,
+        stage_pools: list[Any],
+        *,
+        completed_trace_limit: int = 256,
+    ) -> "DagRuntime":
         config = build_dag_config_from_stage_pools(stage_pools)
         adapters = {
             spec.stage_id: StagePoolDagAdapter(pool, spec)
             for spec, pool in zip(config.stage_specs, stage_pools, strict=True)
         }
-        return cls(config, adapters)
+        return cls(config, adapters, completed_trace_limit=completed_trace_limit)
 
     def validate_required_full_dag_roles(self) -> set[DagStageKind]:
         present = {spec.kind for spec in self.config.stage_specs}
