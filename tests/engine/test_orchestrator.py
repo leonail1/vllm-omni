@@ -22,13 +22,18 @@ from vllm_omni.engine.messages import (
     AddCompanionRequestMessage,
     CollectiveRPCRequestMessage,
     CollectiveRPCResultMessage,
+    ErrorMessage,
     OutputMessage,
     ShutdownRequestMessage,
     StageSubmissionMessage,
 )
+from vllm_omni.engine.dag_runtime import DagRuntime
 from vllm_omni.engine.orchestrator import Orchestrator, OrchestratorRequestState
+from vllm_omni.engine.pard_planner import PardStageLatencyLookup, PardStageLatencyProfile
+from vllm_omni.engine.pard_runtime import PardRuntime, PardRuntimeConfig
 from vllm_omni.engine.stage_engine_core_client import StageEngineCoreClient
 from vllm_omni.engine.stage_pool import StagePool
+from vllm_omni.engine.dag_types import DagStageKind
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams
 from vllm_omni.outputs import OmniRequestOutput
 
@@ -65,7 +70,7 @@ class FakeStageClient:
         self.final_output_type = final_output_type
         self.default_sampling_params = SamplingParams(max_tokens=1)
         self.requires_multimodal_data = False
-        self.engine_input_source = list(engine_input_source or [0])
+        self.engine_input_source = [0] if engine_input_source is None else list(engine_input_source)
         self.is_comprehension = is_comprehension
         self.model_stage = model_stage
         self.next_inputs = list(next_inputs or [])
@@ -220,6 +225,28 @@ def _sampling_params(max_tokens: int = 4) -> SamplingParams:
     return SamplingParams(max_tokens=max_tokens)
 
 
+def _pard_profiles_for_text_stage() -> dict[DagStageKind, PardStageLatencyProfile]:
+    return {
+        DagStageKind.TEXT_ENCODER: PardStageLatencyProfile(
+            DagStageKind.TEXT_ENCODER,
+            queue_wait_ms=10.0,
+            batch_wait_ms=0.0,
+            execution_ms=10.0,
+            throughput_work_per_s=100.0,
+        )
+    }
+
+
+def _pard_profile(kind: DagStageKind) -> PardStageLatencyProfile:
+    return PardStageLatencyProfile(
+        kind,
+        queue_wait_ms=10.0,
+        batch_wait_ms=0.0,
+        execution_ms=10.0,
+        throughput_work_per_s=100.0,
+    )
+
+
 def _engine_core_outputs(tag: str, timestamp: float) -> SimpleNamespace:
     return SimpleNamespace(outputs=[tag], timestamp=timestamp, scheduler_stats=None)
 
@@ -360,6 +387,251 @@ def _build_harness(
         thread=thread,
         result_future=result_future,
     )
+
+
+@pytest.mark.asyncio
+async def test_pard_stage_entry_drop_prevents_stage_submit_and_archives_trace() -> None:
+    stage_pools = _build_stage_pools(
+        [[FakeStageClient(model_stage="text_encoder", engine_input_source=[])]],
+        stage_vllm_configs=[SimpleNamespace(model_config=SimpleNamespace(max_model_len=64))],
+    )
+    dag_runtime = DagRuntime.from_stage_pools(stage_pools)
+    pard_runtime = PardRuntime(
+        dag_runtime,
+        PardStageLatencyLookup(_pard_profiles_for_text_stage()),
+        config=PardRuntimeConfig(policy_alias="dag_full_pard", require_full_profiles=False),
+    )
+    request_queue = janus.Queue()
+    output_queue = janus.Queue()
+    rpc_queue = janus.Queue()
+    orchestrator = Orchestrator(
+        request_async_queue=request_queue.async_q,
+        output_async_queue=output_queue.async_q,
+        rpc_async_queue=rpc_queue.async_q,
+        stage_pools=stage_pools,
+        pard_runtime=pard_runtime,
+    )
+
+    await orchestrator._handle_add_request(
+        StageSubmissionMessage(
+            type="add_request",
+            request_id="req-pard-drop",
+            prompt=SimpleNamespace(prompt_token_ids=[1, 2, 3]),
+            original_prompt={"deadline_time_s": time.time() + 0.001},
+            output_prompt_text=None,
+            sampling_params_list=[_sampling_params(max_tokens=4)],
+            final_stage_id=0,
+            preprocess_ms=0.0,
+            enqueue_ts=0.0,
+        )
+    )
+
+    message = output_queue.sync_q.get_nowait()
+
+    assert isinstance(message, ErrorMessage)
+    assert message.request_id == "req-pard-drop"
+    assert "PARD dropped request" in message.error
+    assert stage_pools[0].stage_client.add_request_calls == []
+    assert "req-pard-drop" not in orchestrator.request_states
+    archived = orchestrator.dag_runtime.get_completed_trace("req-pard-drop")
+    assert archived is not None
+    assert any(event.event == "pard_broker_decision" for event in archived)
+    assert any(event.event == "pard_drop_cleanup" for event in archived)
+
+
+@pytest.mark.asyncio
+async def test_pard_downstream_drop_prevents_next_stage_submit() -> None:
+    stage0 = FakeStageClient(model_stage="text_encoder")
+    stage1 = FakeStageClient(
+        model_stage="vae_decoder",
+        final_output=True,
+        next_inputs=[{"prompt_token_ids": [4, 5, 6]}],
+    )
+    stage_pools = _build_stage_pools(
+        [[stage0], [stage1]],
+        stage_vllm_configs=[
+            SimpleNamespace(model_config=SimpleNamespace(max_model_len=64)),
+            SimpleNamespace(model_config=SimpleNamespace(max_model_len=64)),
+        ],
+    )
+    dag_runtime = DagRuntime.from_stage_pools(stage_pools)
+    pard_runtime = PardRuntime(
+        dag_runtime,
+        PardStageLatencyLookup(
+            profiles_by_stage_id={
+                0: _pard_profile(DagStageKind.TEXT_ENCODER),
+                1: _pard_profile(DagStageKind.VAE_DECODER),
+            }
+        ),
+        config=PardRuntimeConfig(policy_alias="dag_full_pard", require_full_profiles=False),
+    )
+    request_queue = janus.Queue()
+    output_queue = janus.Queue()
+    rpc_queue = janus.Queue()
+    orchestrator = Orchestrator(
+        request_async_queue=request_queue.async_q,
+        output_async_queue=output_queue.async_q,
+        rpc_async_queue=rpc_queue.async_q,
+        stage_pools=stage_pools,
+        pard_runtime=pard_runtime,
+    )
+    req_state = OrchestratorRequestState(
+        request_id="req-downstream-drop",
+        prompt={"prompt": "downstream"},
+        sampling_params_list=[_sampling_params(), _sampling_params()],
+        final_stage_id=1,
+    )
+    orchestrator.request_states[req_state.request_id] = req_state
+    dag_runtime.create_request_context(
+        req_state.request_id,
+        arrival_time_s=time.time(),
+        deadline_time_s=time.time() + 0.001,
+    )
+
+    await orchestrator._forward_to_next_stage(
+        req_state.request_id,
+        0,
+        _build_request_output(req_state.request_id),
+        req_state,
+    )
+
+    message = output_queue.sync_q.get_nowait()
+
+    assert isinstance(message, ErrorMessage)
+    assert message.request_id == req_state.request_id
+    assert message.stage_id == 1
+    assert stage1.add_request_calls == []
+    assert req_state.request_id not in orchestrator.request_states
+    archived = orchestrator.dag_runtime.get_completed_trace(req_state.request_id)
+    assert archived is not None
+    assert any(event.event == "pard_broker_decision" for event in archived)
+    assert any(event.event == "pard_drop_cleanup" for event in archived)
+
+
+@pytest.mark.asyncio
+async def test_pard_companion_drop_cleans_parent_tracking() -> None:
+    stage0 = FakeStageClient(model_stage="text_encoder")
+    stage_pools = _build_stage_pools(
+        [[stage0]],
+        stage_vllm_configs=[SimpleNamespace(model_config=SimpleNamespace(max_model_len=64))],
+    )
+    dag_runtime = DagRuntime.from_stage_pools(stage_pools)
+    pard_runtime = PardRuntime(
+        dag_runtime,
+        PardStageLatencyLookup(_pard_profiles_for_text_stage()),
+        config=PardRuntimeConfig(policy_alias="dag_full_pard", require_full_profiles=False),
+    )
+    request_queue = janus.Queue()
+    output_queue = janus.Queue()
+    rpc_queue = janus.Queue()
+    orchestrator = Orchestrator(
+        request_async_queue=request_queue.async_q,
+        output_async_queue=output_queue.async_q,
+        rpc_async_queue=rpc_queue.async_q,
+        stage_pools=stage_pools,
+        pard_runtime=pard_runtime,
+    )
+    parent_state = OrchestratorRequestState(
+        request_id="parent",
+        prompt={"prompt": "parent"},
+        sampling_params_list=[_sampling_params()],
+        final_stage_id=0,
+    )
+    orchestrator.request_states["parent"] = parent_state
+    dag_runtime.create_request_context(
+        "parent",
+        arrival_time_s=time.time(),
+        deadline_time_s=time.time() + 0.001,
+    )
+
+    await orchestrator._handle_add_companion(
+        AddCompanionRequestMessage(
+            companion_id="parent-neg",
+            parent_id="parent",
+            role="negative",
+            prompt=SimpleNamespace(request_id="parent-neg", prompt_token_ids=[9]),
+            companion_prompt_text={"prompt": "negative"},
+            sampling_params_list=[_sampling_params()],
+        )
+    )
+
+    message = output_queue.sync_q.get_nowait()
+
+    assert isinstance(message, ErrorMessage)
+    assert message.request_id == "parent"
+    assert "PARD dropped request" in message.error
+    assert stage0.add_request_calls == []
+    assert "parent" not in orchestrator.request_states
+    assert "parent-neg" not in orchestrator.request_states
+    assert not orchestrator._cfg_tracker.has_companions("parent")
+    assert not orchestrator._cfg_tracker.is_companion("parent-neg")
+    companion_trace = orchestrator.dag_runtime.get_completed_trace("parent-neg")
+    assert companion_trace is not None
+    assert any(event.event == "pard_drop_cleanup" for event in companion_trace)
+
+
+@pytest.mark.asyncio
+async def test_pard_async_chunk_prewarm_drop_prevents_submit() -> None:
+    stage0 = FakeStageClient(model_stage="text_encoder")
+    stage1 = FakeStageClient(model_stage="vae_decoder", final_output=True)
+    stage_pools = _build_stage_pools(
+        [[stage0], [stage1]],
+        stage_vllm_configs=[
+            SimpleNamespace(model_config=SimpleNamespace(max_model_len=64)),
+            SimpleNamespace(model_config=SimpleNamespace(max_model_len=64)),
+        ],
+    )
+    dag_runtime = DagRuntime.from_stage_pools(stage_pools)
+    pard_runtime = PardRuntime(
+        dag_runtime,
+        PardStageLatencyLookup(
+            profiles_by_stage_id={
+                0: _pard_profile(DagStageKind.TEXT_ENCODER),
+                1: _pard_profile(DagStageKind.VAE_DECODER),
+            }
+        ),
+        config=PardRuntimeConfig(policy_alias="dag_full_pard", require_full_profiles=False),
+    )
+    request_queue = janus.Queue()
+    output_queue = janus.Queue()
+    rpc_queue = janus.Queue()
+    orchestrator = Orchestrator(
+        request_async_queue=request_queue.async_q,
+        output_async_queue=output_queue.async_q,
+        rpc_async_queue=rpc_queue.async_q,
+        stage_pools=stage_pools,
+        async_chunk=True,
+        pard_runtime=pard_runtime,
+    )
+    req_state = OrchestratorRequestState(
+        request_id="req-prewarm-drop",
+        prompt={"prompt": "prewarm"},
+        sampling_params_list=[_sampling_params(), _sampling_params()],
+        final_stage_id=1,
+    )
+    orchestrator.request_states[req_state.request_id] = req_state
+    dag_runtime.create_request_context(
+        req_state.request_id,
+        arrival_time_s=time.time(),
+        deadline_time_s=time.time() + 0.001,
+    )
+
+    await orchestrator._prewarm_async_chunk_stages(
+        req_state.request_id,
+        SimpleNamespace(prompt_token_ids=[1, 2, 3]),
+        req_state,
+    )
+
+    message = output_queue.sync_q.get_nowait()
+
+    assert isinstance(message, ErrorMessage)
+    assert message.request_id == req_state.request_id
+    assert message.stage_id == 1
+    assert stage1.add_request_calls == []
+    assert req_state.request_id not in orchestrator.request_states
+    archived = orchestrator.dag_runtime.get_completed_trace(req_state.request_id)
+    assert archived is not None
+    assert any(event.event == "pard_drop_cleanup" for event in archived)
 
 
 async def _shutdown_orchestrator(orchestrator_fixture: OrchestratorFixture) -> None:
@@ -964,6 +1236,8 @@ async def test_handle_streaming_update_passes_prompt_text_to_stage_pool() -> Non
 
     pool = RecordingPool()
     orchestrator = object.__new__(Orchestrator)
+    orchestrator.dag_runtime = SimpleNamespace(enter_stage=lambda *_args, **_kwargs: None)
+    orchestrator.pard_runtime = None
     orchestrator.request_states = {
         "req-stream": OrchestratorRequestState(
             request_id="req-stream",

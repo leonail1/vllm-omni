@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections import OrderedDict
 import time
 from dataclasses import dataclass
 from typing import Any
@@ -90,6 +91,8 @@ def _stage_pool_predecessors(stage_pools: list[Any]) -> dict[int, tuple[int, ...
                     source_id = int(source)
                 except (TypeError, ValueError):
                     continue
+                if source_id == stage_id:
+                    continue
                 if source_id in stage_ids:
                     normalized_sources.add(source_id)
             sources = tuple(sorted(normalized_sources))
@@ -162,11 +165,19 @@ def build_required_full_dag_template(resource_by_kind: dict[DagStageKind, DagSta
 class DagRuntime:
     """Request lifecycle and trace holder for the DAG control plane."""
 
-    def __init__(self, config: DagRuntimeConfig, adapters: dict[int, Any] | None = None) -> None:
+    def __init__(
+        self,
+        config: DagRuntimeConfig,
+        adapters: dict[int, Any] | None = None,
+        *,
+        completed_trace_limit: int = 256,
+    ) -> None:
         self.config = config
         self.adapters: dict[int, Any] = dict(adapters or {})
         self.cache_registry = DagCacheRegistry()
         self.request_contexts: dict[str, DagRequestContext] = {}
+        self.completed_trace_limit = max(int(completed_trace_limit), 0)
+        self.completed_request_traces: OrderedDict[str, list[Any]] = OrderedDict()
 
     @classmethod
     def from_stage_pools(cls, stage_pools: list[Any]) -> "DagRuntime":
@@ -250,6 +261,21 @@ class DagRuntime:
         self.cache_registry.release_request(request_id)
         self.request_contexts.pop(request_id, None)
 
+    def archive_request_trace(self, request_id: str) -> None:
+        if self.completed_trace_limit <= 0:
+            return
+        ctx = self.request_contexts.get(request_id)
+        if ctx is None:
+            return
+        self.completed_request_traces[request_id] = list(ctx.trace)
+        self.completed_request_traces.move_to_end(request_id)
+        while len(self.completed_request_traces) > self.completed_trace_limit:
+            self.completed_request_traces.popitem(last=False)
+
+    def get_completed_trace(self, request_id: str) -> list[Any] | None:
+        trace = self.completed_request_traces.get(request_id)
+        return None if trace is None else list(trace)
+
     def snapshot(self) -> dict[str, Any]:
         return {
             "stages": [
@@ -264,5 +290,7 @@ class DagRuntime:
                 for spec in self.config.stage_specs
             ],
             "requests": len(self.request_contexts),
+            "completed_request_traces": len(self.completed_request_traces),
+            "completed_trace_limit": self.completed_trace_limit,
             "cache": self.cache_registry.snapshot(),
         }

@@ -171,6 +171,17 @@ def test_runtime_from_stage_pools_preserves_branch_merge_edges() -> None:
     assert {spec.kind for spec in config.stage_specs} == FULL_DAG_REQUIRED_STAGE_KINDS
 
 
+def test_runtime_from_stage_pools_ignores_self_input_source() -> None:
+    pools = [_FakePool(0, stage_type="llm", model_stage="text_encoder", engine_input_source=[0])]
+
+    config = build_dag_config_from_stage_pools(pools)
+
+    assert config.entry_stage_ids == (0,)
+    assert config.exit_stage_ids == (0,)
+    assert config.spec_by_id[0].pres == ()
+    assert config.spec_by_id[0].subs == ()
+
+
 def test_dag_runtime_tracks_request_lifecycle_and_cache_trace() -> None:
     config = build_required_full_dag_template({})
     runtime = DagRuntime(config)
@@ -205,7 +216,27 @@ def test_dag_runtime_tracks_request_lifecycle_and_cache_trace() -> None:
 
     runtime.cleanup_request("req-1")
     assert runtime.get_request_context("req-1") is None
+    assert runtime.get_completed_trace("req-1") is None
     assert runtime.cache_registry.get(handle_id).released is True
+
+
+def test_dag_runtime_archives_completed_traces_only_when_explicitly_requested() -> None:
+    runtime = DagRuntime(build_required_full_dag_template({}), completed_trace_limit=1)
+
+    runtime.create_request_context("req-1", arrival_time_s=100.0)
+    runtime.enter_stage("req-1", 0)
+    runtime.archive_request_trace("req-1")
+    runtime.cleanup_request("req-1")
+
+    assert runtime.get_completed_trace("req-1") is not None
+
+    runtime.create_request_context("req-2", arrival_time_s=101.0)
+    runtime.enter_stage("req-2", 0)
+    runtime.archive_request_trace("req-2")
+    runtime.cleanup_request("req-2")
+
+    assert runtime.get_completed_trace("req-1") is None
+    assert runtime.get_completed_trace("req-2") is not None
 
 
 def test_runtime_from_stage_pools_exposes_missing_required_roles() -> None:

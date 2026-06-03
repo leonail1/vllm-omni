@@ -53,6 +53,8 @@ from vllm_omni.engine.messages import (
     StageSubmissionMessage,
     UnregisterRemoteReplicaMessage,
 )
+from vllm_omni.engine.pard_cleanup import PardDropCleanupOutcome
+from vllm_omni.engine.pard_runtime import PardRuntime
 from vllm_omni.engine.serialization import serialize_additional_information
 from vllm_omni.engine.stage_pool import StagePool
 from vllm_omni.outputs import OmniRequestOutput
@@ -116,6 +118,32 @@ def build_engine_core_request_from_tokens(
     )
 
 
+def _coerce_optional_float(value: Any) -> float | None:
+    try:
+        if value is None:
+            return None
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _merge_pard_replica_snapshots(replica_snapshots: list[dict[str, Any]]) -> dict[str, Any]:
+    merged: dict[str, Any] = {
+        "replica_snapshot_count": len(replica_snapshots),
+        "num_waiting": sum(int(snapshot.get("num_waiting", 0) or 0) for snapshot in replica_snapshots),
+        "num_running": sum(int(snapshot.get("num_running", 0) or 0) for snapshot in replica_snapshots),
+    }
+    for key in ("queue_wait_ms", "batch_wait_ms", "execution_ms", "tail_quantile_ms"):
+        values: list[float] = []
+        for snapshot in replica_snapshots:
+            value = _coerce_optional_float(snapshot.get(key))
+            if value is not None:
+                values.append(value)
+        if values:
+            merged[key] = max(values)
+    return merged
+
+
 @dataclass
 class OrchestratorRequestState:
     """Per-request bookkeeping inside the Orchestrator."""
@@ -169,6 +197,7 @@ class Orchestrator:
         coordinator_pub_address: str | None = None,
         load_balancer_factory: Callable[[], LoadBalancer] | None = None,
         remote_replica_factory: RemoteReplicaFactory | None = None,
+        pard_runtime: PardRuntime | None = None,
     ) -> None:
         self.request_async_queue = request_async_queue
         self.output_async_queue = output_async_queue
@@ -177,7 +206,12 @@ class Orchestrator:
         self.async_chunk = bool(async_chunk)
         self.num_stages = len(stage_pools)
         self.stage_pools: list[StagePool] = stage_pools
-        self.dag_runtime = DagRuntime.from_stage_pools(stage_pools)
+        self.dag_runtime = (
+            pard_runtime.dag_runtime
+            if pard_runtime is not None
+            else DagRuntime.from_stage_pools(stage_pools)
+        )
+        self.pard_runtime = pard_runtime
 
         # PD disaggregation state
         self._pd_pair: tuple[int, int] | None = None
@@ -431,8 +465,8 @@ class Orchestrator:
         )
         req_state.dag_context_id = request_id
         req_state.streaming.enabled = bool(getattr(prompt, "resumable", False))
-        req_state.stage_submit_ts[stage_id] = _time.time()
-        self.dag_runtime.enter_stage(request_id, stage_id)
+        if not await self._enter_stage_and_maybe_admit(request_id, stage_id, req_state):
+            return
         enqueue_ts = msg.enqueue_ts
         if enqueue_ts > 0:
             req_state.pipeline_timings["queue_wait_ms"] = (_time.perf_counter() - enqueue_ts) * 1000.0
@@ -479,8 +513,13 @@ class Orchestrator:
             req_state.sampling_params_list = msg.sampling_params_list
 
         req_state.streaming.enabled = True
-        req_state.stage_submit_ts[stage_id] = _time.time()
-        self.dag_runtime.enter_stage(request_id, stage_id)
+        if not await self._enter_stage_and_maybe_admit(
+            request_id,
+            stage_id,
+            req_state,
+            abort_on_drop_cleanup=True,
+        ):
+            return
         await self.stage_pools[stage_id].submit_update(
             request_id,
             req_state,
@@ -515,14 +554,21 @@ class Orchestrator:
             final_stage_id=0,
         )
         self.request_states[companion_id] = companion_state
+        parent_ctx = self.dag_runtime.get_request_context(parent_id)
         self.dag_runtime.create_request_context(
             companion_id,
-            arrival_time_s=_time.time(),
+            arrival_time_s=parent_ctx.arrival_time_s if parent_ctx is not None else _time.time(),
+            deadline_time_s=parent_ctx.deadline_time_s if parent_ctx is not None else None,
             metadata={"parent_id": parent_id, "role": role, "companion": True},
         )
         companion_state.dag_context_id = companion_id
-        companion_state.stage_submit_ts[0] = _time.time()
-        self.dag_runtime.enter_stage(companion_id, 0)
+        if not await self._enter_stage_and_maybe_admit(
+            companion_id,
+            0,
+            companion_state,
+            abort_on_drop_cleanup=True,
+        ):
+            return
         companion_replica_id = await self.stage_pools[0].submit_initial(
             companion_id,
             companion_state,
@@ -559,6 +605,132 @@ class Orchestrator:
         """Release all stage-local route bindings for the given request ids."""
         for pool in self.stage_pools:
             pool.release_bindings(request_ids)
+
+    async def _enter_stage_and_maybe_admit(
+        self,
+        request_id: str,
+        stage_id: int,
+        req_state: OrchestratorRequestState,
+        *,
+        abort_on_drop_cleanup: bool = False,
+    ) -> bool:
+        req_state.stage_submit_ts[stage_id] = _time.time()
+        self.dag_runtime.enter_stage(request_id, stage_id)
+        return await self._maybe_pard_stage_entry(
+            request_id,
+            stage_id,
+            req_state,
+            abort_on_drop_cleanup=abort_on_drop_cleanup,
+        )
+
+    async def _maybe_pard_stage_entry(
+        self,
+        request_id: str,
+        stage_id: int,
+        req_state: OrchestratorRequestState,
+        *,
+        abort_on_drop_cleanup: bool = False,
+    ) -> bool:
+        """Run PARD stage-entry admission when full-DAG PARD is explicitly enabled."""
+
+        if self.pard_runtime is None:
+            return True
+        snapshots = await self._pard_stage_snapshots()
+        recent_input_work = self._pard_recent_input_work(req_state, stage_id)
+        decision = self.pard_runtime.stage_entry(
+            request_id,
+            stage_id,
+            recent_input_work=recent_input_work,
+            stage_snapshots=snapshots,
+        )
+        if not decision.dropped:
+            return True
+        cleanup = await self.pard_runtime.apply_drop_decision(decision)
+        await self.output_async_queue.put(
+            ErrorMessage(
+                error=f"PARD dropped request: {decision.reason}",
+                request_id=self._pard_drop_error_request_id(request_id),
+                stage_id=stage_id,
+            )
+        )
+        if cleanup.outcome != PardDropCleanupOutcome.PENDING_STEP_BOUNDARY:
+            cleanup_ids = self._pard_drop_cleanup_request_ids(request_id)
+            self._archive_pard_drop_traces(cleanup_ids)
+            await self._cleanup_request_ids(
+                cleanup_ids,
+                abort=abort_on_drop_cleanup or self._has_request_bindings(cleanup_ids),
+            )
+        return False
+
+    def _pard_drop_error_request_id(self, request_id: str) -> str:
+        if self._cfg_tracker.is_companion(request_id):
+            return self._cfg_tracker.get_parent_id(request_id) or request_id
+        return request_id
+
+    def _pard_drop_cleanup_request_ids(self, request_id: str) -> list[str]:
+        if self._cfg_tracker.is_companion(request_id):
+            parent_id = self._cfg_tracker.get_parent_id(request_id)
+            if parent_id is None:
+                return [request_id]
+            request_ids = [parent_id, *self._cfg_tracker.cleanup_parent(parent_id)]
+        else:
+            request_ids = [request_id, *self._cfg_tracker.cleanup_parent(request_id)]
+        seen: set[str] = set()
+        deduped: list[str] = []
+        for candidate in request_ids:
+            if candidate not in seen:
+                seen.add(candidate)
+                deduped.append(candidate)
+        return deduped
+
+    def _archive_pard_drop_traces(self, request_ids: list[str]) -> None:
+        for request_id in request_ids:
+            self.dag_runtime.archive_request_trace(request_id)
+
+    def _has_request_bindings(self, request_ids: list[str]) -> bool:
+        for request_id in request_ids:
+            for pool in self.stage_pools:
+                if pool.get_bound_replica_id(request_id) is not None:
+                    return True
+        return False
+
+    async def _pard_stage_snapshots(self) -> dict[int, dict[str, Any]]:
+        snapshots: dict[int, dict[str, Any]] = {}
+        for stage_id, pool in enumerate(self.stage_pools):
+            stage_snapshot: dict[str, Any] = {
+                "stage_id": stage_id,
+                "live_replicas": len(pool.live_replica_ids()),
+                "stage_type": pool.stage_type,
+            }
+            if pool.stage_type == "diffusion":
+                replica_snapshots: list[dict[str, Any]] = []
+                for replica_id in pool.live_replica_ids():
+                    snapshot = await pool._get_scheduler_snapshot(replica_id)
+                    if snapshot is not None:
+                        replica_snapshots.append(snapshot)
+                if replica_snapshots:
+                    stage_snapshot.update(_merge_pard_replica_snapshots(replica_snapshots))
+            snapshots[stage_id] = stage_snapshot
+        return snapshots
+
+    def _pard_recent_input_work(self, req_state: OrchestratorRequestState, stage_id: int) -> float:
+        params = req_state.sampling_params_list[stage_id] if stage_id < len(req_state.sampling_params_list) else None
+        width = _coerce_optional_float(getattr(params, "width", None))
+        height = _coerce_optional_float(getattr(params, "height", None))
+        if width is not None and height is not None:
+            frames = _coerce_optional_float(getattr(params, "num_frames", None)) or 1.0
+            steps = _coerce_optional_float(getattr(params, "num_inference_steps", None)) or 1.0
+            return max(width * height * frames * steps / float(1024 * 1024), 1.0)
+        max_tokens = _coerce_optional_float(getattr(params, "max_tokens", None))
+        if max_tokens is not None:
+            return max(max_tokens, 1.0)
+        prompt_token_ids = getattr(req_state.prompt, "prompt_token_ids", None)
+        if prompt_token_ids is not None:
+            try:
+                return max(float(len(prompt_token_ids)), 1.0)
+            except TypeError:
+                pass
+        return 1.0
 
     async def _handle_collective_rpc(self, msg: CollectiveRPCRequestMessage) -> None:
         """Handle a control-plane RPC request from the main thread."""
@@ -1036,6 +1208,13 @@ class Orchestrator:
             else:
                 diffusion_prompt = req_state.prompt
 
+            if not await self._enter_stage_and_maybe_admit(
+                req_id,
+                next_logical,
+                req_state,
+                abort_on_drop_cleanup=already_submitted,
+            ):
+                return
             if already_submitted:
                 await next_pool.submit_update(req_id, req_state, diffusion_prompt)
             else:
@@ -1051,8 +1230,6 @@ class Orchestrator:
                     },
                     params_override=self._maybe_clone_diffusion_params_for_cfg(req_id, params),
                 )
-            req_state.stage_submit_ts[next_logical] = _time.time()
-            self.dag_runtime.enter_stage(req_id, next_logical)
             return
 
         # PD disaggregation: prefill → decode routing uses original prompt + KV transfer params
@@ -1073,9 +1250,16 @@ class Orchestrator:
                     raise TypeError(
                         "[Orchestrator][PD] decode input must be dict or have prompt_token_ids, "
                         f"got {type(decode_input).__name__} for req={req_id}"
-                    )
+                )
                 decode_inputs.append({"prompt_token_ids": list(prompt_token_ids)})
 
+            if not await self._enter_stage_and_maybe_admit(
+                req_id,
+                next_logical,
+                req_state,
+                abort_on_drop_cleanup=already_submitted,
+            ):
+                return
             for decode_input in decode_inputs:
                 request = build_engine_core_request_from_tokens(
                     request_id=req_id,
@@ -1091,8 +1275,6 @@ class Orchestrator:
                 else:
                     await next_pool.submit_initial(req_id, req_state, request, prompt_text=None)
 
-            req_state.stage_submit_ts[next_logical] = _time.time()
-            self.dag_runtime.enter_stage(req_id, next_logical)
             return
 
         if req_state.pd_prefill_multimodal_output is not None:
@@ -1115,6 +1297,13 @@ class Orchestrator:
             )
             raise
 
+        if not await self._enter_stage_and_maybe_admit(
+            req_id,
+            next_logical,
+            req_state,
+            abort_on_drop_cleanup=already_submitted,
+        ):
+            return
         # Build and submit requests for each input
         for next_input in next_inputs:
             # Only AR thinker stages consume encoder mm_features; downstream
@@ -1135,9 +1324,6 @@ class Orchestrator:
                 await next_pool.submit_update(req_id, req_state, request)
             else:
                 await next_pool.submit_initial(req_id, req_state, request, prompt_text=None)
-
-        req_state.stage_submit_ts[next_logical] = _time.time()
-        self.dag_runtime.enter_stage(req_id, next_logical)
 
     async def _prewarm_async_chunk_stages(
         self,
@@ -1161,8 +1347,13 @@ class Orchestrator:
             next_pool = self.stage_pools[next_stage_id]
             params = req_state.sampling_params_list[next_stage_id]
 
-            req_state.stage_submit_ts[next_stage_id] = _time.time()
-            self.dag_runtime.enter_stage(request_id, next_stage_id)
+            if not await self._enter_stage_and_maybe_admit(
+                request_id,
+                next_stage_id,
+                req_state,
+                abort_on_drop_cleanup=True,
+            ):
+                return
 
             if next_pool.stage_type == "diffusion":
                 await next_pool.submit_initial(
