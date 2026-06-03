@@ -1,0 +1,18 @@
+key,value
+repo,/home/lzg/vllm-omni-pr4024-baseline
+branch,codex/pr4024-token-baseline
+model,Qwen/Qwen-Image
+devices,"0,1,2,3,4,5,6,7"
+replicas,8
+tensor_parallel_size,1
+requests_per_cell,20
+repeat,0 only
+workloads,"current-mix, shape-grouped-current-mix"
+interarrival_s,"2.5, 4.25"
+scales,"4.0, 6.0"
+quantization_config,int8
+dynamic_backend,FLASH_ATTN/MindIE-SD
+current_fixed_backend,TORCH_SDPA/SDPA
+current_fixed_output_dir,/home/lzg/vllm-omni-pr4024-baseline/benchmark_outputs/codex-pr4024-current-fixed-20260602-213717
+core_partial_output_dir,/home/lzg/vllm-omni-pr4024-baseline/benchmark_outputs/codex-pr4024-firststage-core-20260602-192231
+remaining_output_dir,/home/lzg/vllm-omni-pr4024-baseline/benchmark_outputs/codex-pr4024-remaining-token-20260602-220541

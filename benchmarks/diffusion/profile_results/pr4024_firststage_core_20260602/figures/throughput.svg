@@ -1,0 +1,37 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="980" height="430" viewBox="0 0 980 430">
+<rect width="100%" height="100%" fill="white"/>
+<text x="490.0" y="28" text-anchor="middle" font-family="Arial" font-size="18" font-weight="700">Mean Throughput by Policy</text>
+<line x1="190" y1="348" x2="940" y2="348" stroke="#333"/>
+<line x1="190.0" y1="54" x2="190.0" y2="348" stroke="#e5e7eb"/>
+<text x="190.0" y="372" text-anchor="middle" font-family="Arial" font-size="11" fill="#555">0.000</text>
+<line x1="377.5" y1="54" x2="377.5" y2="348" stroke="#e5e7eb"/>
+<text x="377.5" y="372" text-anchor="middle" font-family="Arial" font-size="11" fill="#555">0.063</text>
+<line x1="565.0" y1="54" x2="565.0" y2="348" stroke="#e5e7eb"/>
+<text x="565.0" y="372" text-anchor="middle" font-family="Arial" font-size="11" fill="#555">0.125</text>
+<line x1="752.5" y1="54" x2="752.5" y2="348" stroke="#e5e7eb"/>
+<text x="752.5" y="372" text-anchor="middle" font-family="Arial" font-size="11" fill="#555">0.188</text>
+<line x1="940.0" y1="54" x2="940.0" y2="348" stroke="#e5e7eb"/>
+<text x="940.0" y="372" text-anchor="middle" font-family="Arial" font-size="11" fill="#555">0.250</text>
+<text x="182" y="85.1" text-anchor="end" font-family="Arial" font-size="12" fill="#111">current</text>
+<rect x="190" y="65.4" width="698.7" height="29.0" rx="3" fill="#2f6f9f"/>
+<text x="894.7" y="85.1" font-family="Arial" font-size="12" fill="#111">0.233</text>
+<text x="182" y="125.5" text-anchor="end" font-family="Arial" font-size="12" fill="#111">pr4024_dynamic</text>
+<rect x="190" y="105.8" width="540.0" height="29.0" rx="3" fill="#d88c22"/>
+<text x="736.0" y="125.5" font-family="Arial" font-size="12" fill="#111">0.180</text>
+<text x="182" y="165.8" text-anchor="end" font-family="Arial" font-size="12" fill="#111">slo_no_preemption_token_guarded</text>
+<rect x="190" y="146.1" width="743.6" height="29.0" rx="3" fill="#4c956c"/>
+<text x="939.6" y="165.8" font-family="Arial" font-size="12" fill="#111">0.248</text>
+<text x="182" y="206.2" text-anchor="end" font-family="Arial" font-size="12" fill="#111">slo_no_preemption_token_adaptive</text>
+<rect x="190" y="186.5" width="695.5" height="29.0" rx="3" fill="#9a5b9f"/>
+<text x="891.5" y="206.2" font-family="Arial" font-size="12" fill="#111">0.232</text>
+<text x="182" y="246.6" text-anchor="end" font-family="Arial" font-size="12" fill="#111">slo_no_preemption_token_objective</text>
+<rect x="190" y="226.9" width="750.0" height="29.0" rx="3" fill="#2f8f83"/>
+<text x="946.0" y="246.6" font-family="Arial" font-size="12" fill="#111">0.250</text>
+<text x="182" y="287.0" text-anchor="end" font-family="Arial" font-size="12" fill="#111">slo_token_step_preemptive</text>
+<rect x="190" y="267.3" width="749.2" height="29.0" rx="3" fill="#bf5b4b"/>
+<text x="945.2" y="287.0" font-family="Arial" font-size="12" fill="#111">0.250</text>
+<text x="182" y="327.3" text-anchor="end" font-family="Arial" font-size="12" fill="#111">current_diagnostic_flash_attn</text>
+<rect x="190" y="307.6" width="127.1" height="29.0" rx="3" fill="#6b7280"/>
+<text x="323.1" y="327.3" font-family="Arial" font-size="12" fill="#111">0.042</text>
+<text x="490.0" y="412" text-anchor="middle" font-family="Arial" font-size="12" fill="#555">completed requests / second</text>
+</svg>
