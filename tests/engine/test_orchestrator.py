@@ -161,6 +161,27 @@ class FakeCollectiveRpcStageClient(FakeStageClient):
         return self.rpc_result
 
 
+class FakeStepBoundaryDiffusionClient(FakeStageClient):
+    def __init__(self, *, snapshots: list[dict[str, Any]]) -> None:
+        super().__init__(stage_type="diffusion", model_stage="diffusion")
+        self._snapshots = list(snapshots)
+
+    async def collective_rpc_async(
+        self,
+        method: str,
+        timeout: float | None = None,
+        args: tuple[Any, ...] = (),
+        kwargs: dict[str, Any] | None = None,
+    ) -> Any:
+        self.collective_rpc_calls.append((method, timeout, tuple(args), dict(kwargs or {})))
+        if method == "get_step_boundary_snapshot" and self._snapshots:
+            return self._snapshots[-1]
+        return {
+            "supported": False,
+            "reason": f"unsupported method {method}",
+        }
+
+
 class FakeOutputProcessor:
     def __init__(self, *, request_outputs: list[object] | None = None) -> None:
         self.request_outputs = list(request_outputs or [])
@@ -632,6 +653,80 @@ async def test_pard_async_chunk_prewarm_drop_prevents_submit() -> None:
     archived = orchestrator.dag_runtime.get_completed_trace(req_state.request_id)
     assert archived is not None
     assert any(event.event == "pard_drop_cleanup" for event in archived)
+
+
+@pytest.mark.asyncio
+async def test_pard_step_boundary_snapshot_applies_pending_drop() -> None:
+    snapshot = {
+        "supported": True,
+        "timestamp_s": time.time(),
+        "step_id": 7,
+        "scheduled_req_ids": ["req-running"],
+        "request_ids": ["req-running"],
+        "finished_req_ids": [],
+        "request_outputs": {"req-running": {"step_index": 2, "finished": False}},
+    }
+    stage0 = FakeStepBoundaryDiffusionClient(snapshots=[snapshot])
+    stage_pools = _build_stage_pools([[stage0]])
+    dag_runtime = DagRuntime.from_stage_pools(stage_pools)
+    pard_runtime = PardRuntime(
+        dag_runtime,
+        PardStageLatencyLookup({DagStageKind.DIT_DENOISE: _pard_profile(DagStageKind.DIT_DENOISE)}),
+        config=PardRuntimeConfig(policy_alias="dag_full_pard", require_full_profiles=False),
+    )
+    request_queue = janus.Queue()
+    output_queue = janus.Queue()
+    rpc_queue = janus.Queue()
+    orchestrator = Orchestrator(
+        request_async_queue=request_queue.async_q,
+        output_async_queue=output_queue.async_q,
+        rpc_async_queue=rpc_queue.async_q,
+        stage_pools=stage_pools,
+        pard_runtime=pard_runtime,
+    )
+    req_state = OrchestratorRequestState(
+        request_id="req-running",
+        prompt={"prompt": "running"},
+        sampling_params_list=[_sampling_params()],
+        final_stage_id=0,
+    )
+    orchestrator.request_states[req_state.request_id] = req_state
+    companion_state = OrchestratorRequestState(
+        request_id="req-running-neg",
+        prompt={"prompt": "negative"},
+        sampling_params_list=[_sampling_params()],
+        final_stage_id=0,
+    )
+    orchestrator.request_states[companion_state.request_id] = companion_state
+    orchestrator._cfg_tracker.register_companion(
+        req_state.request_id,
+        "negative",
+        companion_state.request_id,
+    )
+    ctx = dag_runtime.create_request_context(req_state.request_id, arrival_time_s=time.time())
+    dag_runtime.create_request_context(companion_state.request_id, arrival_time_s=time.time())
+    dag_runtime.enter_stage(req_state.request_id, 0, replica_id=0)
+    lifecycle = ctx.stage_lifecycle[0]
+    lifecycle.metadata["inside_denoise_step"] = True
+    lifecycle.metadata["at_step_boundary"] = False
+    lifecycle.metadata["pard_drop_pending_step_boundary"] = True
+    stage_pools[0]._request_bindings[req_state.request_id] = 0
+    stage_pools[0]._request_bindings[companion_state.request_id] = 0
+
+    handled = await orchestrator._maybe_handle_pard_step_boundary(0, 0)
+
+    assert handled is True
+    assert stage0.collective_rpc_calls[-1][0] == "get_step_boundary_snapshot"
+    assert "req-running" not in orchestrator.request_states
+    assert "req-running-neg" not in orchestrator.request_states
+    archived = orchestrator.dag_runtime.get_completed_trace("req-running")
+    assert archived is not None
+    assert any(event.event == "dit_step_boundary" for event in archived)
+    assert any(event.event == "pard_drop_cleanup" for event in archived)
+    assert stage0.abort_calls == [
+        ["req-running"],
+        ["req-running-neg"],
+    ]
 
 
 async def _shutdown_orchestrator(orchestrator_fixture: OrchestratorFixture) -> None:

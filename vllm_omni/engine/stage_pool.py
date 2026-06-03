@@ -1942,6 +1942,42 @@ class StagePool:
             return None
         return cast(StagePoolDiffusionClient, raw_client).get_diffusion_output_nowait()
 
+    async def get_step_boundary_snapshot(self, replica_id: int) -> dict[str, Any] | None:
+        """Fetch the latest DiT step-boundary event from a diffusion replica."""
+        if self.stage_type != "diffusion" or replica_id >= len(self.clients):
+            return None
+        client = self.clients[replica_id]
+        if client is None:
+            return None
+        rpc = getattr(client, "collective_rpc_async", None)
+        if not callable(rpc):
+            return None
+        try:
+            snapshot = await rpc(
+                "get_step_boundary_snapshot",
+                timeout=self.SCHEDULER_SNAPSHOT_RPC_TIMEOUT_S,
+            )
+        except Exception:
+            return None
+        if not self._is_valid_step_boundary_snapshot(snapshot):
+            return None
+        return snapshot
+
+    @staticmethod
+    def _is_valid_step_boundary_snapshot(snapshot: Any) -> bool:
+        if not isinstance(snapshot, dict):
+            return False
+        if snapshot.get("supported") is False:
+            return False
+        if not isinstance(snapshot.get("timestamp_s"), (int, float)):
+            return False
+        if snapshot.get("step_id") is not None and not isinstance(snapshot.get("step_id"), int):
+            return False
+        for key in ("scheduled_req_ids", "request_ids", "finished_req_ids"):
+            if not isinstance(snapshot.get(key), list):
+                return False
+        return True
+
     # ---- Stage-local control plane ----
 
     async def abort_requests(self, request_ids: list[str]) -> None:

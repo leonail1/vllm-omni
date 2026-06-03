@@ -42,7 +42,7 @@ from vllm_omni.diffusion.sched import (
 )
 from vllm_omni.diffusion.sched.base_scheduler import qwen_image_dynamic_step_batching_enabled
 from vllm_omni.diffusion.sched.interface import DiffusionRequestStatus
-from vllm_omni.diffusion.worker.utils import BatchRunnerOutput, RunnerOutput
+from vllm_omni.diffusion.worker.utils import BaseRunnerOutput, BatchRunnerOutput, RunnerOutput
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams, OmniTextPrompt
 from vllm_omni.outputs import OmniRequestOutput
 
@@ -169,6 +169,15 @@ class DiffusionEngine:
         self._shutdown_complete = False
         self.abort_queue: queue.Queue[str] = queue.Queue()
         self._rpc_queue: queue.Queue[_RpcTask] = queue.Queue()
+        self._last_step_boundary_snapshot: dict[str, Any] = {
+            "supported": True,
+            "timestamp_s": time.time(),
+            "step_id": None,
+            "scheduled_req_ids": [],
+            "request_ids": [],
+            "finished_req_ids": [],
+            "request_outputs": {},
+        }
         self.execute_fn = self.executor.execute_step if self.step_execution else self.executor.execute_request
 
         try:
@@ -544,6 +553,7 @@ class DiffusionEngine:
             self._process_aborts_queue()
             self._process_rpc_queue()
             finished_req_ids = self.scheduler.update_from_output(sched_output, runner_output)
+            self._record_step_boundary_snapshot(sched_output, runner_output, finished_req_ids)
             self._handle_finished_requests(finished_req_ids, runner_output)
 
         # Engine is stopping: fail any RPCs still queued so callers don't hang.
@@ -600,6 +610,52 @@ class DiffusionEngine:
                 return
             if not task.future.done():
                 task.future.set_exception(exc)
+
+    def _record_step_boundary_snapshot(
+        self,
+        sched_output: DiffusionSchedulerOutput,
+        runner_output: BaseRunnerOutput,
+        finished_req_ids: set[str],
+    ) -> None:
+        request_ids: list[str] = []
+        request_outputs: dict[str, dict[str, Any]] = {}
+        for sched_req_id in sched_output.scheduled_req_ids:
+            external_ids = self._external_request_ids_for_sched_req_id(sched_req_id)
+            request_ids.extend(external_ids)
+            req_output = runner_output.get_req_output(sched_req_id)
+            if req_output is None:
+                continue
+            result = req_output.result
+            request_outputs[sched_req_id] = {
+                "request_ids": external_ids,
+                "step_index": req_output.step_index,
+                "finished": req_output.finished,
+                "error": None if result is None else result.error,
+            }
+        self._last_step_boundary_snapshot = {
+            "supported": True,
+            "timestamp_s": time.time(),
+            "step_id": sched_output.step_id,
+            "scheduled_req_ids": list(sched_output.scheduled_req_ids),
+            "request_ids": list(dict.fromkeys(request_ids)),
+            "finished_req_ids": list(finished_req_ids),
+            "request_outputs": request_outputs,
+        }
+
+    def _external_request_ids_for_sched_req_id(self, sched_req_id: str) -> list[str]:
+        state = self.scheduler.get_request_state(sched_req_id)
+        if state is None:
+            return [sched_req_id]
+        req_ids: list[str] = []
+        if logical_request_id := getattr(state.req, "request_id", None):
+            req_ids.append(logical_request_id)
+        req_ids.extend(getattr(state.req, "request_ids", None) or [])
+        if not req_ids:
+            req_ids.append(sched_req_id)
+        return list(dict.fromkeys(req_ids))
+
+    def get_step_boundary_snapshot(self) -> dict[str, Any]:
+        return dict(self._last_step_boundary_snapshot)
 
     def _handle_finished_requests(
         self,
@@ -698,6 +754,7 @@ class DiffusionEngine:
                 self._process_aborts_queue()
 
                 finished_req_ids = self.scheduler.update_from_output(sched_output, runner_output)
+                self._record_step_boundary_snapshot(sched_output, runner_output, finished_req_ids)
 
                 # sync func should receive one result
                 if not isinstance(runner_output, RunnerOutput) and not len(runner_output) == 1:
@@ -825,6 +882,9 @@ class DiffusionEngine:
         if method == "get_scheduler_load_snapshot":
             with self._cv:
                 return self.scheduler.get_load_snapshot()
+        if method == "get_step_boundary_snapshot":
+            with self._cv:
+                return self.get_step_boundary_snapshot()
 
         # If the busy loop hasn't started yet (e.g. during _dummy_run in
         # __init__, or before the first async request after construction),
@@ -869,6 +929,9 @@ class DiffusionEngine:
         if method == "get_scheduler_load_snapshot":
             with self._cv:
                 return self.scheduler.get_load_snapshot()
+        if method == "get_step_boundary_snapshot":
+            with self._cv:
+                return self.get_step_boundary_snapshot()
         await self._check_and_start_background_loop()
         task = self._submit_rpc(method, timeout, args, kwargs, unique_reply_rank)
         aio_fut = asyncio.wrap_future(task.future)

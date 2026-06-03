@@ -39,6 +39,7 @@ from vllm_omni.distributed.omni_coordinator import (
 from vllm_omni.engine import OmniEngineCoreRequest
 from vllm_omni.engine.cfg_companion_tracker import CfgCompanionTracker
 from vllm_omni.engine.dag_runtime import DagRuntime
+from vllm_omni.engine.dag_types import DagTraceEvent
 from vllm_omni.engine.messages import (
     AbortRequestMessage,
     AddCompanionRequestMessage,
@@ -212,6 +213,9 @@ class Orchestrator:
             else DagRuntime.from_stage_pools(stage_pools)
         )
         self.pard_runtime = pard_runtime
+        self._pard_step_boundary_cursors: dict[tuple[int, int], tuple[int | None, float]] = {}
+        self._pard_step_boundary_last_poll_s: dict[tuple[int, int], float] = {}
+        self._pard_step_boundary_poll_interval_s = 0.02
 
         # PD disaggregation state
         self._pd_pair: tuple[int, int] | None = None
@@ -606,6 +610,89 @@ class Orchestrator:
         for pool in self.stage_pools:
             pool.release_bindings(request_ids)
 
+    async def _maybe_handle_pard_step_boundary(self, stage_id: int, replica_id: int) -> bool:
+        if self.pard_runtime is None:
+            return False
+        key = (stage_id, replica_id)
+        now_s = _time.time()
+        last_poll = self._pard_step_boundary_last_poll_s.get(key)
+        if last_poll is not None and now_s - last_poll < self._pard_step_boundary_poll_interval_s:
+            return False
+        self._pard_step_boundary_last_poll_s[key] = now_s
+
+        pool = self.stage_pools[stage_id]
+        snapshot = await pool.get_step_boundary_snapshot(replica_id)
+        if snapshot is None:
+            return False
+        step_id = snapshot.get("step_id")
+        timestamp_s = float(snapshot.get("timestamp_s", now_s))
+        cursor = (step_id if isinstance(step_id, int) else None, timestamp_s)
+        if self._pard_step_boundary_cursors.get(key) == cursor:
+            return False
+        self._pard_step_boundary_cursors[key] = cursor
+
+        handled = False
+        for request_id in snapshot.get("request_ids", []):
+            if not isinstance(request_id, str):
+                continue
+            handled = True
+            await self._handle_pard_request_step_boundary(
+                request_id,
+                stage_id,
+                replica_id,
+                step_id=step_id if isinstance(step_id, int) else None,
+                timestamp_s=timestamp_s,
+                snapshot=snapshot,
+            )
+        return handled
+
+    async def _handle_pard_request_step_boundary(
+        self,
+        request_id: str,
+        stage_id: int,
+        replica_id: int,
+        *,
+        step_id: int | None,
+        timestamp_s: float,
+        snapshot: dict[str, Any],
+    ) -> None:
+        ctx = self.dag_runtime.get_request_context(request_id)
+        if ctx is None:
+            return
+        lifecycle = ctx.stage_lifecycle.get(stage_id)
+        if lifecycle is not None:
+            lifecycle.metadata["inside_denoise_step"] = False
+            lifecycle.metadata["at_step_boundary"] = True
+            lifecycle.metadata["last_step_boundary_step_id"] = step_id
+            lifecycle.metadata["last_step_boundary_replica_id"] = replica_id
+        ctx.trace.append(
+            DagTraceEvent(
+                request_id=request_id,
+                stage_id=stage_id,
+                event="dit_step_boundary",
+                timestamp_s=timestamp_s,
+                details={
+                    "replica_id": replica_id,
+                    "step_id": step_id,
+                    "scheduled_req_ids": list(snapshot.get("scheduled_req_ids", [])),
+                    "finished_req_ids": list(snapshot.get("finished_req_ids", [])),
+                },
+            )
+        )
+        if not lifecycle or not lifecycle.metadata.get("pard_drop_pending_step_boundary"):
+            return
+        try:
+            cleanup = await self.pard_runtime.apply_pending_step_boundary(request_id, stage_id)
+        except ValueError:
+            return
+        if cleanup.outcome == PardDropCleanupOutcome.CLEANED_UP:
+            cleanup_ids = self._pard_drop_cleanup_request_ids(request_id)
+            self._archive_pard_drop_traces(cleanup_ids)
+            await self._cleanup_request_ids(
+                cleanup_ids,
+                abort=self._has_request_bindings(cleanup_ids),
+            )
+
     async def _enter_stage_and_maybe_admit(
         self,
         request_id: str,
@@ -795,6 +882,8 @@ class Orchestrator:
                         return
 
                     if pool.stage_type == "diffusion":
+                        if await self._maybe_handle_pard_step_boundary(stage_id, replica_id):
+                            idle = False
                         output = pool.poll_diffusion_output(replica_id)
                         if output is None:
                             continue
