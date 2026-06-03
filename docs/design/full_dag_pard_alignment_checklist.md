@@ -58,13 +58,13 @@ Paper-native ablation 映射表：
 
 | Paper name | Local alias | 必须表达的语义 |
 |---|---|---|
-| `PARD-back` | `dag_pard_back` | 回退式后验丢弃 / backward baseline，对比 proactive drop 的收益 |
-| `PARD-sf` | `dag_pard_sf` | static fixed priority / 固定优先级 baseline |
-| `PARD-oc` | `dag_pard_oc` | oracle control / 最优或近似 oracle 控制 baseline，用于界定上限 |
-| `PARD-split` | `dag_pard_split` | 固定资源切分 baseline |
-| `PARD-WCL` | `dag_pard_wcl` | workload-class-aware 或论文定义的 WCL baseline，语义必须按论文逐项对齐 |
-| `PARD-lower` | `dag_pard_lower` | planner lower-bound ablation |
-| `PARD-upper` | `dag_pard_upper` | planner upper-bound ablation |
+| `PARD-back` | `dag_pard_back` | 只考虑前序和当前模块，令 `L_sub = 0` |
+| `PARD-sf` | `dag_pard_sf` | 只把后续模块执行时长纳入 `L_sub`，忽略后续排队和 batch wait |
+| `PARD-oc` | `dag_pard_oc` | DAGOR 式 overload control：模块平均排队延迟超过阈值后通知前序限流接纳 |
+| `PARD-split` | `dag_pard_split` | 固定 per-module SLO budget 切分，请求超过模块预算时丢弃 |
+| `PARD-WCL` | `dag_pard_wcl` | 按模块 runtime worst-case latency 动态分配 per-module budget |
+| `PARD-lower` | `dag_pard_lower` | 后续 batch wait `W_i` 取下界 0，不改变执行时长 `d_i` |
+| `PARD-upper` | `dag_pard_upper` | 后续 batch wait `W_i` 取上界 `sum(d_i)`，不改变执行时长 `d_i` |
 | `PARD-FCFS` | `dag_pard_fcfs` | Request Broker 使用 FCFS priority |
 | `PARD-HBF` | `dag_pard_hbf` | 固定 High Budget First |
 | `PARD-LBF` | `dag_pard_lbf` | 固定 Low Budget First |
