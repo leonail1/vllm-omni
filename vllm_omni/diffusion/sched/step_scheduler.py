@@ -124,27 +124,7 @@ class StepScheduler(_BaseScheduler):
             return self._sequence_length(sampling.timesteps)
         if sampling.sigmas is not None:
             return len(sampling.sigmas)
-        stage_payload = self._get_qwen_image_stage_payload(request)
-        if stage_payload is not None:
-            payload_timesteps = stage_payload.get("timesteps")
-            if payload_timesteps is not None:
-                return self._sequence_length(payload_timesteps)
-            payload_steps = stage_payload.get("num_inference_steps")
-            if payload_steps is not None:
-                return int(payload_steps)
         return int(sampling.num_inference_steps)
-
-    @staticmethod
-    def _get_qwen_image_stage_payload(request: OmniDiffusionRequest) -> dict[str, Any] | None:
-        if not request.prompts:
-            return None
-        prompt = request.prompts[0]
-        if not isinstance(prompt, dict):
-            return None
-        payload = prompt.get("qwen_image_stage_payload")
-        if isinstance(payload, dict):
-            return payload
-        return None
 
     @staticmethod
     def _sequence_length(values: Any) -> int:

@@ -175,29 +175,6 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
         self._diffusion_extra_body_params = params
         return params
 
-    @staticmethod
-    def _get_config_value(config: Any, key: str, default: Any = None) -> Any:
-        if isinstance(config, dict):
-            return config.get(key, default)
-        return getattr(config, key, default)
-
-    def _get_diffusion_stage_model_class_names(self, *, final_only: bool) -> list[str]:
-        engine = getattr(self._diffusion_engine, "engine", None)
-        stage_configs = (
-            getattr(self._diffusion_engine, "stage_configs", None)
-            or getattr(engine, "stage_configs", None)
-            or []
-        )
-        names: list[str] = []
-        for stage_cfg in stage_configs:
-            if final_only and not bool(self._get_config_value(stage_cfg, "final_output", False)):
-                continue
-            engine_args = self._get_config_value(stage_cfg, "engine_args", {}) or {}
-            model_class_name = self._get_config_value(engine_args, "model_class_name")
-            if model_class_name:
-                names.append(str(model_class_name))
-        return names
-
     def _get_diffusion_extra_output_params(
         self,
         custom_output: dict[str, Any] | None,
@@ -212,12 +189,6 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
                 od_config = resolve_diffusion_od_config(self.engine_client, self._diffusion_engine)
                 if od_config is not None and getattr(od_config, "model_class_name", None):
                     params = get_extra_output_params(od_config.model_class_name)
-                if not params:
-                    for model_class_name in self._get_diffusion_stage_model_class_names(final_only=True):
-                        params |= get_extra_output_params(model_class_name)
-                if not params:
-                    for model_class_name in self._get_diffusion_stage_model_class_names(final_only=False):
-                        params |= get_extra_output_params(model_class_name)
             except Exception as e:
                 logger.warning("Failed to read EXTRA_OUTPUT_PARAMS from pipeline: %s", e)
             self._diffusion_extra_output_params = params
@@ -2228,7 +2199,6 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
         # Handle profiling data
         stage_durations = omni_outputs.stage_durations
         peak_memory_mb = omni_outputs.peak_memory_mb
-        extra_output = self._get_diffusion_extra_output_params(omni_outputs.custom_output) or {}
 
         # Handle different image output formats
         images = []
@@ -2285,7 +2255,6 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
                     },
                     "stage_durations": stage_durations,
                     "peak_memory_mb": peak_memory_mb,
-                    **extra_output,
                 }
             )
 
@@ -3027,7 +2996,6 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
             multimodal_output = getattr(result, "multimodal_output", {}) or {}
             stage_durations = result.stage_durations
             peak_memory_mb = result.peak_memory_mb
-            extra_output = self._get_diffusion_extra_output_params(result.custom_output) or {}
 
             if final_output_type == "audio":
                 sample_rate = 48000
@@ -3107,7 +3075,6 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
                             },
                             "stage_durations": stage_durations,
                             "peak_memory_mb": peak_memory_mb,
-                            **extra_output,
                         }
                     )
 

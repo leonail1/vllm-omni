@@ -34,21 +34,17 @@ def get_sampling_params_key(
     lora_request = getattr(sampling, "lora_request", None)
     do_classifier_free_guidance = getattr(sampling, "do_classifier_free_guidance", False)
 
-    if od_config is not None and getattr(od_config, "step_execution", False):
-        model_class_name = getattr(od_config, "model_class_name", None)
-        if model_class_name == "QwenImageDenoisePipeline":
-            prompt = request.prompts[0]
-            if isinstance(prompt, dict):
-                payload = prompt.get("qwen_image_stage_payload")
-                if isinstance(payload, dict):
-                    do_classifier_free_guidance = bool(payload.get("do_true_cfg", False))
-        elif model_class_name == "QwenImagePipeline":
-            true_cfg_scale = getattr(sampling, "true_cfg_scale", None)
-            true_cfg_scale = 4.0 if true_cfg_scale is None else true_cfg_scale
-            has_negative_prompt = any(
-                not isinstance(prompt, str) and prompt.get("negative_prompt") is not None for prompt in request.prompts
-            )
-            do_classifier_free_guidance = true_cfg_scale > 1 and has_negative_prompt
+    if (
+        od_config is not None
+        and getattr(od_config, "step_execution", False)
+        and getattr(od_config, "model_class_name", None) == "QwenImagePipeline"
+    ):
+        true_cfg_scale = getattr(sampling, "true_cfg_scale", None)
+        true_cfg_scale = 4.0 if true_cfg_scale is None else true_cfg_scale
+        has_negative_prompt = any(
+            not isinstance(prompt, str) and prompt.get("negative_prompt") is not None for prompt in request.prompts
+        )
+        do_classifier_free_guidance = true_cfg_scale > 1 and has_negative_prompt
 
     return SamplingParamsKey(
         do_classifier_free_guidance=do_classifier_free_guidance,

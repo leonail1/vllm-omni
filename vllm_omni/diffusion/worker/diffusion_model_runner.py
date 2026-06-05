@@ -365,13 +365,13 @@ class DiffusionModelRunner(OmniConnectorModelRunnerMixin):
         except (TypeError, ValueError):
             return False
         cls = self.pipeline.__class__
-        return cls.__name__ in ("QwenImagePipeline", "QwenImageDenoisePipeline") and "qwen_image" in cls.__module__
+        return cls.__name__ == "QwenImagePipeline" and "qwen_image" in cls.__module__
 
     def _validate_qwen_image_dynamic_step_batch(self, input_batch: InputBatch) -> None:
         if not input_batch.is_dynamic:
             return
         if not self._supports_qwen_image_dynamic_step_batching():
-            raise ValueError("Dynamic step batching is only enabled for Qwen-Image step pipelines.")
+            raise ValueError("Dynamic step batching is only enabled for QwenImagePipeline.")
         if not self.od_config.enforce_eager:
             raise ValueError("Qwen-Image dynamic step batching requires enforce_eager=True in the first version.")
         if getattr(self.od_config, "cache_backend", "none") not in (None, "none"):

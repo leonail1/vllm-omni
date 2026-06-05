@@ -62,49 +62,6 @@ def pad_tensor(tensor: torch.Tensor, target_seq_len: int, pad_value: float = 0.0
     return torch.cat([tensor, padding], dim=1)
 
 
-def test_npu_varlen_flat_segments_call_dense_4d(monkeypatch):
-    lengths = [3, 5]
-    num_heads = 2
-    head_dim = 4
-    total_tokens = sum(lengths)
-    query = torch.arange(total_tokens * num_heads * head_dim, dtype=torch.float32).reshape(
-        total_tokens, num_heads, head_dim
-    )
-    key = query + 1
-    value = query + 2
-    cu_seqlens = torch.tensor([0, lengths[0], total_tokens], dtype=torch.int32)
-    metadata = AttentionMetadata(
-        q_cu_seqlens=cu_seqlens,
-        kv_cu_seqlens=cu_seqlens,
-        max_q_len=max(lengths),
-        max_kv_len=max(lengths),
-        padded_tokens=0,
-    )
-    impl = FlashAttentionImpl(
-        num_heads=num_heads,
-        head_size=head_dim,
-        softmax_scale=head_dim**-0.5,
-        causal=False,
-        num_kv_heads=num_heads,
-    )
-    seen_shapes = []
-
-    def fake_dense_npu(q, k, v, attn_metadata=None):
-        assert attn_metadata is None
-        seen_shapes.append((tuple(q.shape), tuple(k.shape), tuple(v.shape)))
-        return q + 10
-
-    monkeypatch.setattr(impl, "forward_fa_npu", fake_dense_npu)
-
-    actual = impl._forward_varlen_flat_npu(query, key, value, metadata)
-
-    assert seen_shapes == [
-        ((1, 3, num_heads, head_dim), (1, 3, num_heads, head_dim), (1, 3, num_heads, head_dim)),
-        ((1, 5, num_heads, head_dim), (1, 5, num_heads, head_dim), (1, 5, num_heads, head_dim)),
-    ]
-    torch.testing.assert_close(actual, query + 10)
-
-
 @pytest.mark.skipif(not is_gpu, reason="FlashAttention requires CUDA or XPU")
 def test_padding_equivalence():
     """

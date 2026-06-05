@@ -1,9 +1,0 @@
-label,steps,requests,dit_completion_gap_mean_s,dit_completion_gap_p50_s,dit_completion_gap_p95_s,max_completions_in_0p50s,max_completions_in_1p00s,decode_queue_mean_s,decode_queue_p95_s
-baseline_7replica,4,42,0.116244,0.014210,0.111312,21,31,0.000142,0.000180
-baseline_7replica,8,42,0.119885,0.044428,0.147457,19,29,0.000205,0.000274
-baseline_7replica,12,42,0.122598,0.052824,0.193909,19,29,0.000272,0.000343
-pipeline_1decode,4,42,0.313839,0.075498,0.985847,12,15,1.217127,2.987647
-pipeline_1decode,8,42,0.282310,0.139852,1.736787,6,10,0.725308,2.117137
-pipeline_1decode,12,42,0.281634,0.089699,1.763757,6,10,0.757830,2.122846
-pipeline_1decode_dummy_decode,4,42,0.319073,0.073231,1.192603,12,16,0.008531,0.017996
-pipeline_1decode_stagger_0p15,4,42,0.304960,0.186459,0.871539,10,13,0.629795,2.209064

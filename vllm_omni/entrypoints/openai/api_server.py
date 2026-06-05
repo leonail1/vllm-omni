@@ -543,12 +543,6 @@ async def build_async_omni_from_stage_config(
             async_omni.shutdown()
 
 
-def _is_diffusion_only_stage_configs(stage_configs: Any) -> bool:
-    if not stage_configs:
-        return False
-    return all(get_stage_type(stage_config) == "diffusion" for stage_config in stage_configs)
-
-
 async def omni_init_app_state(
     engine_client: EngineClient,
     state: State,
@@ -569,15 +563,15 @@ async def omni_init_app_state(
     # Get vllm_config from engine_client (following 0.14.0 pattern)
     vllm_config = await _get_vllm_config(engine_client)
 
-    # Detect diffusion-only mode. Multi-stage diffusion pipelines such as
-    # encoder -> DiT -> decoder do not have an LLM vLLM config, so they must
-    # use the diffusion serving handlers rather than OpenAIServingRender.
-    is_diffusion_only = False
+    # Detect if it's pure Diffusion mode (single stage and is Diffusion)
+    is_pure_diffusion = False
     if hasattr(engine_client, "stage_configs") and engine_client.stage_configs:
         stage_configs = engine_client.stage_configs
-        if _is_diffusion_only_stage_configs(stage_configs):
-            is_diffusion_only = True
-            logger.info("Detected diffusion-only mode (%d diffusion stage(s))", len(stage_configs))
+        if len(stage_configs) == 1:
+            stage_type = get_stage_type(stage_configs[0])
+            if stage_type == "diffusion":
+                is_pure_diffusion = True
+                logger.info("Detected pure diffusion mode (single diffusion stage)")
 
     if args.served_model_name is not None:
         served_model_names = args.served_model_name
@@ -599,8 +593,8 @@ async def omni_init_app_state(
     state.stage_configs = engine_client.stage_configs if hasattr(engine_client, "stage_configs") else None
     model_name = served_model_names[0] if served_model_names else args.model
 
-    # Diffusion-only mode: use simplified initialization logic
-    if is_diffusion_only:
+    # Pure Diffusion mode: use simplified initialization logic
+    if is_pure_diffusion:
         state.vllm_config = None
         state.diffusion_engine = engine_client
         state.openai_serving_models = _DiffusionServingModels(base_model_paths)
