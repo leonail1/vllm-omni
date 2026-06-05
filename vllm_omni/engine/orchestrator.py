@@ -401,11 +401,17 @@ class Orchestrator:
         preprocess_ms = msg.preprocess_ms
         if preprocess_ms > 0:
             req_state.pipeline_timings["preprocess_ms"] = preprocess_ms
-        await self.stage_pools[stage_id].submit_initial(
+        replica_id = await self.stage_pools[stage_id].submit_initial(
             request_id,
             req_state,
             prompt,
             prompt_text=msg.output_prompt_text,
+        )
+        self._record_stage_route(
+            req_state,
+            stage_id,
+            replica_id,
+            route_kind="submit_initial",
         )
 
         if self.async_chunk and stage_id == 0 and final_stage_id > 0:
@@ -442,11 +448,36 @@ class Orchestrator:
 
         req_state.streaming.enabled = True
         req_state.stage_submit_ts[stage_id] = _time.time()
-        await self.stage_pools[stage_id].submit_update(
+        replica_id = await self.stage_pools[stage_id].submit_update(
             request_id,
             req_state,
             request,
             prompt_text=msg.output_prompt_text,
+        )
+        self._record_stage_route(
+            req_state,
+            stage_id,
+            replica_id,
+            route_kind="submit_update",
+        )
+
+    def _record_stage_route(
+        self,
+        req_state: OrchestratorRequestState,
+        stage_id: int,
+        replica_id: int,
+        *,
+        route_kind: str,
+    ) -> None:
+        """Keep low-cardinality routing fields for pipeline diagnostics."""
+        pool = self.stage_pools[stage_id]
+        prefix = f"stage_{stage_id}_route"
+        req_state.pipeline_timings[f"{prefix}_replica_id"] = float(replica_id)
+        req_state.pipeline_timings[f"{prefix}_live_replicas"] = float(pool.live_num_replicas)
+        req_state.pipeline_timings[f"{prefix}_is_distributed"] = float(bool(pool.is_distributed))
+        req_state.pipeline_timings[f"{prefix}_submit_s"] = _time.time()
+        req_state.pipeline_timings[f"{prefix}_{route_kind}_count"] = (
+            req_state.pipeline_timings.get(f"{prefix}_{route_kind}_count", 0.0) + 1.0
         )
 
     async def _handle_add_companion(self, msg: AddCompanionRequestMessage) -> None:
@@ -483,6 +514,12 @@ class Orchestrator:
             companion_prompt,
             prompt_text=msg.companion_prompt_text,
             affinity_request_id=parent_id,
+        )
+        self._record_stage_route(
+            companion_state,
+            0,
+            companion_replica_id,
+            route_kind="submit_initial",
         )
 
         logger.info(
@@ -1006,9 +1043,9 @@ class Orchestrator:
                 diffusion_prompt = req_state.prompt
 
             if already_submitted:
-                await next_pool.submit_update(req_id, req_state, diffusion_prompt)
+                replica_id = await next_pool.submit_update(req_id, req_state, diffusion_prompt)
             else:
-                await next_pool.submit_initial(
+                replica_id = await next_pool.submit_initial(
                     req_id,
                     req_state,
                     diffusion_prompt,
@@ -1020,6 +1057,12 @@ class Orchestrator:
                     },
                     params_override=self._maybe_clone_diffusion_params_for_cfg(req_id, params),
                 )
+            self._record_stage_route(
+                req_state,
+                next_logical,
+                replica_id,
+                route_kind="submit_update" if already_submitted else "submit_initial",
+            )
             req_state.stage_submit_ts[next_logical] = _time.time()
             return
 
@@ -1055,9 +1098,15 @@ class Orchestrator:
                 )
                 request.external_req_id = request.request_id
                 if already_submitted:
-                    await next_pool.submit_update(req_id, req_state, request)
+                    replica_id = await next_pool.submit_update(req_id, req_state, request)
                 else:
-                    await next_pool.submit_initial(req_id, req_state, request, prompt_text=None)
+                    replica_id = await next_pool.submit_initial(req_id, req_state, request, prompt_text=None)
+                self._record_stage_route(
+                    req_state,
+                    next_logical,
+                    replica_id,
+                    route_kind="submit_update" if already_submitted else "submit_initial",
+                )
 
             req_state.stage_submit_ts[next_logical] = _time.time()
             return
@@ -1099,9 +1148,15 @@ class Orchestrator:
 
             request.external_req_id = request.request_id
             if already_submitted:
-                await next_pool.submit_update(req_id, req_state, request)
+                replica_id = await next_pool.submit_update(req_id, req_state, request)
             else:
-                await next_pool.submit_initial(req_id, req_state, request, prompt_text=None)
+                replica_id = await next_pool.submit_initial(req_id, req_state, request, prompt_text=None)
+            self._record_stage_route(
+                req_state,
+                next_logical,
+                replica_id,
+                route_kind="submit_update" if already_submitted else "submit_initial",
+            )
 
         req_state.stage_submit_ts[next_logical] = _time.time()
 
@@ -1130,7 +1185,7 @@ class Orchestrator:
             req_state.stage_submit_ts[next_stage_id] = _time.time()
 
             if next_pool.stage_type == "diffusion":
-                await next_pool.submit_initial(
+                replica_id = await next_pool.submit_initial(
                     request_id,
                     req_state,
                     req_state.prompt,
@@ -1140,6 +1195,12 @@ class Orchestrator:
                             request_id=request_id,
                         )
                     },
+                )
+                self._record_stage_route(
+                    req_state,
+                    next_stage_id,
+                    replica_id,
+                    route_kind="submit_initial",
                 )
             else:
                 import copy
@@ -1168,7 +1229,13 @@ class Orchestrator:
                     model_config=next_pool.stage_vllm_config.model_config,
                 )
                 request.external_req_id = request.request_id
-                await next_pool.submit_initial(request_id, req_state, request, prompt_text=None)
+                replica_id = await next_pool.submit_initial(request_id, req_state, request, prompt_text=None)
+                self._record_stage_route(
+                    req_state,
+                    next_stage_id,
+                    replica_id,
+                    route_kind="submit_initial",
+                )
 
     def _build_kv_sender_info(
         self,

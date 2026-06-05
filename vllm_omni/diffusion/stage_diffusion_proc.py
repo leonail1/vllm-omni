@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import os
 import signal
 import time
 from concurrent.futures import ThreadPoolExecutor
@@ -641,6 +642,9 @@ class StageDiffusionProc:
 
         signal.signal(signal.SIGTERM, signal_handler)
         signal.signal(signal.SIGINT, signal_handler)
+
+        os.environ["VLLM_OMNI_STAGE_ID"] = "" if omni_stage_id is None else str(omni_stage_id)
+        os.environ["VLLM_OMNI_REPLICA_ID"] = str(omni_replica_id)
 
         proc = cls(model, od_config)
         coord_client: OmniCoordClientForStage | None = None

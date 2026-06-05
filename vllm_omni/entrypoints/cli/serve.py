@@ -714,6 +714,7 @@ def run_headless(args: argparse.Namespace) -> None:
         prepare_engine_environment,
         setup_stage_devices,
         split_devices_for_replicas,
+        stage_runtime_env,
         terminate_alive_proc,
     )
     from vllm_omni.entrypoints.utils import inject_omni_kv_config, load_and_resolve_stage_configs
@@ -820,7 +821,8 @@ def run_headless(args: argparse.Namespace) -> None:
         # from the loaded deploy config so heterogeneous KV routing keys match
         # the head process (e.g. from_tp=2, to_tp=1).
         inject_kv_stage_info(stage_cfg, stage_id, stage_configs)
-        od_config = build_diffusion_config(model, stage_cfg, metadata)
+        with stage_runtime_env(stage_id, runtime_cfg):
+            od_config = build_diffusion_config(model, stage_cfg, metadata)
 
         logger.info(
             "[Headless] Launching %d diffusion replica(s) for stage %d via OmniMasterServer at %s:%d",
@@ -854,39 +856,47 @@ def run_headless(args: argparse.Namespace) -> None:
                 try:
                     if per_replica_devices[_rep_idx] is not None:
                         setup_stage_devices(stage_id, {"devices": per_replica_devices[_rep_idx]})
-                    # Each StageDiffusionProc starts its own
-                    # torch.distributed group bound to
-                    # ``od_config.master_port``. Without an explicit
-                    # per-replica override all spawned subprocesses
-                    # share the value ``OmniDiffusionConfig.__post_init__``
-                    # picked once (and the second binder hits EADDRINUSE
-                    # on ``init_process_group``). We can't use
-                    # kernel-ephemeral allocation either, because the
-                    # master server's pre-allocated ZMQ ports (returned
-                    # by ``register_stage_with_omni_master``) also live
-                    # in the ephemeral range and are not actually bound
-                    # until the headless ``_perform_diffusion_handshake``
-                    # runs — so picking an ephemeral port here can steal
-                    # a port the master server already promised to a
-                    # sibling headless. Use ``settle_port`` from a base
-                    # above the Linux default ephemeral range
-                    # (32768-60999) so torch.distributed master ports
-                    # never overlap with ZMQ allocations.
-                    if omni_dp_size_local > 1:
-                        od_config.master_port = od_config.settle_port(
-                            61000 + _rep_idx * 100,
-                            port_inc=37,
+                    with stage_runtime_env(stage_id, runtime_cfg):
+                        # Each StageDiffusionProc starts its own
+                        # torch.distributed group bound to
+                        # ``od_config.master_port``. Without an explicit
+                        # per-replica override all spawned subprocesses
+                        # share the value ``OmniDiffusionConfig.__post_init__``
+                        # picked once (and the second binder hits EADDRINUSE
+                        # on ``init_process_group``). We can't use
+                        # kernel-ephemeral allocation either, because the
+                        # master server's pre-allocated ZMQ ports (returned
+                        # by ``register_stage_with_omni_master``) also live
+                        # in the ephemeral range and are not actually bound
+                        # until the headless ``_perform_diffusion_handshake``
+                        # runs — so picking an ephemeral port here can steal
+                        # a port the master server already promised to a
+                        # sibling headless. Use ``settle_port`` from a base
+                        # above the Linux default ephemeral range
+                        # (32768-60999) so torch.distributed master ports
+                        # never overlap with ZMQ allocations. Include the
+                        # stage id in the base port so two multi-replica
+                        # diffusion stages on the same host do not both
+                        # start at 61000 and collide. Keep the seed inside
+                        # the high-port window to avoid invalid port values
+                        # for larger stage ids.
+                        if omni_dp_size_local > 1:
+                            master_port_seed = (stage_id * 1000 + _rep_idx * 100) % 4500
+                            od_config.master_port = od_config.settle_port(
+                                61000 + master_port_seed,
+                                port_inc=37,
+                            )
+                            os.environ["MASTER_PORT"] = str(od_config.master_port)
+                        proc, _, _, _ = spawn_diffusion_proc(
+                            model,
+                            od_config,
+                            handshake_address=response.handshake_address,
+                            request_address=response.input_address,
+                            response_address=response.output_address,
+                            omni_coordinator_address=response.coordinator_router_address,
+                            omni_stage_id=stage_id,
+                            omni_replica_id=response.replica_id,
                         )
-                    proc, _, _, _ = spawn_diffusion_proc(
-                        model,
-                        od_config,
-                        handshake_address=response.handshake_address,
-                        request_address=response.input_address,
-                        response_address=response.output_address,
-                        omni_coordinator_address=response.coordinator_router_address,
-                        omni_stage_id=stage_id,
-                        omni_replica_id=response.replica_id,
-                    )
                 finally:
                     if previous_visible_devices is None:
                         current_omni_platform.unset_device_control_env_var()

@@ -312,7 +312,40 @@ class FlashAttentionImpl(AttentionImpl):
         kv_cache_dtype = attn_metadata.extra.get("kv_cache_dtype") if attn_metadata else None
         if kv_cache_dtype is not None:
             return self.forward_fa_quant_npu(query, key, value, attn_metadata)
+        if attn_metadata is not None and attn_metadata.is_varlen:
+            return self._forward_varlen_flat_npu(query, key, value, attn_metadata)
         return self.forward_fa_npu(query, key, value, attn_metadata)
+
+    def _forward_varlen_flat_npu(
+        self,
+        query: torch.Tensor,
+        key: torch.Tensor,
+        value: torch.Tensor,
+        attn_metadata: AttentionMetadata,
+    ) -> torch.Tensor:
+        """Run flat varlen Q/K/V on NPU using existing dense MindIE-SD calls."""
+        if query.ndim != 3 or key.ndim != 3 or value.ndim != 3:
+            raise ValueError("Flat varlen NPU FlashAttention expects [total_tokens, heads, head_dim] Q/K/V.")
+        if attn_metadata.attn_mask is not None or attn_metadata.joint_attn_mask is not None:
+            raise ValueError("Flat varlen NPU FlashAttention does not accept attention masks.")
+        if attn_metadata.padded_tokens != 0:
+            raise ValueError("Flat varlen NPU FlashAttention requires padded_tokens=0.")
+        if attn_metadata.q_cu_seqlens is None or attn_metadata.kv_cu_seqlens is None:
+            raise ValueError("Flat varlen NPU FlashAttention requires q_cu_seqlens and kv_cu_seqlens.")
+        q_cu = attn_metadata.q_cu_seqlens.detach().cpu().tolist()
+        kv_cu = attn_metadata.kv_cu_seqlens.detach().cpu().tolist()
+        if len(q_cu) != len(kv_cu):
+            raise ValueError("Flat varlen NPU FlashAttention requires matching q/kv segment counts.")
+
+        outputs: list[torch.Tensor] = []
+        for q_start, q_end, kv_start, kv_end in zip(q_cu[:-1], q_cu[1:], kv_cu[:-1], kv_cu[1:], strict=True):
+            q_segment = query[int(q_start) : int(q_end)].unsqueeze(0)
+            k_segment = key[int(kv_start) : int(kv_end)].unsqueeze(0)
+            v_segment = value[int(kv_start) : int(kv_end)].unsqueeze(0)
+            outputs.append(self.forward_fa_npu(q_segment, k_segment, v_segment, None).squeeze(0))
+        if not outputs:
+            return query.new_empty(query.shape)
+        return torch.cat(outputs, dim=0)
 
     def forward_fa_quant_npu(
         self,

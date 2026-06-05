@@ -26,6 +26,21 @@ _DIFFUSION_MODELS = {
         "pipeline_qwen_image",
         "QwenImagePipeline",
     ),
+    "QwenImageEncodePipeline": (
+        "qwen_image",
+        "pipeline_qwen_image",
+        "QwenImageEncodePipeline",
+    ),
+    "QwenImageDenoisePipeline": (
+        "qwen_image",
+        "pipeline_qwen_image",
+        "QwenImageDenoisePipeline",
+    ),
+    "QwenImageDecodePipeline": (
+        "qwen_image",
+        "pipeline_qwen_image",
+        "QwenImageDecodePipeline",
+    ),
     "QwenImageEditPipeline": (
         "qwen_image",
         "pipeline_qwen_image_edit",
@@ -448,6 +463,7 @@ _DIFFUSION_POST_PROCESS_FUNCS = {
     # `post_process_func` function must be placed in {mod_folder}/{mod_relname}.py,
     # where mod_folder and mod_relname are  defined and mapped using `_DIFFUSION_MODELS` via the `arch` key
     "QwenImagePipeline": "get_qwen_image_post_process_func",
+    "QwenImageDecodePipeline": "get_qwen_image_post_process_func",
     "QwenImageEditPipeline": "get_qwen_image_edit_post_process_func",
     "QwenImageEditPlusPipeline": "get_qwen_image_edit_plus_post_process_func",
     "GlmImagePipeline": "get_glm_image_post_process_func",

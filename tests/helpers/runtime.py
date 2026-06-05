@@ -395,6 +395,7 @@ class OmniServerStageCli(OmniServer):
         if 0 not in self.stage_ids:
             raise ValueError(f"Stage CLI test requires stage_id=0 in config: {stage_config_path}")
         self.stage_replica_counts = self._load_stage_replica_counts(resolved_cfg)
+        self.stage_types = self._load_stage_types(resolved_cfg)
         self.stage_procs: dict[tuple[int, int], subprocess.Popen] = {}
         self.proc = None
 
@@ -437,6 +438,16 @@ class OmniServerStageCli(OmniServer):
                 int(stage.get("num_replicas") or stage.get("runtime", {}).get("num_replicas", 1)),
             )
         return replica_counts
+
+    @staticmethod
+    def _load_stage_types(resolved_config: dict) -> dict[int, str]:
+        stage_types: dict[int, str] = {}
+        for stage in OmniServerStageCli._stage_entries(resolved_config):
+            stage_id = stage.get("stage_id")
+            if stage_id is None:
+                continue
+            stage_types[int(stage_id)] = str(stage.get("stage_type") or "unknown")
+        return stage_types
 
     @classmethod
     def _parse_device_list(cls, devices: str | int) -> list[str]:
@@ -497,7 +508,14 @@ class OmniServerStageCli(OmniServer):
         if env_var:
             env[env_var] = mapped_devices
 
-    def _build_stage_cmd(self, stage_id: int, *, headless: bool, replica_id: int = 0) -> list[str]:
+    def _build_stage_cmd(
+        self,
+        stage_id: int,
+        *,
+        headless: bool,
+        replica_id: int = 0,
+        omni_dp_size_local: int | None = None,
+    ) -> list[str]:
         cmd = [
             sys.executable,
             "-m",
@@ -516,6 +534,8 @@ class OmniServerStageCli(OmniServer):
             "--replica-id",
             str(replica_id),
         ]
+        if omni_dp_size_local is not None and omni_dp_size_local > 1:
+            cmd += ["--omni-dp-size-local", str(omni_dp_size_local)]
 
         if headless:
             cmd.append("--headless")
@@ -525,13 +545,25 @@ class OmniServerStageCli(OmniServer):
         cmd += self.serve_args
         return cmd
 
-    def _launch_stage(self, stage_id: int, *, headless: bool, replica_id: int = 0) -> None:
+    def _launch_stage(
+        self,
+        stage_id: int,
+        *,
+        headless: bool,
+        replica_id: int = 0,
+        omni_dp_size_local: int | None = None,
+    ) -> None:
         env = os.environ.copy()
         env["VLLM_WORKER_MULTIPROC_METHOD"] = "spawn"
         if self.env_dict is not None:
             env.update(self.env_dict)
 
-        cmd = self._build_stage_cmd(stage_id, headless=headless, replica_id=replica_id)
+        cmd = self._build_stage_cmd(
+            stage_id,
+            headless=headless,
+            replica_id=replica_id,
+            omni_dp_size_local=omni_dp_size_local,
+        )
         print(f"Launching OmniServerStageCli stage {stage_id} replica {replica_id}: {' '.join(cmd)}")
         # Capture each subprocess's stdout+stderr to a per-stage log file so
         # debugging "Stage N exited before API server ready" doesn't rely on
@@ -573,6 +605,30 @@ class OmniServerStageCli(OmniServer):
                     f"Stage {stage_id} replica {replica_id} exited with code {ret} before API server became ready.{tail}"
                 )
 
+    def _headless_stage_replicas_ready(self) -> bool:
+        """Return true once every non-head stage reports its local replica(s) as UP."""
+        log_paths = getattr(self, "_stage_log_paths", {}) or {}
+        for stage_id in self.stage_ids:
+            if stage_id == 0:
+                continue
+            log_path = log_paths.get((stage_id, 0))
+            if not log_path or not log_path.exists():
+                return False
+            try:
+                text = log_path.read_text(encoding="utf-8", errors="replace")
+            except OSError:
+                return False
+            for replica_id in range(self.stage_replica_counts.get(stage_id, 1)):
+                stage_type = self.stage_types.get(stage_id, "unknown")
+                markers = []
+                if stage_type in ("diffusion", "unknown"):
+                    markers.append(f"Diffusion replica id={replica_id} for stage {stage_id} is up")
+                if stage_type in ("llm", "unknown"):
+                    markers.append(f"Stage {stage_id} replica id={replica_id} up")
+                if not any(marker in text for marker in markers):
+                    return False
+        return True
+
     def _start_server(self) -> None:
         startup_t0 = time.perf_counter()
         ordered_stage_ids = [0, *[stage_id for stage_id in self.stage_ids if stage_id != 0]]
@@ -582,8 +638,13 @@ class OmniServerStageCli(OmniServer):
         self._ensure_stage_processes_alive()
 
         for stage_id in ordered_stage_ids[1:]:
-            for replica_id in range(self.stage_replica_counts.get(stage_id, 1)):
-                self._launch_stage(stage_id, headless=True, replica_id=replica_id)
+            replica_count = self.stage_replica_counts.get(stage_id, 1)
+            self._launch_stage(
+                stage_id,
+                headless=True,
+                replica_id=0,
+                omni_dp_size_local=replica_count,
+            )
 
         max_wait = 1200
         start_time = time.time()
@@ -592,7 +653,7 @@ class OmniServerStageCli(OmniServer):
             with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
                 sock.settimeout(1)
                 result = sock.connect_ex((self.host, self.port))
-                if result == 0:
+                if result == 0 and self._headless_stage_replicas_ready():
                     startup_s = time.perf_counter() - startup_t0
                     if self.log_stats:
                         print(

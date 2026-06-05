@@ -231,9 +231,11 @@ class OmniRequestOutput:
         For pipeline outputs with an inner OmniRequestOutput, forwards
         the custom_output from the inner request output.
         """
+        if self._custom_output:
+            return self._custom_output
         if self.request_output is not None:
             if isinstance(self.request_output, OmniRequestOutput):
-                return self.request_output._custom_output
+                return self.request_output.custom_output
         return self._custom_output
 
     @custom_output.setter

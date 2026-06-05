@@ -7,7 +7,8 @@ import json
 import logging
 import math
 import os
-from collections.abc import Iterable
+import time
+from collections.abc import Iterable, Mapping
 from typing import TYPE_CHECKING, Any, ClassVar
 
 import numpy as np
@@ -35,7 +36,7 @@ from vllm_omni.diffusion.models.qwen_image.qwen_image_transformer import (
     QwenImageTransformer2DModel,
 )
 from vllm_omni.diffusion.profiler.diffusion_pipeline_profiler import DiffusionPipelineProfilerMixin
-from vllm_omni.diffusion.request import OmniDiffusionRequest
+from vllm_omni.diffusion.request import DUMMY_DIFFUSION_REQUEST_ID, OmniDiffusionRequest
 from vllm_omni.diffusion.utils.prompt_utils import (
     validate_prompt_sequence_lengths,
 )
@@ -54,19 +55,350 @@ from vllm_omni.model_executor.model_loader.weight_utils import (
 
 logger = logging.getLogger(__name__)
 
+QWEN_IMAGE_STAGE_PAYLOAD_KEY = "qwen_image_stage_payload"
+QWEN_IMAGE_STAGE_KIND_KEY = "qwen_image_stage_kind"
+QWEN_IMAGE_STAGE_TRACE_KEY = "qwen_image_stage_trace"
+QWEN_IMAGE_DENOISE_BATCH_TRACE_KEY = "qwen_image_denoise_batch_trace"
+
+
+def _get_qwen_image_model_path(model_name: str) -> str:
+    if os.path.exists(model_name):
+        return model_name
+    return download_weights_from_hf_specific(model_name, None, ["vae/config.json"])
+
+
+def _load_qwen_image_vae_config(model_name: str) -> dict[str, Any]:
+    model_path = _get_qwen_image_model_path(model_name)
+    vae_config_path = os.path.join(model_path, "vae/config.json")
+    with open(vae_config_path) as f:
+        return json.load(f)
+
+
+def _get_qwen_image_vae_scale_factor(model_name: str) -> int:
+    vae_config = _load_qwen_image_vae_config(model_name)
+    return 2 ** len(vae_config["temporal_downsample"]) if "temporal_downsample" in vae_config else 8
+
+
+def _extract_qwen_image_stage_payload(
+    prompts: list[Any] | None,
+    expected_kind: str,
+) -> dict[str, Any]:
+    if not prompts:
+        raise ValueError(f"Qwen-Image {expected_kind} stage requires an upstream stage payload.")
+    prompt = prompts[0]
+    if not isinstance(prompt, dict):
+        raise ValueError(
+            f"Qwen-Image {expected_kind} stage expects a dict prompt carrying "
+            f"{QWEN_IMAGE_STAGE_PAYLOAD_KEY!r}, got {type(prompt).__name__}."
+        )
+    payload = prompt.get(QWEN_IMAGE_STAGE_PAYLOAD_KEY)
+    kind = prompt.get(QWEN_IMAGE_STAGE_KIND_KEY)
+    if not isinstance(payload, dict) or kind != expected_kind:
+        raise ValueError(
+            f"Qwen-Image {expected_kind} stage received invalid payload kind {kind!r}."
+        )
+    return payload
+
+
+def _get_qwen_image_stage_payload_from_prompt(prompt: Any) -> dict[str, Any] | None:
+    if not isinstance(prompt, dict):
+        return None
+    payload = prompt.get(QWEN_IMAGE_STAGE_PAYLOAD_KEY)
+    if not isinstance(payload, dict):
+        return None
+    return payload
+
+
+def get_qwen_image_stage_payload_do_true_cfg(prompt: Any) -> bool | None:
+    payload = _get_qwen_image_stage_payload_from_prompt(prompt)
+    if payload is None:
+        return None
+    return bool(payload.get("do_true_cfg", False))
+
+
+def _to_cpu_stage_value(value: Any) -> Any:
+    if isinstance(value, torch.Tensor):
+        return value.detach().cpu()
+    if isinstance(value, Mapping):
+        return {key: _to_cpu_stage_value(item) for key, item in value.items()}
+    if isinstance(value, list):
+        return [_to_cpu_stage_value(item) for item in value]
+    if isinstance(value, tuple):
+        return tuple(_to_cpu_stage_value(item) for item in value)
+    return value
+
+
+def _qwen_image_tensor_nbytes(value: Any) -> int:
+    if isinstance(value, torch.Tensor):
+        return int(value.numel() * value.element_size())
+    if isinstance(value, np.ndarray):
+        return int(value.nbytes)
+    if isinstance(value, Mapping):
+        return sum(_qwen_image_tensor_nbytes(item) for item in value.values())
+    if isinstance(value, (list, tuple)):
+        return sum(_qwen_image_tensor_nbytes(item) for item in value)
+    return 0
+
+
+def _qwen_image_payload_nbytes(payload: Mapping[str, Any]) -> int:
+    return sum(
+        _qwen_image_tensor_nbytes(value)
+        for key, value in payload.items()
+        if key != QWEN_IMAGE_STAGE_TRACE_KEY
+    )
+
+
+def _qwen_image_trace_request_id(payload: Mapping[str, Any]) -> str:
+    trace = payload.get(QWEN_IMAGE_STAGE_TRACE_KEY)
+    if isinstance(trace, list):
+        for event in reversed(trace):
+            if isinstance(event, Mapping):
+                request_id = event.get("request_id")
+                if request_id:
+                    return str(request_id)
+    return "unknown"
+
+
+def _qwen_image_runtime_trace_context() -> dict[str, Any]:
+    """Collect stable runtime identifiers for cross-stage trace analysis."""
+    context: dict[str, Any] = {}
+    for env_name, trace_key in (
+        ("VLLM_OMNI_STAGE_ID", "stage_id"),
+        ("VLLM_OMNI_REPLICA_ID", "replica_id"),
+        ("ASCEND_RT_VISIBLE_DEVICES", "ascend_visible_devices"),
+        ("CUDA_VISIBLE_DEVICES", "cuda_visible_devices"),
+    ):
+        value = os.environ.get(env_name)
+        if value is None or value == "":
+            continue
+        if trace_key in {"stage_id", "replica_id"}:
+            try:
+                context[trace_key] = int(value)
+                continue
+            except ValueError:
+                pass
+        context[trace_key] = value
+    return context
+
+
+def _append_qwen_image_stage_trace(
+    payload: dict[str, Any],
+    *,
+    stage: str,
+    request_id: str,
+    start_s: float,
+    end_s: float,
+    payload_bytes: int | None = None,
+    extra: Mapping[str, Any] | None = None,
+) -> dict[str, Any]:
+    trace = list(payload.get(QWEN_IMAGE_STAGE_TRACE_KEY) or [])
+    event = {
+        "stage": stage,
+        "request_id": request_id,
+        "start_s": start_s,
+        "end_s": end_s,
+        "duration_s": max(0.0, end_s - start_s),
+        "payload_bytes": _qwen_image_payload_nbytes(payload) if payload_bytes is None else int(payload_bytes),
+    }
+    event.update(_qwen_image_runtime_trace_context())
+    if extra:
+        for key, value in extra.items():
+            if isinstance(value, (str, int, float, bool)) or value is None:
+                event[str(key)] = value
+    trace.append(event)
+    payload[QWEN_IMAGE_STAGE_TRACE_KEY] = trace
+    return payload
+
+
+def _qwen_image_stage_env_flag(name: str, default: bool = False) -> bool:
+    value = os.environ.get(name)
+    if value is None:
+        return default
+    return value.strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _qwen_image_stage_timing_sync(enabled: bool) -> None:
+    if not enabled:
+        return
+    npu = getattr(torch, "npu", None)
+    if npu is not None:
+        is_available = getattr(npu, "is_available", None)
+        synchronize = getattr(npu, "synchronize", None)
+        if callable(is_available) and is_available() and callable(synchronize):
+            synchronize()
+            return
+    if torch.cuda.is_available():
+        torch.cuda.synchronize()
+
+
+def _qwen_image_record_denoise_batch_trace(
+    instance: Any,
+    input_batch: "InputBatch",
+    *,
+    start_s: float,
+    end_s: float,
+) -> None:
+    if not _qwen_image_stage_env_flag("QWEN_IMAGE_DENOISE_BATCH_TRACE"):
+        return
+    if all(request_id == DUMMY_DIFFUSION_REQUEST_ID for request_id in input_batch.request_ids):
+        return
+
+    trace_by_request = getattr(instance, "_qwen_image_denoise_batch_trace_by_request", None)
+    if trace_by_request is None:
+        trace_by_request = {}
+        setattr(instance, "_qwen_image_denoise_batch_trace_by_request", trace_by_request)
+
+    token_counts = {span.request_id: int(span.token_count) for span in input_batch.request_spans}
+    row_counts = {span.request_id: int(span.row_count) for span in input_batch.request_spans}
+    total_image_tokens = int(sum(token_counts.values()))
+    total_rows = int(sum(row_counts.values()))
+    common = {
+        "stage": "denoise_step",
+        "start_s": start_s,
+        "end_s": end_s,
+        "duration_s": max(0.0, end_s - start_s),
+        "batch_size": int(input_batch.num_reqs),
+        "num_reqs_after_padding": int(input_batch.num_reqs_after_padding),
+        "total_rows": total_rows,
+        "total_image_tokens": total_image_tokens,
+        "is_dynamic": bool(input_batch.is_dynamic),
+    }
+    common.update(_qwen_image_runtime_trace_context())
+    for request_id in input_batch.request_ids:
+        request_trace = trace_by_request.setdefault(request_id, [])
+        event = dict(common)
+        event["request_id"] = request_id
+        event["step_index"] = len(request_trace)
+        event["request_image_tokens"] = int(token_counts.get(request_id, 0))
+        event["request_rows"] = int(row_counts.get(request_id, 0))
+        request_trace.append(event)
+
+
+def _qwen_image_pop_denoise_batch_trace(instance: Any, request_id: str) -> list[dict[str, Any]]:
+    trace_by_request = getattr(instance, "_qwen_image_denoise_batch_trace_by_request", None)
+    if not isinstance(trace_by_request, dict):
+        return []
+    trace = trace_by_request.pop(request_id, [])
+    return trace if isinstance(trace, list) else []
+
+
+def _is_qwen_image_shape_triplet(value: Any) -> bool:
+    if torch.is_tensor(value):
+        value = value.detach().cpu().tolist()
+    return (
+        isinstance(value, (list, tuple))
+        and len(value) == 3
+        and all(isinstance(item, (int, np.integer)) for item in value)
+    )
+
+
+def _as_qwen_image_shape_tuple(value: Any) -> tuple[int, int, int]:
+    if torch.is_tensor(value):
+        value = value.detach().cpu().tolist()
+    if not _is_qwen_image_shape_triplet(value):
+        raise ValueError(f"Invalid Qwen-Image shape entry: {value!r}.")
+    return (int(value[0]), int(value[1]), int(value[2]))
+
+
+def _normalize_qwen_image_img_shapes(img_shapes: Any) -> list[list[tuple[int, int, int]]]:
+    """Normalize stage-transported image shapes to the request-state layout."""
+    if torch.is_tensor(img_shapes):
+        img_shapes = img_shapes.detach().cpu().tolist()
+    if _is_qwen_image_shape_triplet(img_shapes):
+        return [[_as_qwen_image_shape_tuple(img_shapes)]]
+    if not isinstance(img_shapes, (list, tuple)) or not img_shapes:
+        raise ValueError(f"Invalid Qwen-Image img_shapes payload: {img_shapes!r}.")
+
+    normalized: list[list[tuple[int, int, int]]] = []
+    for sample_shapes in img_shapes:
+        if torch.is_tensor(sample_shapes):
+            sample_shapes = sample_shapes.detach().cpu().tolist()
+        if _is_qwen_image_shape_triplet(sample_shapes):
+            normalized.append([_as_qwen_image_shape_tuple(sample_shapes)])
+            continue
+        if not isinstance(sample_shapes, (list, tuple)) or not sample_shapes:
+            raise ValueError(f"Invalid Qwen-Image sample img_shapes entry: {sample_shapes!r}.")
+        normalized.append([_as_qwen_image_shape_tuple(shape) for shape in sample_shapes])
+    return normalized
+
+
+def _make_dummy_encode_payload(
+    *,
+    height: int,
+    width: int,
+    num_inference_steps: int,
+    true_cfg_scale: float = 4.0,
+) -> dict[str, Any]:
+    timesteps = torch.arange(num_inference_steps, 0, -1, dtype=torch.float32)
+    return {
+        "prompt_embeds": torch.zeros(1, 1, 1),
+        "prompt_embeds_mask": torch.ones(1, 1, dtype=torch.long),
+        "negative_prompt_embeds": None,
+        "negative_prompt_embeds_mask": None,
+        "latents": torch.zeros(1, 1, 4),
+        "img_shapes": [[(1, 1, 1)]],
+        "timesteps": timesteps,
+        "num_inference_steps": num_inference_steps,
+        "sigmas": None,
+        "do_true_cfg": False,
+        "guidance": None,
+        "txt_seq_lens": [1],
+        "negative_txt_seq_lens": None,
+        "true_cfg_scale": true_cfg_scale,
+        "cfg_normalize": True,
+        "height": height,
+        "width": width,
+        "output_type": "latent",
+        "attention_kwargs": {},
+    }
+
+
+def _make_dummy_denoise_payload(
+    *,
+    height: int,
+    width: int,
+) -> dict[str, Any]:
+    return {
+        "latents": torch.zeros(1, 1, 4),
+        "height": height,
+        "width": width,
+        "output_type": "dummy_image",
+    }
+
+
+def _stage_output(payload: dict[str, Any], kind: str) -> DiffusionOutput:
+    payload_bytes = _qwen_image_payload_nbytes(payload)
+    export_start_s = time.time()
+    converted_payload = _to_cpu_stage_value(payload)
+    export_end_s = time.time()
+    if _qwen_image_stage_env_flag("QWEN_IMAGE_STAGE_TRANSFER_TRACE"):
+        _append_qwen_image_stage_trace(
+            converted_payload,
+            stage=f"{kind}_payload_export",
+            request_id=_qwen_image_trace_request_id(payload),
+            start_s=export_start_s,
+            end_s=export_end_s,
+            payload_bytes=payload_bytes,
+            extra={
+                "source_device": "stage_device",
+                "target_device": "cpu",
+                "payload_kind": kind,
+            },
+        )
+    return DiffusionOutput(
+        output=[],
+        custom_output={
+            QWEN_IMAGE_STAGE_PAYLOAD_KEY: converted_payload,
+            QWEN_IMAGE_STAGE_KIND_KEY: kind,
+        },
+    )
+
 
 def get_qwen_image_post_process_func(
     od_config: OmniDiffusionConfig,
 ):
     model_name = od_config.model
-    if os.path.exists(model_name):
-        model_path = model_name
-    else:
-        model_path = download_weights_from_hf_specific(model_name, None, ["*"])
-    vae_config_path = os.path.join(model_path, "vae/config.json")
-    with open(vae_config_path) as f:
-        vae_config = json.load(f)
-        vae_scale_factor = 2 ** len(vae_config["temporal_downsample"]) if "temporal_downsample" in vae_config else 8
+    vae_scale_factor = _get_qwen_image_vae_scale_factor(model_name)
 
     image_processor = VaeImageProcessor(vae_scale_factor=vae_scale_factor * 2)
 
@@ -252,6 +584,9 @@ def apply_rotary_emb_qwen(
 
 class QwenImagePipeline(nn.Module, QwenImageCFGParallelMixin, DiffusionPipelineProfilerMixin):
     supports_step_execution: ClassVar[bool] = True
+    EXTRA_OUTPUT_PARAMS: ClassVar[frozenset[str]] = frozenset(
+        {QWEN_IMAGE_STAGE_TRACE_KEY, QWEN_IMAGE_DENOISE_BATCH_TRACE_KEY}
+    )
 
     def __init__(
         self,
@@ -743,15 +1078,19 @@ class QwenImagePipeline(nn.Module, QwenImageCFGParallelMixin, DiffusionPipelineP
         **kwargs: Any,
     ) -> "DiffusionRequestState":
         """Populate *state* with encoded prompts, latents, timesteps, and CFG config."""
+        stage_start_s = time.time()
         sampling = state.sampling
         prompt, negative_prompt = self._extract_prompts(state.prompts or [])
+        height = sampling.height or self.default_sample_size * self.vae_scale_factor
+        width = sampling.width or self.default_sample_size * self.vae_scale_factor
+        num_inference_steps = sampling.num_inference_steps or 50
 
         ctx = self._prepare_generation_context(
             prompt=prompt,
             negative_prompt=negative_prompt,
-            height=sampling.height or self.default_sample_size * self.vae_scale_factor,
-            width=sampling.width or self.default_sample_size * self.vae_scale_factor,
-            num_inference_steps=sampling.num_inference_steps or 50,
+            height=height,
+            width=width,
+            num_inference_steps=num_inference_steps,
             sigmas=sampling.sigmas,
             guidance_scale=sampling.guidance_scale if sampling.guidance_scale_provided else 1.0,
             num_images_per_prompt=sampling.num_outputs_per_prompt if sampling.num_outputs_per_prompt > 0 else 1,
@@ -784,6 +1123,33 @@ class QwenImagePipeline(nn.Module, QwenImageCFGParallelMixin, DiffusionPipelineP
         state.negative_txt_seq_lens = ctx["negative_txt_seq_lens"]
         # QwenImage always normalizes CFG output (matching forward())
         state.sampling.cfg_normalize = True
+        stage_end_s = time.time()
+        trace_payload = {
+            QWEN_IMAGE_STAGE_TRACE_KEY: [],
+            "prompt_embeds": ctx["prompt_embeds"],
+            "negative_prompt_embeds": ctx["negative_prompt_embeds"],
+            "latents": ctx["latents"],
+        }
+        _append_qwen_image_stage_trace(
+            trace_payload,
+            stage="encode",
+            request_id=state.request_id,
+            start_s=stage_start_s,
+            end_s=stage_end_s,
+            extra={
+                "height": int(height),
+                "width": int(width),
+                "num_inference_steps": int(num_inference_steps),
+            },
+        )
+        state.extra["qwen_image_full_trace"] = {
+            "height": int(height),
+            "width": int(width),
+            "stage_trace": list(trace_payload.get(QWEN_IMAGE_STAGE_TRACE_KEY) or []),
+            "denoise_start_s": stage_end_s,
+            "num_inference_steps": int(num_inference_steps),
+            "timestep_count": len(ctx["timesteps"]),
+        }
 
         return state
 
@@ -854,16 +1220,41 @@ class QwenImagePipeline(nn.Module, QwenImageCFGParallelMixin, DiffusionPipelineP
         height: int,
         width: int,
         output_type: str = "pil",
+        *,
+        timing: dict[str, float] | None = None,
+        sync_timing: bool = False,
     ) -> DiffusionOutput:
         """Unpack, normalize, and VAE-decode latents into a DiffusionOutput."""
+        timing_start_s = time.time()
+        last_s = timing_start_s
+
+        def mark_timing(name: str) -> None:
+            nonlocal last_s
+            if timing is None:
+                return
+            _qwen_image_stage_timing_sync(sync_timing)
+            now_s = time.time()
+            timing[name] = max(0.0, now_s - last_s)
+            last_s = now_s
+
+        if timing is not None:
+            _qwen_image_stage_timing_sync(sync_timing)
+            timing_start_s = time.time()
+            last_s = timing_start_s
+
         if output_type == "latent":
+            if timing is not None:
+                mark_timing("latent_passthrough_s")
+                timing["total_s"] = max(0.0, time.time() - timing_start_s)
             return DiffusionOutput(
                 output=latents,
                 stage_durations=self.stage_durations if hasattr(self, "stage_durations") else None,
             )
 
         latents = self._unpack_latents(latents, height, width, self.vae_scale_factor)
+        mark_timing("unpack_s")
         latents = latents.to(self.vae.dtype)
+        mark_timing("to_dtype_s")
         latents_mean = (
             torch.tensor(self.vae.config.latents_mean)
             .view(1, self.vae.config.z_dim, 1, 1, 1)
@@ -872,8 +1263,13 @@ class QwenImagePipeline(nn.Module, QwenImageCFGParallelMixin, DiffusionPipelineP
         latents_std = 1.0 / torch.tensor(self.vae.config.latents_std).view(1, self.vae.config.z_dim, 1, 1, 1).to(
             latents.device, latents.dtype
         )
+        mark_timing("stats_tensor_s")
         latents = latents / latents_std + latents_mean
+        mark_timing("normalize_s")
         image = self.vae.decode(latents, return_dict=False)[0][:, :, 0]
+        mark_timing("vae_decode_s")
+        if timing is not None:
+            timing["total_s"] = max(0.0, time.time() - timing_start_s)
         return DiffusionOutput(
             output=image,
             stage_durations=self.stage_durations if hasattr(self, "stage_durations") else None,
@@ -983,43 +1379,52 @@ class QwenImagePipeline(nn.Module, QwenImageCFGParallelMixin, DiffusionPipelineP
         ``diffuse()``.
         """
         del kwargs
-        if self.interrupt:
-            return None
+        trace_start_s = time.time()
+        try:
+            if self.interrupt:
+                return None
 
-        t = input_batch.timesteps
-        self._current_timestep = t
-        self.transformer.do_true_cfg = input_batch.do_true_cfg
+            t = input_batch.timesteps
+            self._current_timestep = t
+            self.transformer.do_true_cfg = input_batch.do_true_cfg
 
-        if input_batch.is_dynamic:
-            return self._denoise_step_dynamic_batch(input_batch)
+            if input_batch.is_dynamic:
+                return self._denoise_step_dynamic_batch(input_batch)
 
-        positive_kwargs, negative_kwargs, output_slice = self._build_denoise_kwargs(
-            latents=input_batch.latents,
-            timestep=t,
-            guidance=input_batch.guidance,
-            prompt_embeds=input_batch.prompt_embeds,
-            prompt_embeds_mask=input_batch.prompt_embeds_mask,
-            img_shapes=input_batch.img_shapes,
-            txt_seq_lens=input_batch.txt_seq_lens,
-            do_true_cfg=input_batch.do_true_cfg,
-            negative_prompt_embeds=input_batch.negative_prompt_embeds,
-            negative_prompt_embeds_mask=input_batch.negative_prompt_embeds_mask,
-            negative_txt_seq_lens=input_batch.negative_txt_seq_lens,
-            image_latents=input_batch.image_latents,
-            extra_transformer_kwargs={
-                "attention_kwargs": self.attention_kwargs,
-                "return_dict": False,
-            },
-        )
+            positive_kwargs, negative_kwargs, output_slice = self._build_denoise_kwargs(
+                latents=input_batch.latents,
+                timestep=t,
+                guidance=input_batch.guidance,
+                prompt_embeds=input_batch.prompt_embeds,
+                prompt_embeds_mask=input_batch.prompt_embeds_mask,
+                img_shapes=input_batch.img_shapes,
+                txt_seq_lens=input_batch.txt_seq_lens,
+                do_true_cfg=input_batch.do_true_cfg,
+                negative_prompt_embeds=input_batch.negative_prompt_embeds,
+                negative_prompt_embeds_mask=input_batch.negative_prompt_embeds_mask,
+                negative_txt_seq_lens=input_batch.negative_txt_seq_lens,
+                image_latents=input_batch.image_latents,
+                extra_transformer_kwargs={
+                    "attention_kwargs": self.attention_kwargs,
+                    "return_dict": False,
+                },
+            )
 
-        return self.predict_noise_maybe_with_cfg(
-            input_batch.do_true_cfg,
-            input_batch.true_cfg_scale,
-            positive_kwargs,
-            negative_kwargs,
-            input_batch.cfg_normalize,
-            output_slice,
-        )
+            return self.predict_noise_maybe_with_cfg(
+                input_batch.do_true_cfg,
+                input_batch.true_cfg_scale,
+                positive_kwargs,
+                negative_kwargs,
+                input_batch.cfg_normalize,
+                output_slice,
+            )
+        finally:
+            _qwen_image_record_denoise_batch_trace(
+                self,
+                input_batch,
+                start_s=trace_start_s,
+                end_s=time.time(),
+            )
 
     def step_scheduler(
         self,
@@ -1053,8 +1458,59 @@ class QwenImagePipeline(nn.Module, QwenImageCFGParallelMixin, DiffusionPipelineP
         height = state.sampling.height or self.default_sample_size * self.vae_scale_factor
         width = state.sampling.width or self.default_sample_size * self.vae_scale_factor
         output_type = kwargs.get("output_type", "pil")
-
-        return self._decode_latents(state.latents, height, width, output_type)
+        stage_meta = state.extra.get("qwen_image_full_trace", {})
+        denoise_end_s = time.time()
+        payload = {
+            QWEN_IMAGE_STAGE_TRACE_KEY: list(stage_meta.get("stage_trace") or []),
+            QWEN_IMAGE_DENOISE_BATCH_TRACE_KEY: _qwen_image_pop_denoise_batch_trace(self, state.request_id),
+        }
+        _append_qwen_image_stage_trace(
+            payload,
+            stage="denoise",
+            request_id=state.request_id,
+            start_s=float(stage_meta.get("denoise_start_s") or denoise_end_s),
+            end_s=denoise_end_s,
+            extra={
+                "height": int(height),
+                "width": int(width),
+                "num_inference_steps": int(stage_meta.get("num_inference_steps") or 50),
+                "timestep_count": int(stage_meta.get("timestep_count") or state.step_index),
+            },
+        )
+        decode_start_s = time.time()
+        fine_timing = _qwen_image_stage_env_flag("QWEN_IMAGE_STAGE_FINE_TIMING")
+        sync_timing = _qwen_image_stage_env_flag("QWEN_IMAGE_STAGE_TIMING_SYNC")
+        decode_timing: dict[str, float] = {}
+        output = self._decode_latents(
+            state.latents,
+            height,
+            width,
+            output_type,
+            timing=decode_timing if fine_timing else None,
+            sync_timing=sync_timing,
+        )
+        trace_extra: dict[str, Any] = {
+            "height": int(height),
+            "width": int(width),
+            "fine_timing": fine_timing,
+            "sync_timing": sync_timing,
+        }
+        for name, value in decode_timing.items():
+            trace_extra[f"decode_{name}"] = value
+        _append_qwen_image_stage_trace(
+            payload,
+            stage="decode",
+            request_id=state.request_id,
+            start_s=decode_start_s,
+            end_s=time.time(),
+            extra=trace_extra,
+        )
+        output.custom_output = dict(output.custom_output or {})
+        output.custom_output[QWEN_IMAGE_STAGE_TRACE_KEY] = list(payload.get(QWEN_IMAGE_STAGE_TRACE_KEY) or [])
+        output.custom_output[QWEN_IMAGE_DENOISE_BATCH_TRACE_KEY] = list(
+            payload.get(QWEN_IMAGE_DENOISE_BATCH_TRACE_KEY) or []
+        )
+        return output
 
     def forward(
         self,
@@ -1146,6 +1602,567 @@ class QwenImagePipeline(nn.Module, QwenImageCFGParallelMixin, DiffusionPipelineP
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         loader = AutoWeightsLoader(self)
         return loader.load_weights(weights)
+
+
+class QwenImageEncodePipeline(nn.Module, QwenImageCFGParallelMixin, DiffusionPipelineProfilerMixin):
+    """Text/latent preparation stage for split Qwen-Image execution."""
+
+    supports_step_execution: ClassVar[bool] = False
+    EXTRA_OUTPUT_PARAMS: ClassVar[frozenset[str]] = frozenset(
+        {QWEN_IMAGE_STAGE_TRACE_KEY, QWEN_IMAGE_DENOISE_BATCH_TRACE_KEY}
+    )
+
+    _extract_masked_hidden = QwenImagePipeline._extract_masked_hidden
+    _get_qwen_prompt_embeds = QwenImagePipeline._get_qwen_prompt_embeds
+    encode_prompt = QwenImagePipeline.encode_prompt
+    _pack_latents = staticmethod(QwenImagePipeline._pack_latents)
+    prepare_latents = QwenImagePipeline.prepare_latents
+    prepare_timesteps = QwenImagePipeline.prepare_timesteps
+    _extract_prompts = QwenImagePipeline._extract_prompts
+    check_inputs = QwenImagePipeline.check_inputs
+
+    def __init__(
+        self,
+        *,
+        od_config: OmniDiffusionConfig,
+        prefix: str = "",
+    ):
+        super().__init__()
+        del prefix
+        self.od_config = od_config
+        self.parallel_config = od_config.parallel_config
+        self.weights_sources: list[DiffusersPipelineLoader.ComponentSource] = []
+        self.device = get_local_device()
+        model = od_config.model
+        local_files_only = os.path.exists(model)
+
+        prefetch_subfolders(
+            model,
+            ["scheduler", "text_encoder", "tokenizer"],
+            local_files_only=local_files_only,
+        )
+        self.scheduler = FlowMatchEulerDiscreteScheduler.from_pretrained(
+            model, subfolder="scheduler", local_files_only=local_files_only
+        )
+        self.text_encoder = Qwen2_5_VLForConditionalGeneration.from_pretrained(
+            model, subfolder="text_encoder", local_files_only=local_files_only
+        )
+        visual_owner = None
+        if hasattr(self.text_encoder, "model") and hasattr(self.text_encoder.model, "visual"):
+            visual_owner = self.text_encoder.model
+        elif hasattr(self.text_encoder, "visual"):
+            visual_owner = self.text_encoder
+        if visual_owner is not None:
+            del visual_owner.visual
+        else:
+            logger.warning("Qwen-Image encode stage: vision tower not found on text encoder; skipping drop")
+        self.text_encoder = self.text_encoder.to(self.device)
+        self.tokenizer = Qwen2Tokenizer.from_pretrained(model, subfolder="tokenizer", local_files_only=local_files_only)
+
+        transformer_kwargs = get_transformer_config_kwargs(od_config.tf_model_config, QwenImageTransformer2DModel)
+        self.num_channels_latents = int(transformer_kwargs.get("in_channels", 64)) // 4
+        self.transformer_guidance_embeds = bool(transformer_kwargs.get("guidance_embeds", False))
+        self.vae_scale_factor = _get_qwen_image_vae_scale_factor(model)
+        self.tokenizer_max_length = 1024
+        self.prompt_template_encode = "<|im_start|>system\nDescribe the image by detailing the color, shape, size, texture, quantity, text, spatial relationships of the objects and background:<|im_end|>\n<|im_start|>user\n{}<|im_end|>\n<|im_start|>assistant\n"  # noqa: E501
+        self.prompt_template_encode_start_idx = 34
+        self.default_sample_size = 128
+        self._guidance_scale = 1.0
+        self._attention_kwargs: dict[str, Any] = {}
+        self._current_timestep = None
+        self._interrupt = False
+        self._num_timesteps = 0
+        self.setup_diffusion_pipeline_profiler(
+            enable_diffusion_pipeline_profiler=self.od_config.enable_diffusion_pipeline_profiler
+        )
+
+    def _prepare_stage_payload(
+        self,
+        *,
+        prompt,
+        negative_prompt,
+        height,
+        width,
+        num_inference_steps,
+        sigmas,
+        guidance_scale,
+        num_images_per_prompt,
+        generator,
+        true_cfg_scale,
+        max_sequence_length,
+        output_type,
+        prompt_embeds=None,
+        prompt_embeds_mask=None,
+        negative_prompt_embeds=None,
+        negative_prompt_embeds_mask=None,
+        latents=None,
+        attention_kwargs=None,
+    ) -> dict[str, Any]:
+        self.check_inputs(
+            prompt,
+            height,
+            width,
+            negative_prompt,
+            prompt_embeds,
+            negative_prompt_embeds,
+            prompt_embeds_mask,
+            negative_prompt_embeds_mask,
+            None,
+            max_sequence_length,
+        )
+
+        self._guidance_scale = guidance_scale
+        self._attention_kwargs = attention_kwargs or {}
+        self._current_timestep = None
+        self._interrupt = False
+
+        if prompt is not None and isinstance(prompt, str):
+            batch_size = 1
+        elif prompt is not None and isinstance(prompt, list):
+            batch_size = len(prompt)
+        elif prompt_embeds is not None:
+            batch_size = prompt_embeds.shape[0]
+        else:
+            batch_size = 1
+
+        has_neg_prompt = negative_prompt is not None or (
+            negative_prompt_embeds is not None and negative_prompt_embeds_mask is not None
+        )
+        do_true_cfg = true_cfg_scale > 1 and has_neg_prompt
+        self.check_cfg_parallel_validity(true_cfg_scale, has_neg_prompt)
+
+        prompt_embeds, prompt_embeds_mask = self.encode_prompt(
+            prompt=prompt,
+            prompt_embeds=prompt_embeds,
+            prompt_embeds_mask=prompt_embeds_mask,
+            num_images_per_prompt=num_images_per_prompt,
+            max_sequence_length=max_sequence_length,
+        )
+        if do_true_cfg:
+            negative_prompt_embeds, negative_prompt_embeds_mask = self.encode_prompt(
+                prompt=negative_prompt,
+                prompt_embeds=negative_prompt_embeds,
+                prompt_embeds_mask=negative_prompt_embeds_mask,
+                num_images_per_prompt=num_images_per_prompt,
+                max_sequence_length=max_sequence_length,
+                prompt_name="negative_prompt",
+            )
+        else:
+            negative_prompt_embeds = None
+            negative_prompt_embeds_mask = None
+
+        latents = self.prepare_latents(
+            batch_size * num_images_per_prompt,
+            self.num_channels_latents,
+            height,
+            width,
+            prompt_embeds.dtype,
+            self.device,
+            generator,
+            latents,
+        )
+
+        img_shapes = [[(1, height // self.vae_scale_factor // 2, width // self.vae_scale_factor // 2)]] * batch_size
+        timesteps, num_inference_steps = self.prepare_timesteps(
+            num_inference_steps,
+            sigmas,
+            latents.shape[1],
+        )
+        self._num_timesteps = len(timesteps)
+
+        if self.transformer_guidance_embeds:
+            guidance = torch.full([1], guidance_scale, dtype=torch.float32)
+            guidance = guidance.expand(latents.shape[0])
+        else:
+            guidance = None
+
+        txt_seq_lens = prompt_embeds_mask.sum(dim=1).tolist() if prompt_embeds_mask is not None else None
+        negative_txt_seq_lens = (
+            negative_prompt_embeds_mask.sum(dim=1).tolist() if negative_prompt_embeds_mask is not None else None
+        )
+
+        return {
+            "prompt_embeds": prompt_embeds,
+            "prompt_embeds_mask": prompt_embeds_mask,
+            "negative_prompt_embeds": negative_prompt_embeds,
+            "negative_prompt_embeds_mask": negative_prompt_embeds_mask,
+            "latents": latents,
+            "img_shapes": img_shapes,
+            "timesteps": timesteps,
+            "num_inference_steps": num_inference_steps,
+            "sigmas": sigmas,
+            "do_true_cfg": do_true_cfg,
+            "guidance": guidance,
+            "txt_seq_lens": txt_seq_lens,
+            "negative_txt_seq_lens": negative_txt_seq_lens,
+            "true_cfg_scale": true_cfg_scale,
+            "cfg_normalize": True,
+            "height": height,
+            "width": width,
+            "output_type": output_type,
+            "attention_kwargs": self._attention_kwargs,
+        }
+
+    def forward(
+        self,
+        req: OmniDiffusionRequest,
+        **kwargs: Any,
+    ) -> DiffusionOutput:
+        stage_start_s = time.time()
+        sampling = req.sampling_params
+        if sampling.generator is None and sampling.seed is not None:
+            gen_device = sampling.generator_device or ("cpu" if self.device.type == "cpu" else self.device)
+            sampling.generator = torch.Generator(device=gen_device).manual_seed(sampling.seed)
+
+        prompt, negative_prompt = self._extract_prompts(req.prompts)
+        height = sampling.height or self.default_sample_size * self.vae_scale_factor
+        width = sampling.width or self.default_sample_size * self.vae_scale_factor
+        height, width = normalize_min_aligned_size(height, width, self.vae_scale_factor * 2)
+        num_images_per_prompt = sampling.num_outputs_per_prompt if sampling.num_outputs_per_prompt > 0 else 1
+        guidance_scale = sampling.guidance_scale if sampling.guidance_scale_provided else 1.0
+
+        payload = self._prepare_stage_payload(
+            prompt=prompt,
+            negative_prompt=negative_prompt,
+            height=height,
+            width=width,
+            num_inference_steps=sampling.num_inference_steps or 50,
+            sigmas=sampling.sigmas,
+            guidance_scale=guidance_scale,
+            num_images_per_prompt=num_images_per_prompt,
+            generator=sampling.generator,
+            true_cfg_scale=sampling.true_cfg_scale or 4.0,
+            max_sequence_length=sampling.max_sequence_length or self.tokenizer_max_length,
+            output_type=kwargs.get("output_type", "pil"),
+            attention_kwargs=kwargs.get("attention_kwargs"),
+        )
+        stage_end_s = time.time()
+        _append_qwen_image_stage_trace(
+            payload,
+            stage="encode",
+            request_id=req.request_id,
+            start_s=stage_start_s,
+            end_s=stage_end_s,
+            extra={
+                "height": height,
+                "width": width,
+                "num_inference_steps": int(sampling.num_inference_steps or 50),
+            },
+        )
+        return _stage_output(payload, "encode")
+
+    def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> None:
+        del weights
+        return None
+
+
+class QwenImageDenoisePipeline(nn.Module, QwenImageCFGParallelMixin, DiffusionPipelineProfilerMixin):
+    """DiT-only step execution stage for split Qwen-Image pipelines."""
+
+    supports_step_execution: ClassVar[bool] = True
+    EXTRA_OUTPUT_PARAMS: ClassVar[frozenset[str]] = frozenset(
+        {QWEN_IMAGE_STAGE_TRACE_KEY, QWEN_IMAGE_DENOISE_BATCH_TRACE_KEY}
+    )
+
+    prepare_timesteps = QwenImagePipeline.prepare_timesteps
+    _build_denoise_kwargs = QwenImagePipeline._build_denoise_kwargs
+    _build_dynamic_denoise_kwargs = QwenImagePipeline._build_dynamic_denoise_kwargs
+    _expect_dynamic_noise = staticmethod(QwenImagePipeline._expect_dynamic_noise)
+    _combine_dynamic_cfg = QwenImagePipeline._combine_dynamic_cfg
+    _denoise_step_dynamic_batch = QwenImagePipeline._denoise_step_dynamic_batch
+    denoise_step = QwenImagePipeline.denoise_step
+    step_scheduler = QwenImagePipeline.step_scheduler
+    guidance_scale = QwenImagePipeline.guidance_scale
+    attention_kwargs = QwenImagePipeline.attention_kwargs
+    num_timesteps = QwenImagePipeline.num_timesteps
+    current_timestep = QwenImagePipeline.current_timestep
+    interrupt = QwenImagePipeline.interrupt
+
+    def __init__(
+        self,
+        *,
+        od_config: OmniDiffusionConfig,
+        prefix: str = "",
+    ):
+        super().__init__()
+        del prefix
+        self.od_config = od_config
+        self.parallel_config = od_config.parallel_config
+        self.weights_sources = [
+            DiffusersPipelineLoader.ComponentSource(
+                model_or_path=od_config.model,
+                subfolder="transformer",
+                revision=None,
+                prefix="transformer.",
+                fall_back_to_pt=True,
+            )
+        ]
+        self.device = get_local_device()
+        model = od_config.model
+        local_files_only = os.path.exists(model)
+        prefetch_subfolders(model, ["scheduler"], local_files_only=local_files_only)
+        self.scheduler = FlowMatchEulerDiscreteScheduler.from_pretrained(
+            model, subfolder="scheduler", local_files_only=local_files_only
+        )
+        transformer_kwargs = get_transformer_config_kwargs(od_config.tf_model_config, QwenImageTransformer2DModel)
+        self.transformer = QwenImageTransformer2DModel(
+            od_config=od_config, quant_config=od_config.quantization_config, **transformer_kwargs
+        )
+        self.vae_scale_factor = _get_qwen_image_vae_scale_factor(model)
+        self.default_sample_size = 128
+        self._guidance_scale = 1.0
+        self._attention_kwargs: dict[str, Any] = {}
+        self._current_timestep = None
+        self._interrupt = False
+        self._num_timesteps = 0
+        self.setup_diffusion_pipeline_profiler(
+            enable_diffusion_pipeline_profiler=self.od_config.enable_diffusion_pipeline_profiler
+        )
+
+    def prepare_encode(
+        self,
+        state: "DiffusionRequestState",
+        **kwargs: Any,
+    ) -> "DiffusionRequestState":
+        del kwargs
+        import_start_s = time.time()
+        if state.request_id == DUMMY_DIFFUSION_REQUEST_ID:
+            payload = _make_dummy_encode_payload(
+                height=state.sampling.height or self.default_sample_size * self.vae_scale_factor,
+                width=state.sampling.width or self.default_sample_size * self.vae_scale_factor,
+                num_inference_steps=state.sampling.num_inference_steps or 1,
+                true_cfg_scale=state.sampling.true_cfg_scale or 4.0,
+            )
+        else:
+            payload = _extract_qwen_image_stage_payload(state.prompts, "encode")
+        transfer_trace = _qwen_image_stage_env_flag("QWEN_IMAGE_STAGE_TRANSFER_TRACE")
+        sync_timing = _qwen_image_stage_env_flag("QWEN_IMAGE_STAGE_TIMING_SYNC")
+        if transfer_trace:
+            _qwen_image_stage_timing_sync(sync_timing)
+            import_start_s = time.time()
+        state.prompt_embeds = payload["prompt_embeds"].to(self.device)
+        state.prompt_embeds_mask = payload["prompt_embeds_mask"].to(self.device)
+        negative_prompt_embeds = payload.get("negative_prompt_embeds")
+        negative_prompt_embeds_mask = payload.get("negative_prompt_embeds_mask")
+        state.negative_prompt_embeds = (
+            None if negative_prompt_embeds is None else negative_prompt_embeds.to(self.device)
+        )
+        state.negative_prompt_embeds_mask = (
+            None if negative_prompt_embeds_mask is None else negative_prompt_embeds_mask.to(self.device)
+        )
+        state.latents = payload["latents"].to(self.device)
+        state.img_shapes = _normalize_qwen_image_img_shapes(payload["img_shapes"])
+        state.do_true_cfg = bool(payload["do_true_cfg"])
+        guidance = payload.get("guidance")
+        state.guidance = None if guidance is None else guidance.to(self.device)
+        state.txt_seq_lens = payload.get("txt_seq_lens")
+        state.negative_txt_seq_lens = payload.get("negative_txt_seq_lens")
+        if transfer_trace:
+            _qwen_image_stage_timing_sync(sync_timing)
+            _append_qwen_image_stage_trace(
+                payload,
+                stage="encode_payload_import",
+                request_id=state.request_id,
+                start_s=import_start_s,
+                end_s=time.time(),
+                extra={
+                    "source_device": "cpu",
+                    "target_device": str(self.device),
+                    "payload_kind": "encode",
+                    "sync_timing": sync_timing,
+                },
+            )
+        state.step_index = 0
+        state.sampling.true_cfg_scale = float(payload.get("true_cfg_scale", state.sampling.true_cfg_scale or 4.0))
+        state.sampling.cfg_normalize = bool(payload.get("cfg_normalize", True))
+        self._attention_kwargs = payload.get("attention_kwargs") or {}
+
+        timesteps, _ = self.prepare_timesteps(
+            int(payload.get("num_inference_steps") or 50),
+            payload.get("sigmas"),
+            state.latents.shape[1],
+        )
+        self._num_timesteps = len(timesteps)
+        state.timesteps = timesteps
+        req_scheduler = copy.deepcopy(self.scheduler)
+        req_scheduler.set_begin_index(0)
+        state.scheduler = req_scheduler
+        state.extra["qwen_image_stage"] = {
+            "height": int(payload["height"]),
+            "width": int(payload["width"]),
+            "output_type": payload.get("output_type", "pil"),
+            "stage_trace": list(payload.get(QWEN_IMAGE_STAGE_TRACE_KEY) or []),
+            "denoise_start_s": time.time(),
+            "num_inference_steps": int(payload.get("num_inference_steps") or 50),
+            "timestep_count": len(timesteps),
+        }
+        return state
+
+    def denoise_step(
+        self,
+        input_batch: "InputBatch",
+        **kwargs: Any,
+    ) -> torch.Tensor | list[torch.Tensor] | None:
+        if all(request_id == DUMMY_DIFFUSION_REQUEST_ID for request_id in input_batch.request_ids):
+            if input_batch.is_dynamic:
+                if input_batch.dynamic_latents is None:
+                    raise ValueError("Dummy dynamic Qwen-Image denoise requires request-local latents.")
+                return [torch.zeros_like(latent) for latent in input_batch.dynamic_latents]
+            if input_batch.latents is None:
+                raise ValueError("Dummy dense Qwen-Image denoise requires dense latents.")
+            return torch.zeros_like(input_batch.latents)
+        return QwenImagePipeline.denoise_step(self, input_batch, **kwargs)
+
+    def post_decode(
+        self,
+        state: "DiffusionRequestState",
+        **kwargs: Any,
+    ) -> DiffusionOutput:
+        del kwargs
+        self._current_timestep = None
+        stage_meta = state.extra.get("qwen_image_stage", {})
+        payload = {
+            "latents": state.latents,
+            "height": int(
+                stage_meta.get("height") or state.sampling.height or self.default_sample_size * self.vae_scale_factor
+            ),
+            "width": int(
+                stage_meta.get("width") or state.sampling.width or self.default_sample_size * self.vae_scale_factor
+            ),
+            "output_type": stage_meta.get("output_type", "pil"),
+            QWEN_IMAGE_STAGE_TRACE_KEY: list(stage_meta.get("stage_trace") or []),
+            QWEN_IMAGE_DENOISE_BATCH_TRACE_KEY: _qwen_image_pop_denoise_batch_trace(self, state.request_id),
+        }
+        _append_qwen_image_stage_trace(
+            payload,
+            stage="denoise",
+            request_id=state.request_id,
+            start_s=float(stage_meta.get("denoise_start_s") or time.time()),
+            end_s=time.time(),
+            extra={
+                "height": int(payload["height"]),
+                "width": int(payload["width"]),
+                "num_inference_steps": int(stage_meta.get("num_inference_steps") or 50),
+                "timestep_count": int(stage_meta.get("timestep_count") or 0),
+            },
+        )
+        return _stage_output(payload, "denoise")
+
+    def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
+        loader = AutoWeightsLoader(self)
+        return loader.load_weights(weights)
+
+
+class QwenImageDecodePipeline(nn.Module, DiffusionPipelineProfilerMixin):
+    """VAE decode stage for split Qwen-Image execution."""
+
+    supports_step_execution: ClassVar[bool] = False
+    EXTRA_OUTPUT_PARAMS: ClassVar[frozenset[str]] = frozenset(
+        {QWEN_IMAGE_STAGE_TRACE_KEY, QWEN_IMAGE_DENOISE_BATCH_TRACE_KEY}
+    )
+
+    _unpack_latents = staticmethod(QwenImagePipeline._unpack_latents)
+    _decode_latents = QwenImagePipeline._decode_latents
+
+    def __init__(
+        self,
+        *,
+        od_config: OmniDiffusionConfig,
+        prefix: str = "",
+    ):
+        super().__init__()
+        del prefix
+        self.od_config = od_config
+        self.parallel_config = od_config.parallel_config
+        self.weights_sources: list[DiffusersPipelineLoader.ComponentSource] = []
+        self.device = get_local_device()
+        model = od_config.model
+        local_files_only = os.path.exists(model)
+        prefetch_subfolders(model, ["vae"], local_files_only=local_files_only)
+        self.vae = DistributedAutoencoderKLQwenImage.from_pretrained(
+            model, subfolder="vae", local_files_only=local_files_only
+        ).to(self.device)
+        self.vae_scale_factor = 2 ** len(self.vae.temperal_downsample) if getattr(self, "vae", None) else 8
+        self.default_sample_size = 128
+        self.setup_diffusion_pipeline_profiler(
+            enable_diffusion_pipeline_profiler=self.od_config.enable_diffusion_pipeline_profiler
+        )
+
+    def forward(
+        self,
+        req: OmniDiffusionRequest,
+        **kwargs: Any,
+    ) -> DiffusionOutput:
+        del kwargs
+        stage_start_s = time.time()
+        import_start_s = stage_start_s
+        if req.request_id == DUMMY_DIFFUSION_REQUEST_ID:
+            payload = _make_dummy_denoise_payload(
+                height=req.sampling_params.height or self.default_sample_size * self.vae_scale_factor,
+                width=req.sampling_params.width or self.default_sample_size * self.vae_scale_factor,
+            )
+        else:
+            payload = _extract_qwen_image_stage_payload(req.prompts, "denoise")
+        transfer_trace = _qwen_image_stage_env_flag("QWEN_IMAGE_STAGE_TRANSFER_TRACE")
+        sync_timing = _qwen_image_stage_env_flag("QWEN_IMAGE_STAGE_TIMING_SYNC")
+        if transfer_trace:
+            _qwen_image_stage_timing_sync(sync_timing)
+            import_start_s = time.time()
+        latents = payload["latents"].to(self.device)
+        if transfer_trace:
+            _qwen_image_stage_timing_sync(sync_timing)
+            _append_qwen_image_stage_trace(
+                payload,
+                stage="denoise_payload_import",
+                request_id=req.request_id,
+                start_s=import_start_s,
+                end_s=time.time(),
+                extra={
+                    "source_device": "cpu",
+                    "target_device": str(self.device),
+                    "payload_kind": "denoise",
+                    "sync_timing": sync_timing,
+                },
+            )
+        if payload.get("output_type") == "dummy_image":
+            image = torch.zeros(1, 3, 16, 16, device=self.device, dtype=self.vae.dtype)
+            return DiffusionOutput(output=image)
+        fine_timing = _qwen_image_stage_env_flag("QWEN_IMAGE_STAGE_FINE_TIMING")
+        decode_timing: dict[str, float] = {}
+        output = self._decode_latents(
+            latents,
+            int(payload["height"]),
+            int(payload["width"]),
+            payload.get("output_type", "pil"),
+            timing=decode_timing if fine_timing else None,
+            sync_timing=sync_timing,
+        )
+        trace_extra: dict[str, Any] = {
+            "height": int(payload["height"]),
+            "width": int(payload["width"]),
+            "fine_timing": fine_timing,
+            "sync_timing": sync_timing,
+        }
+        for name, value in decode_timing.items():
+            trace_extra[f"decode_{name}"] = value
+        _append_qwen_image_stage_trace(
+            payload,
+            stage="decode",
+            request_id=req.request_id,
+            start_s=stage_start_s,
+            end_s=time.time(),
+            extra=trace_extra,
+        )
+        output.custom_output = dict(output.custom_output or {})
+        output.custom_output[QWEN_IMAGE_STAGE_TRACE_KEY] = list(payload.get(QWEN_IMAGE_STAGE_TRACE_KEY) or [])
+        output.custom_output[QWEN_IMAGE_DENOISE_BATCH_TRACE_KEY] = list(
+            payload.get(QWEN_IMAGE_DENOISE_BATCH_TRACE_KEY) or []
+        )
+        return output
+
+    def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> None:
+        del weights
+        return None
 
 
 class QwenImageDMD2Pipeline(DMD2PipelineMixin, QwenImagePipeline):
