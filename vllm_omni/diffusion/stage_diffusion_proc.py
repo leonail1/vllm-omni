@@ -8,10 +8,13 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import multiprocessing.connection
 import signal
 import time
+from collections.abc import AsyncGenerator
 from concurrent.futures import ThreadPoolExecutor
 from multiprocessing.process import BaseProcess
+from types import SimpleNamespace
 from typing import TYPE_CHECKING, Any
 
 import msgspec
@@ -22,11 +25,15 @@ from PIL import Image
 from vllm.logger import init_logger
 from vllm.utils.network_utils import get_open_zmq_ipc_path, zmq_socket_ctx
 from vllm.utils.system_utils import get_mp_context
+from vllm.v1.engine.core import EngineCoreProc
+from vllm.v1.engine.utils import CoreEngine, EngineZmqAddresses, wait_for_engine_startup
 from vllm.v1.utils import shutdown
 
 from vllm_omni.diffusion.data import DiffusionRequestAbortedError
 from vllm_omni.diffusion.diffusion_engine import DiffusionEngine
 from vllm_omni.diffusion.request import OmniDiffusionRequest
+from vllm_omni.diffusion.worker.utils import DiffusionRequestState
+from vllm_omni.diffusion.ipc import pack_stage_transport_shm, unpack_stage_transport_shm
 from vllm_omni.distributed.omni_connectors.utils.serialization import (
     OmniMsgpackDecoder,
     OmniMsgpackEncoder,
@@ -170,6 +177,29 @@ class StageDiffusionProc:
             result.request_id = request_id
         return result
 
+    async def _process_streaming_request(
+        self,
+        request_id: str,
+        prompt: Any,
+        sampling_params_dict: dict,
+        kv_sender_info: dict[str, Any] | None = None,
+    ) -> AsyncGenerator[OmniRequestOutput, None]:
+        """Process a streaming diffusion request and yield the results from DiffusionEngine.step_streaming()."""
+        sampling_params = self._reconstruct_sampling_params(sampling_params_dict)
+
+        request = OmniDiffusionRequest(
+            prompts=[prompt],
+            sampling_params=sampling_params,
+            request_id=request_id,
+            kv_sender_info=kv_sender_info,
+        )
+
+        async for results in self._engine.step_streaming(request):  # pyright: ignore[reportOptionalMemberAccess]
+            result = results[0]
+            if not result.request_id:
+                result.request_id = request_id
+            yield result
+
     async def _process_batch_request(
         self,
         request_id: str,
@@ -184,6 +214,9 @@ class StageDiffusionProc:
         ``images`` list contains every generated image, matching the
         contract expected by the orchestrator and tests.
         """
+        if self._od_config.streaming_output:
+            raise NotImplementedError("Streaming output is not supported for batched requests")
+
         sampling_params = self._reconstruct_sampling_params(sampling_params_dict)
 
         request = OmniDiffusionRequest(
@@ -360,10 +393,10 @@ class StageDiffusionProc:
         ctx = zmq.asyncio.Context()
 
         request_socket = ctx.socket(zmq.PULL)
-        request_socket.bind(request_address)
+        request_socket.connect(request_address)
 
         response_socket = ctx.socket(zmq.PUSH)
-        response_socket.bind(response_address)
+        response_socket.connect(response_address)
 
         encoder = OmniMsgpackEncoder()
         decoder = OmniMsgpackDecoder()
@@ -386,13 +419,26 @@ class StageDiffusionProc:
         ) -> None:
             """Process a single diffusion request and send the response."""
             try:
-                result = await self._process_request(
-                    request_id,
-                    prompt,
-                    sampling_params_dict,
-                    kv_sender_info=kv_sender_info,
-                )
-                await response_socket.send(encoder.encode({"type": "result", "output": result}))
+                if not self._od_config.streaming_output:
+                    result = await self._process_request(
+                        request_id,
+                        prompt,
+                        sampling_params_dict,
+                        kv_sender_info=kv_sender_info,
+                    )
+                    await response_socket.send(
+                        encoder.encode({"type": "result", "request_id": request_id, "output": result})
+                    )
+                else:
+                    async for result in self._process_streaming_request(
+                        request_id,
+                        prompt,
+                        sampling_params_dict,
+                        kv_sender_info=kv_sender_info,
+                    ):
+                        await response_socket.send(
+                            encoder.encode({"type": "result", "request_id": request_id, "output": result})
+                        )
             except DiffusionRequestAbortedError as e:
                 logger.info(
                     "request_id: %s aborted: %s",
@@ -423,6 +469,30 @@ class StageDiffusionProc:
                     self._signal_fatal_engine_failure(f"add_request {request_id}: {e!s}")
             finally:
                 tasks.pop(request_id, None)
+
+        async def _send_request_error(
+            rid: str,
+            exc: Exception,
+            context: str,
+            *,
+            log_exception: bool = True,
+        ) -> None:
+            if log_exception:
+                logger.exception("%s %s failed: %s", context, rid, exc)
+            else:
+                logger.info("%s %s ended: %s", context, rid, exc)
+            status_code, error_type = client_error_metadata(exc)
+            await response_socket.send(
+                encoder.encode(
+                    {
+                        "type": "error",
+                        "request_id": rid,
+                        "error": str(exc),
+                        "status_code": status_code,
+                        "error_type": error_type,
+                    }
+                )
+            )
 
         try:
             while True:
@@ -478,7 +548,9 @@ class StageDiffusionProc:
                                 sp_dict,
                                 kv_sender_info=kv_sender_info,
                             )
-                            await response_socket.send(encoder.encode({"type": "result", "output": result}))
+                            await response_socket.send(
+                                encoder.encode({"type": "result", "request_id": rid, "output": result})
+                            )
                         except DiffusionRequestAbortedError as e:
                             logger.info(
                                 "request_id: %s aborted: %s",
@@ -514,6 +586,123 @@ class StageDiffusionProc:
                             msg["sampling_params"],
                             msg.get("kv_sender_info"),
                         )
+                    )
+                    tasks[request_id] = task
+
+                elif msg_type == "stage_encode_request":
+                    request_id = msg["request_id"]
+
+                    async def _dispatch_stage_encode(rid: str, msg_in: dict[str, Any]) -> None:
+                        try:
+                            sampling_params = self._reconstruct_sampling_params(msg_in["sampling_params"])
+                            request = OmniDiffusionRequest(
+                                prompts=[msg_in["prompt"]],
+                                sampling_params=sampling_params,
+                                request_id=rid,
+                                kv_sender_info=msg_in.get("kv_sender_info"),
+                            )
+                            payload = await self._engine.async_collective_rpc(
+                                "execute_encode",
+                                args=(request,),
+                                unique_reply_rank=0,
+                                exec_all_ranks=True,
+                            )
+                            # Encode returns a transport envelope for the next role, not a user output.
+                            payload = pack_stage_transport_shm(payload)
+                            await response_socket.send(
+                                encoder.encode({"type": "stage_transport", "request_id": rid, "payload": payload})
+                            )
+                        except DiffusionRequestAbortedError as e:
+                            logger.info("stage encode request_id: %s aborted: %s", rid, str(e))
+                            await _send_request_error(rid, e, "Stage encode request", log_exception=False)
+                        except Exception as e:
+                            await _send_request_error(rid, e, "Stage encode request")
+                            if self._is_executor_dead():
+                                self._signal_fatal_engine_failure(f"stage_encode_request {rid}: {e!s}")
+                        finally:
+                            tasks.pop(rid, None)
+
+                    task = asyncio.create_task(
+                        _dispatch_stage_encode(request_id, msg),
+                        name=f"diffusion-stage-encode-{request_id}",
+                    )
+                    tasks[request_id] = task
+
+                elif msg_type == "stage_dit_transport":
+                    request_id = msg["request_id"]
+
+                    async def _dispatch_stage_dit(rid: str, payload_in: Any) -> None:
+                        try:
+                            # DiT receives encoded state and emits decode-ready state.
+                            payload_in = unpack_stage_transport_shm(payload_in)
+                            payload_out = await self._engine.async_add_stage_transport_and_wait_for_response(payload_in)
+                            payload_out = pack_stage_transport_shm(payload_out)
+                            await response_socket.send(
+                                encoder.encode({"type": "stage_transport", "request_id": rid, "payload": payload_out})
+                            )
+                        except DiffusionRequestAbortedError as e:
+                            logger.info("stage DiT request_id: %s aborted: %s", rid, str(e))
+                            await _send_request_error(rid, e, "Stage DiT request", log_exception=False)
+                        except Exception as e:
+                            await _send_request_error(rid, e, "Stage DiT request")
+                            if self._is_executor_dead():
+                                self._signal_fatal_engine_failure(f"stage_dit_transport {rid}: {e!s}")
+                        finally:
+                            tasks.pop(rid, None)
+
+                    task = asyncio.create_task(
+                        _dispatch_stage_dit(request_id, msg["payload"]),
+                        name=f"diffusion-stage-dit-{request_id}",
+                    )
+                    tasks[request_id] = task
+
+                elif msg_type == "stage_decode_transport":
+                    request_id = msg["request_id"]
+
+                    async def _dispatch_stage_decode(rid: str, payload_in: Any) -> None:
+                        try:
+                            # Decode is terminal, so rebuild a request only for postprocessing metadata.
+                            payload_in = unpack_stage_transport_shm(payload_in)
+                            decode_start = time.perf_counter()
+                            state = DiffusionRequestState.from_transport(payload_in)
+                            request = OmniDiffusionRequest(
+                                prompts=state.prompts or [],
+                                sampling_params=state.sampling,
+                                request_id=rid,
+                            )
+                            output = await self._engine.async_collective_rpc(
+                                "execute_decode",
+                                args=(payload_in,),
+                                unique_reply_rank=0,
+                                exec_all_ranks=True,
+                            )
+                            formatted_outputs = self._engine.postprocess_output(
+                                request,
+                                output,
+                                diffusion_engine_start_time=decode_start,
+                                preprocess_time=0.0,
+                                exec_total_time=time.perf_counter() - decode_start,
+                            )
+                            if not formatted_outputs:
+                                raise RuntimeError(f"Stage decode produced no output for request {rid}.")
+                            await response_socket.send(
+                                encoder.encode(
+                                    {"type": "result", "request_id": rid, "output": formatted_outputs[0]}
+                                )
+                            )
+                        except DiffusionRequestAbortedError as e:
+                            logger.info("stage decode request_id: %s aborted: %s", rid, str(e))
+                            await _send_request_error(rid, e, "Stage decode request", log_exception=False)
+                        except Exception as e:
+                            await _send_request_error(rid, e, "Stage decode request")
+                            if self._is_executor_dead():
+                                self._signal_fatal_engine_failure(f"stage_decode_transport {rid}: {e!s}")
+                        finally:
+                            tasks.pop(rid, None)
+
+                    task = asyncio.create_task(
+                        _dispatch_stage_decode(request_id, msg["payload"]),
+                        name=f"diffusion-stage-decode-{request_id}",
                     )
                     tasks[request_id] = task
 
@@ -612,15 +801,51 @@ class StageDiffusionProc:
     # Subprocess entry point
     # ------------------------------------------------------------------
 
+    @staticmethod
+    def _open_startup_handshake(
+        handshake_address: str,
+        *,
+        local_client: bool,
+        headless: bool,
+    ) -> tuple[zmq.Context, zmq.Socket, EngineZmqAddresses]:
+        ctx = zmq.Context()
+        socket = ctx.socket(zmq.DEALER)
+        socket.setsockopt(zmq.IDENTITY, (0).to_bytes(2, "little"))
+        socket.connect(handshake_address)
+        addresses = EngineCoreProc.startup_handshake(
+            socket,
+            local_client=local_client,
+            headless=headless,
+            parallel_config=None,
+        )
+        return ctx, socket, addresses
+
+    @staticmethod
+    def _send_startup_ready(
+        handshake_socket: zmq.Socket,
+        *,
+        local_client: bool,
+        headless: bool,
+    ) -> None:
+        handshake_socket.send(
+            msgspec.msgpack.encode(
+                {
+                    "status": "READY",
+                    "local": local_client,
+                    "headless": headless,
+                }
+            )
+        )
+
     @classmethod
     def run_diffusion_proc(
         cls,
         model: str,
         od_config: OmniDiffusionConfig,
         handshake_address: str,
-        request_address: str,
-        response_address: str,
         *,
+        local_client: bool,
+        headless: bool,
         omni_coordinator_address: str | None = None,
         omni_stage_id: int | None = None,
         omni_replica_id: int = 0,
@@ -651,21 +876,32 @@ class StageDiffusionProc:
 
         proc = cls(model, od_config)
         coord_client: OmniCoordClientForStage | None = None
+        handshake_ctx: zmq.Context | None = None
+        handshake_socket: zmq.Socket | None = None
         try:
+            handshake_ctx, handshake_socket, addresses = cls._open_startup_handshake(
+                handshake_address,
+                local_client=local_client,
+                headless=headless,
+            )
+            request_address = addresses.inputs[0]
+            response_address = addresses.outputs[0]
+
             proc.initialize()
 
-            # Send READY via handshake socket
-            handshake_ctx = zmq.Context()
-            handshake_socket = handshake_ctx.socket(zmq.DEALER)
-            handshake_socket.connect(handshake_address)
-            handshake_socket.send(msgspec.msgpack.encode({"status": "READY"}))
+            cls._send_startup_ready(
+                handshake_socket,
+                local_client=local_client,
+                headless=headless,
+            )
             handshake_socket.close()
             handshake_ctx.term()
+            handshake_socket = None
+            handshake_ctx = None
 
-            # Wire OmniCoordClientForStage *after* READY so that the head
-            # has bound its head-side request/response sockets — the
-            # address pair we report is the same pair this proc binds to
-            # (request/response addresses passed in).
+            # Wire OmniCoordClientForStage *after* READY. The address pair is
+            # owned by the frontend client; this proc connects to it as the
+            # backend runtime.
             if omni_coordinator_address is not None:
                 if omni_stage_id is None:
                     raise ValueError("omni_stage_id must be provided when omni_coordinator_address is set")
@@ -688,7 +924,6 @@ class StageDiffusionProc:
                     omni_coordinator_address,
                 )
 
-            # Run async event loop
             asyncio.run(proc.run_loop(request_address, response_address))
 
         except SystemExit:
@@ -698,13 +933,157 @@ class StageDiffusionProc:
             logger.exception("StageDiffusionProc encountered a fatal error.")
             raise
         finally:
+            if handshake_socket is not None:
+                handshake_socket.close(linger=0)
+            if handshake_ctx is not None:
+                handshake_ctx.term()
             if coord_client is not None:
                 with contextlib.suppress(RuntimeError):
                     coord_client.close()
             proc.close()
 
 
-# -- Free functions for backward compatibility with StageDiffusionClient ------
+class StageDiffusionProcManager:
+    """Owns a StageDiffusionProc subprocess.
+
+    Mirrors the small process-lifecycle surface used by vLLM's
+    CoreEngineProcManager while keeping diffusion's custom wire protocol.
+    """
+
+    def __init__(
+        self,
+        *,
+        model: str,
+        od_config: OmniDiffusionConfig,
+        stage_init_timeout: int,
+        handshake_address: str | None = None,
+        addresses: EngineZmqAddresses | None = None,
+        omni_coordinator_address: str | None = None,
+        omni_stage_id: int | None = None,
+        omni_replica_id: int = 0,
+    ) -> None:
+        handshake_address = handshake_address or get_open_zmq_ipc_path()
+        addresses = addresses or EngineZmqAddresses(
+            inputs=[get_open_zmq_ipc_path()],
+            outputs=[get_open_zmq_ipc_path()],
+        )
+
+        ctx = get_mp_context()
+        proc = ctx.Process(
+            target=StageDiffusionProc.run_diffusion_proc,
+            name="StageDiffusionProc",
+            kwargs={
+                "model": model,
+                "od_config": od_config,
+                "handshake_address": handshake_address,
+                "local_client": True,
+                "headless": False,
+                "omni_coordinator_address": omni_coordinator_address,
+                "omni_stage_id": omni_stage_id,
+                "omni_replica_id": omni_replica_id,
+            },
+        )
+        proc.start()
+        self.proc = proc
+        self.addresses = addresses
+        self.manager_stopped = False
+        self.failed_proc_name: str | None = None
+
+        self._wait_until_started(handshake_address, stage_init_timeout)
+
+    @classmethod
+    def launch_headless(
+        cls,
+        *,
+        model: str,
+        od_config: OmniDiffusionConfig,
+        handshake_address: str,
+        addresses: EngineZmqAddresses,
+        omni_coordinator_address: str | None,
+        omni_stage_id: int,
+        omni_replica_id: int,
+    ) -> StageDiffusionProcManager:
+        """Launch a headless diffusion backend that connects to head-owned sockets."""
+        self = cls.__new__(cls)
+        ctx = get_mp_context()
+        proc = ctx.Process(
+            target=StageDiffusionProc.run_diffusion_proc,
+            name="StageDiffusionProc",
+            kwargs={
+                "model": model,
+                "od_config": od_config,
+                "handshake_address": handshake_address,
+                "local_client": False,
+                "headless": True,
+                "omni_coordinator_address": omni_coordinator_address,
+                "omni_stage_id": omni_stage_id,
+                "omni_replica_id": omni_replica_id,
+            },
+        )
+        proc.start()
+        self.proc = proc
+        self.addresses = addresses
+        self.manager_stopped = False
+        self.failed_proc_name = None
+        return self
+
+    def _wait_until_started(self, handshake_address: str, stage_init_timeout: int) -> None:
+        try:
+            with zmq_socket_ctx(handshake_address, zmq.ROUTER, bind=True) as handshake_socket:
+                wait_for_engine_startup(
+                    handshake_socket,
+                    self.addresses,
+                    [CoreEngine(index=0, local=True)],
+                    SimpleNamespace(
+                        data_parallel_size_local=1,
+                        data_parallel_hybrid_lb=False,
+                        data_parallel_external_lb=False,
+                    ),
+                    False,
+                    None,
+                    self,
+                    None,
+                )
+        except Exception:
+            shutdown([self.proc])
+            raise
+
+    def shutdown(self, timeout: float | None = None) -> None:
+        self.manager_stopped = True
+        shutdown([self.proc], timeout=timeout)
+
+    def sentinels(self) -> list[int]:
+        return [self.proc.sentinel]
+
+    def finished_procs(self) -> dict[str, int]:
+        if self.proc.exitcode is None:
+            return {}
+        return {self.proc.name: self.proc.exitcode}
+
+    def monitor_engine_liveness(self) -> None:
+        try:
+            multiprocessing.connection.wait([self.proc.sentinel])
+        except Exception:
+            return
+        if self.proc.exitcode not in (None, 0) and not self.manager_stopped:
+            self.failed_proc_name = self.proc.name
+        self.shutdown()
+
+
+_LEGACY_DIFFUSION_HANDSHAKE_ADDRESSES: dict[str, EngineZmqAddresses] = {}
+
+
+class _LegacyDiffusionProcMonitor:
+    def __init__(self, proc: BaseProcess) -> None:
+        self.proc = proc
+
+    def sentinels(self) -> list[int]:
+        return [self.proc.sentinel]
+
+    def finished_procs(self) -> dict[str, int]:
+        if self.proc.exitcode is None:
+            return {}
+        return {self.proc.name: self.proc.exitcode}
 
 
 def spawn_diffusion_proc(
@@ -718,16 +1097,14 @@ def spawn_diffusion_proc(
     omni_stage_id: int | None = None,
     omni_replica_id: int = 0,
 ) -> tuple[BaseProcess, str, str, str]:
-    """Spawn a StageDiffusionProc subprocess.
-
-    Returns ``(proc, handshake_address, request_address, response_address)``.
-
-    Pass ``omni_coordinator_address`` / ``omni_stage_id`` / ``omni_replica_id``
-    to have the subprocess publish heartbeats to an OmniCoordinator.
-    """
+    """Spawn a StageDiffusionProc subprocess using the legacy free-function API."""
     handshake_address = handshake_address or get_open_zmq_ipc_path()
     request_address = request_address or get_open_zmq_ipc_path()
     response_address = response_address or get_open_zmq_ipc_path()
+    _LEGACY_DIFFUSION_HANDSHAKE_ADDRESSES[handshake_address] = EngineZmqAddresses(
+        inputs=[request_address],
+        outputs=[response_address],
+    )
 
     ctx = get_mp_context()
     proc = ctx.Process(
@@ -737,15 +1114,14 @@ def spawn_diffusion_proc(
             "model": model,
             "od_config": od_config,
             "handshake_address": handshake_address,
-            "request_address": request_address,
-            "response_address": response_address,
+            "local_client": True,
+            "headless": False,
             "omni_coordinator_address": omni_coordinator_address,
             "omni_stage_id": omni_stage_id,
             "omni_replica_id": omni_replica_id,
         },
     )
     proc.start()
-    # Wait for the process to become alive before returning.
     deadline = time.monotonic() + 10
     while not proc.is_alive():
         if proc.exitcode is not None:
@@ -761,42 +1137,26 @@ def complete_diffusion_handshake(
     handshake_address: str,
     handshake_timeout: int,
 ) -> None:
-    """Wait for the diffusion subprocess to signal READY.
-
-    On failure the process is terminated before re-raising.
-    """
+    """Wait for a legacy-spawned diffusion subprocess to complete startup."""
+    addresses = _LEGACY_DIFFUSION_HANDSHAKE_ADDRESSES.pop(handshake_address, None)
+    if addresses is None:
+        raise RuntimeError(f"No diffusion handshake addresses registered for {handshake_address!r}.")
     try:
-        _perform_diffusion_handshake(proc, handshake_address, handshake_timeout)
+        with zmq_socket_ctx(handshake_address, zmq.ROUTER, bind=True) as handshake_socket:
+            wait_for_engine_startup(
+                handshake_socket,
+                addresses,
+                [CoreEngine(index=0, local=True)],
+                SimpleNamespace(
+                    data_parallel_size_local=1,
+                    data_parallel_hybrid_lb=False,
+                    data_parallel_external_lb=False,
+                ),
+                False,
+                None,
+                _LegacyDiffusionProcMonitor(proc),
+                None,
+            )
     except Exception:
         shutdown([proc])
         raise
-
-
-def _perform_diffusion_handshake(
-    proc: BaseProcess,
-    handshake_address: str,
-    handshake_timeout: int,
-) -> None:
-    """Run the handshake with the diffusion subprocess."""
-    with zmq_socket_ctx(handshake_address, zmq.ROUTER, bind=True) as handshake_socket:
-        poller = zmq.Poller()
-        poller.register(handshake_socket, zmq.POLLIN)
-        poller.register(proc.sentinel, zmq.POLLIN)
-
-        timeout_ms = handshake_timeout * 1000
-        while True:
-            events = dict(poller.poll(timeout=timeout_ms))
-            if not events:
-                raise TimeoutError(
-                    f"Timed out waiting for READY from StageDiffusionProc after {handshake_timeout}s. "
-                    f"This typically indicates model loading or warmup is taking too long. "
-                    f"Consider increasing `stage_init_timeout` for large models."
-                )
-            if handshake_socket in events:
-                identity, raw = handshake_socket.recv_multipart()
-                msg = msgspec.msgpack.decode(raw)
-                if msg.get("status") == "READY":
-                    return
-                raise RuntimeError(f"Expected READY, got: {msg}")
-            if proc.exitcode is not None:
-                raise RuntimeError(f"StageDiffusionProc died during handshake (exit code {proc.exitcode})")

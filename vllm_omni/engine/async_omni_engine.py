@@ -336,6 +336,11 @@ class AsyncOmniEngine:
             )
 
         self.config_path, self.stage_configs = self._resolve_stage_configs(model, kwargs)
+        self._validate_diffusion_stage_step_configs(
+            self.stage_configs,
+            stage_configs_path=self.config_path,
+            top_level_step_execution=bool(kwargs.get("step_execution", False)),
+        )
         self._validate_single_stage_mode_replica_constraints()
 
         self.num_stages = len(self.stage_configs)
@@ -2054,6 +2059,43 @@ class AsyncOmniEngine:
             )
 
         return result
+
+    @staticmethod
+    def _validate_diffusion_stage_step_configs(
+        stage_configs: Sequence[Any],
+        *,
+        stage_configs_path: str | None,
+        top_level_step_execution: bool,
+    ) -> None:
+        """Validate diffusion stage_split/step_execution lockstep at stage-config level."""
+        diffusion_stage_cfgs = [cfg for cfg in stage_configs if getattr(cfg, "stage_type", None) == "diffusion"]
+        if top_level_step_execution and not diffusion_stage_cfgs:
+            raise ValueError(
+                "step_execution=True requires diffusion stage configs with "
+                "stage_split=True and explicit stage_role entries."
+            )
+
+        for idx, cfg in enumerate(diffusion_stage_cfgs):
+            engine_args = getattr(cfg, "engine_args", None)
+            step_execution = bool(getattr(engine_args, "step_execution", False))
+            stage_split = bool(getattr(engine_args, "stage_split", False))
+            stage_role = getattr(engine_args, "stage_role", "all")
+            stage_label = f"diffusion stage #{idx}"
+            if stage_configs_path:
+                stage_label += f" from {stage_configs_path}"
+
+            if step_execution != stage_split:
+                if step_execution:
+                    raise ValueError(f"{stage_label}: step_execution=True requires stage_split=True.")
+                raise ValueError(f"{stage_label}: stage_split=True requires step_execution=True.")
+            if stage_split:
+                if stage_role not in ("encode", "dit", "decode"):
+                    raise ValueError(
+                        f"{stage_label}: stage_split=True requires stage_role to be one of "
+                        "'encode', 'dit', or 'decode'."
+                    )
+            elif stage_role != "all":
+                raise ValueError(f"{stage_label}: stage_role must be 'all' when stage_split=False.")
 
     def _resolve_stage_configs(self, model: str, kwargs: dict[str, Any]) -> tuple[str, list[Any]]:
         """Resolve stage configs and inject defaults shared by orchestrator/headless."""

@@ -6,7 +6,7 @@ import os
 import random
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field, fields
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Literal
 
 import diffusers
 import torch
@@ -616,8 +616,13 @@ class OmniDiffusionConfig:
     # Diffusion pipeline Profiling config
     enable_diffusion_pipeline_profiler: bool = False
 
-    # Step mode settings
+    # Stage split and step execution are one deployment mode: both on or both off.
     step_execution: bool = False
+    stage_split: bool = False
+    stage_role: Literal["all", "encode", "dit", "decode"] = "all"
+
+    # Streaming mode settings
+    streaming_output: bool = False
 
     # Maximum number of sequences to generate in a batch
     max_num_seqs: int = 1
@@ -751,6 +756,9 @@ class OmniDiffusionConfig:
         elif not isinstance(self.cache_config, DiffusionCacheConfig):
             # If it's neither dict nor DiffusionCacheConfig, convert to empty config
             self.cache_config = DiffusionCacheConfig()
+
+        if self.stage_role not in ("all", "encode", "dit", "decode"):
+            raise ValueError(f"Invalid stage_role={self.stage_role!r}; expected all|encode|dit|decode.")
 
         # Auto-detect quantization from TransformerConfig if not explicitly set.
         # This covers the case where tf_model_config is passed at construction
@@ -1084,6 +1092,11 @@ class DiffusionOutput:
 
     # logged timings info, directly from Req.timings
     # timings: Optional["RequestTimings"] = None
+
+    # Streaming info (the defaults should make sense for non-streaming mode)
+    finished: bool = True
+    chunk_index: int = 0
+    total_chunks: int = 1
 
     # logged duration of stages
     stage_durations: dict[str, float] = field(default_factory=dict)

@@ -136,6 +136,7 @@ def _make_engine_with_loop(
     calls and a real ``RequestScheduler``.
     """
     engine = DiffusionEngine.__new__(DiffusionEngine)
+    engine.od_config = SimpleNamespace(streaming_output=False)
     engine._closed = False
     engine.executor = _ConcurrencyTrackingExecutor(rpc_delay=rpc_delay)
 

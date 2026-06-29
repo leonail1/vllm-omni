@@ -272,6 +272,13 @@ class QwenImagePipeline(
         "prepare_latents",
         "prepare_timesteps",
     )
+    DEFAULT_VAE_SCALE_FACTOR: ClassVar[int] = 8
+    _ROLE_COMPONENTS: ClassVar[dict[str, set[str]]] = {
+        "all": {"scheduler", "text_encoder", "tokenizer", "vae", "transformer"},
+        "encode": {"scheduler", "text_encoder", "tokenizer"},
+        "dit": {"scheduler", "transformer"},
+        "decode": {"vae"},
+    }
 
     def __init__(
         self,
@@ -279,81 +286,121 @@ class QwenImagePipeline(
         od_config: OmniDiffusionConfig,
         prefix: str = "",
     ):
+        # Initialize only the components owned by this stage role.
         super().__init__()
         self.od_config = od_config
         self.parallel_config = od_config.parallel_config
-        self.weights_sources = [
-            DiffusersPipelineLoader.ComponentSource(
-                model_or_path=od_config.model,
-                subfolder="transformer",
-                revision=None,
-                prefix="transformer.",
-                fall_back_to_pt=True,
-            )
-        ]
-
         self.device = get_local_device()
         model = od_config.model
+        self.stage_role = self._resolve_stage_role(od_config)
+        owned_components = self._ROLE_COMPONENTS[self.stage_role]
+        owns_transformer = "transformer" in owned_components
+
+        # Role ownership controls both component loading and discovery.
+        self._dit_modules = ["transformer"] if owns_transformer else []
+        self._encoder_modules = ["text_encoder"] if "text_encoder" in owned_components else []
+        self._vae_modules = ["vae"] if "vae" in owned_components else []
+        self.weights_sources = (
+            [
+                DiffusersPipelineLoader.ComponentSource(
+                    model_or_path=od_config.model,
+                    subfolder="transformer",
+                    revision=None,
+                    prefix="transformer.",
+                    fall_back_to_pt=True,
+                )
+            ]
+            if owns_transformer
+            else []
+        )
+        self.weights_loaded_by_model_init = not owns_transformer
         # Check if model is a local path
         local_files_only = os.path.isdir(model)
 
         # See pipeline_qwen_image_edit_plus: guard against transformers v5
         # multi-worker race on partial subfolder shard sets (Buildkite #1043).
-        qwen_subfolders = ["scheduler", "text_encoder", "vae", "tokenizer"]
+        qwen_subfolders = [
+            subfolder for subfolder in ("scheduler", "text_encoder", "vae", "tokenizer") if subfolder in owned_components
+        ]
         prefetch_subfolders(
             model,
             qwen_subfolders,
             local_files_only=local_files_only,
         )
 
-        self.scheduler = FlowMatchEulerDiscreteScheduler.from_pretrained(
-            model, subfolder="scheduler", local_files_only=local_files_only
+        self.scheduler = (
+            FlowMatchEulerDiscreteScheduler.from_pretrained(
+                model, subfolder="scheduler", local_files_only=local_files_only
+            )
+            if "scheduler" in owned_components
+            else None
         )
         # ``from_pretrained_with_prefetch`` re-prefetches and retries on a
         # half-written cache (missing-shard ``OSError`` *and* the default
         # -config size-mismatch ``RuntimeError`` that ``retry_on_missing_shard``
         # could not recover) instead of crashing the worker.
-        self.text_encoder = from_pretrained_with_prefetch(
-            Qwen2_5_VLForConditionalGeneration.from_pretrained,
-            model,
-            subfolder="text_encoder",
-            prefetch_list=qwen_subfolders,
-            local_files_only=local_files_only,
+        self.text_encoder = (
+            from_pretrained_with_prefetch(
+                Qwen2_5_VLForConditionalGeneration.from_pretrained,
+                model,
+                subfolder="text_encoder",
+                prefetch_list=qwen_subfolders,
+                local_files_only=local_files_only,
+            )
+            if "text_encoder" in owned_components
+            else None
         )
         # Qwen2.5-VL ships a vision tower that text-to-image does not use.
         # Drop it while the model is still on CPU, before moving to GPU, so
         # the vision tower never consumes GPU memory. Handle both transformers
         # layouts: newer puts visual under .model, older puts it directly on
         # the model.
-        visual_owner = None
-        if hasattr(self.text_encoder, "model") and hasattr(self.text_encoder.model, "visual"):
-            visual_owner = self.text_encoder.model
-        elif hasattr(self.text_encoder, "visual"):
-            visual_owner = self.text_encoder
-        if visual_owner is not None:
-            del visual_owner.visual
-        else:
-            logger.warning("Qwen-Image: vision tower not found on text encoder; skipping drop")
-        self.text_encoder = self.text_encoder.to(self.device)
-        self.vae = from_pretrained_with_prefetch(
-            DistributedAutoencoderKLQwenImage.from_pretrained,
-            model,
-            subfolder="vae",
-            prefetch_list=qwen_subfolders,
-            local_files_only=local_files_only,
-        ).to(self.device)
-        transformer_kwargs = get_transformer_config_kwargs(od_config.tf_model_config, QwenImageTransformer2DModel)
-        self.transformer = QwenImageTransformer2DModel(
-            od_config=od_config, quant_config=od_config.quantization_config, **transformer_kwargs
+        if self.text_encoder is not None:
+            visual_owner = None
+            if hasattr(self.text_encoder, "model") and hasattr(self.text_encoder.model, "visual"):
+                visual_owner = self.text_encoder.model
+            elif hasattr(self.text_encoder, "visual"):
+                visual_owner = self.text_encoder
+            if visual_owner is not None:
+                del visual_owner.visual
+            else:
+                logger.warning("Qwen-Image: vision tower not found on text encoder; skipping drop")
+            self.text_encoder = self.text_encoder.to(self.device)
+        self.vae = (
+            from_pretrained_with_prefetch(
+                DistributedAutoencoderKLQwenImage.from_pretrained,
+                model,
+                subfolder="vae",
+                prefetch_list=qwen_subfolders,
+                local_files_only=local_files_only,
+            ).to(self.device)
+            if "vae" in owned_components
+            else None
         )
-        self.transformer_in_channels = self.transformer.in_channels
-        self.transformer_guidance_embeds = self.transformer.guidance_embeds
 
-        self.tokenizer = Qwen2Tokenizer.from_pretrained(model, subfolder="tokenizer", local_files_only=local_files_only)
+        if owns_transformer:
+            transformer_kwargs = get_transformer_config_kwargs(od_config.tf_model_config, QwenImageTransformer2DModel)
+            self.transformer = QwenImageTransformer2DModel(
+                od_config=od_config, quant_config=od_config.quantization_config, **transformer_kwargs
+            )
+            self.transformer_in_channels = self.transformer.in_channels
+            self.transformer_guidance_embeds = self.transformer.guidance_embeds
+        else:
+            self.transformer = None
+            self.transformer_in_channels = int(self._get_tf_config_value("in_channels", 64))
+            self.transformer_guidance_embeds = bool(self._get_tf_config_value("guidance_embeds", False))
 
-        self.stage = None
+        self.tokenizer = (
+            Qwen2Tokenizer.from_pretrained(model, subfolder="tokenizer", local_files_only=local_files_only)
+            if "tokenizer" in owned_components
+            else None
+        )
 
-        self.vae_scale_factor = 2 ** len(self.vae.temperal_downsample) if getattr(self, "vae", None) else 8
+        self.stage = self.stage_role
+
+        self.vae_scale_factor = (
+            2 ** len(self.vae.temperal_downsample) if self.vae is not None else self.DEFAULT_VAE_SCALE_FACTOR
+        )
         # QwenImage latents are turned into 2x2 patches and packed.
         # This means the latent width and height has to be divisible
         # by the patch size. So the vae scale factor is multiplied by the patch size to account for this
@@ -373,6 +420,20 @@ class QwenImagePipeline(
         self.setup_diffusion_pipeline_profiler(
             enable_diffusion_pipeline_profiler=self.od_config.enable_diffusion_pipeline_profiler
         )
+
+    @classmethod
+    def _resolve_stage_role(cls, od_config: OmniDiffusionConfig) -> str:
+        # Validate the role before component discovery and loading use it.
+        role = getattr(od_config, "stage_role", "all")
+        if role not in cls._ROLE_COMPONENTS:
+            raise ValueError(f"Unsupported QwenImage stage_role: {role}")
+        return role
+
+    def _get_tf_config_value(self, key: str, default: Any) -> Any:
+        # Read transformer config when the transformer module is not loaded in this role.
+        tf_config = getattr(self.od_config, "tf_model_config", None)
+        getter = getattr(tf_config, "get", None)
+        return getter(key, default) if callable(getter) else default
 
     def _check_inputs_impl(
         self,
@@ -1006,7 +1067,29 @@ class QwenImagePipeline(
 
         return self._decode_latents(state.latents, height, width, output_type)
 
+    def rehydrate_stage_state(self, state: "DiffusionRequestState") -> "DiffusionRequestState":
+        """Rebuild process-local scheduler state after transport."""
+        # Transport hook: recreate non-serializable scheduler objects in the receiving role.
+        if self.scheduler is None:
+            return state
+        if state.scheduler is not None or state.timesteps is None or state.latents is None:
+            return state
+        timesteps = state.timesteps
+        self._prepare_timesteps_impl(
+            state.total_steps,
+            state.sampling.sigmas,
+            state.latents.shape[1],
+        )
+        req_scheduler = copy.deepcopy(self.scheduler)
+        req_scheduler.set_begin_index(state.step_index)
+        state.scheduler = req_scheduler
+        state.timesteps = timesteps
+        return state
+
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
+        # Encoder/decode-only roles load all owned weights during component initialization.
+        if self.weights_loaded_by_model_init:
+            return {name for name, _ in self.named_parameters()}
         loader = AutoWeightsLoader(self)
         return loader.load_weights(weights)
 

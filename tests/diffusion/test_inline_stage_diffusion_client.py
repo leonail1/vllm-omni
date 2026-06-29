@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import asyncio
 from types import SimpleNamespace
-from unittest.mock import MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 from vllm.v1.engine.exceptions import EngineDeadError
@@ -135,6 +135,19 @@ def test_inline_check_health_marks_engine_dead(client, mock_engine):
         client.check_health()
 
     assert client._engine_dead is True
+
+
+@pytest.mark.asyncio
+async def test_inline_stage_dit_transport_uses_step_scheduler_path(client, mock_engine):
+    payload = {"state": "encoded"}
+    expected = {"state": "decode-ready"}
+    mock_engine.async_add_stage_transport_and_wait_for_response = AsyncMock(return_value=expected)
+
+    with patch.object(client, "collective_rpc_async", AsyncMock(side_effect=AssertionError("execute_dit fallback"))):
+        result = await client.stage_dit_transport_async("req-dit", payload)
+
+    assert result is expected
+    mock_engine.async_add_stage_transport_and_wait_for_response.assert_awaited_once_with(payload)
 
 
 def test_inline_client_requires_replica_id(mock_engine):
