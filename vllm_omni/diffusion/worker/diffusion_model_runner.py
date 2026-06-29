@@ -155,7 +155,7 @@ class DiffusionModelRunner(OmniConnectorModelRunnerMixin):
         if getattr(self.od_config, "step_execution", False) and not self.supports_step_mode():
             raise ValueError(
                 "step_execution=True requires a pipeline implementing "
-                "prepare_encode(), denoise_step(), step_scheduler(), and post_decode(); "
+                "encode_stage(), denoise_stage(), scheduler_stage(), and decode_stage(); "
                 f"{self.od_config.model_class_name} does not support that contract."
             )
 
@@ -404,7 +404,7 @@ class DiffusionModelRunner(OmniConnectorModelRunnerMixin):
                         gen_device = self.device
                     state.sampling.generator = torch.Generator(device=gen_device).manual_seed(state.sampling.seed)
                 # encode
-                self.pipeline.prepare_encode(state)
+                self.pipeline.encode_stage(state)
 
         input_batch = InputBatch.make_batch(
             states,
@@ -469,7 +469,7 @@ class DiffusionModelRunner(OmniConnectorModelRunnerMixin):
                 omni_diffusion_config=self.od_config,
                 attn_metadata=attn_metadata,
             ):
-                noise_pred = self.pipeline.denoise_step(input_batch)
+                noise_pred = self.pipeline.denoise_stage(input_batch)
 
                 runner_output_list = []
                 pipeline_interrupted = getattr(self.pipeline, "interrupt", False)
@@ -488,12 +488,12 @@ class DiffusionModelRunner(OmniConnectorModelRunnerMixin):
                     offset = 0
                     for req in states:
                         row_num = req.latents.shape[0]
-                        self.pipeline.step_scheduler(
+                        self.pipeline.scheduler_stage(
                             req, noise_pred[offset : offset + row_num] if noise_pred is not None else None
                         )
                         offset = offset + row_num
                         if req.denoise_completed:
-                            result = self.pipeline.post_decode(req)
+                            result = self.pipeline.decode_stage(req)
                         else:
                             result = None
                         runner_output_list.append(

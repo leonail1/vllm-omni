@@ -108,8 +108,9 @@ def test_encode_prompt_rejects_prompt_longer_than_default_max_sequence_length(
         input_kind=input_kind,
     )
 
+    encode_prompt = getattr(pipeline, "_encode_prompt_impl", pipeline.encode_prompt)
     with pytest.raises(ValueError, match=r"got 1025 tokens, but `max_sequence_length` is 1024"):
-        pipeline.encode_prompt(prompt="prompt")
+        encode_prompt(prompt="prompt")
 
 
 @pytest.mark.parametrize(("pipeline_class", "drop_idx", "input_kind"), PIPELINE_CASES)
@@ -125,8 +126,9 @@ def test_encode_prompt_rejects_prompt_longer_than_explicit_max_sequence_length(
         input_kind=input_kind,
     )
 
+    encode_prompt = getattr(pipeline, "_encode_prompt_impl", pipeline.encode_prompt)
     with pytest.raises(ValueError, match=r"got 17 tokens, but `max_sequence_length` is 16"):
-        pipeline.encode_prompt(prompt="prompt", max_sequence_length=16)
+        encode_prompt(prompt="prompt", max_sequence_length=16)
 
 
 def test_prepare_encode_defaults_to_tokenizer_max_length():
@@ -135,32 +137,13 @@ def test_prepare_encode_defaults_to_tokenizer_max_length():
     pipeline.tokenizer_max_length = 1024
     pipeline.vae_scale_factor = 8
     pipeline.default_sample_size = 128
+    pipeline.text_encoder = object()
+    pipeline.tokenizer = object()
     pipeline.scheduler = _FakeScheduler()
     pipeline._extract_prompts = lambda prompts: (["prompt"], None)
-
-    captured = {}
-
-    def _fake_prepare_generation_context(**kwargs):
-        captured["max_sequence_length"] = kwargs["max_sequence_length"]
-        embeds = torch.ones((1, 1, 1))
-        mask = torch.ones((1, 1), dtype=torch.long)
-        return {
-            "prompt_embeds": embeds,
-            "prompt_embeds_mask": mask,
-            "negative_prompt_embeds": None,
-            "negative_prompt_embeds_mask": None,
-            "latents": embeds,
-            "timesteps": torch.tensor([1]),
-            "do_true_cfg": False,
-            "guidance": None,
-            "img_shapes": [[(1, 1, 1)]],
-            "txt_seq_lens": [1],
-            "negative_txt_seq_lens": None,
-        }
-
-    pipeline._prepare_generation_context = _fake_prepare_generation_context
     state = SimpleNamespace(
         prompts=["prompt"],
+        extra={},
         sampling=SimpleNamespace(
             height=None,
             width=None,
@@ -174,9 +157,9 @@ def test_prepare_encode_defaults_to_tokenizer_max_length():
         ),
     )
 
-    pipeline.prepare_encode(state)
+    inputs = pipeline._stage_inputs_from_state(state)
 
-    assert captured["max_sequence_length"] == 1024
+    assert inputs["max_sequence_length"] == 1024
 
 
 @pytest.mark.parametrize(
@@ -221,8 +204,9 @@ def test_qwen_generation_validator_excludes_template_suffix_from_budget(pipeline
     pipeline.prompt_template_encode_start_idx = 34
     pipeline.tokenizer = _FakeTokenizer([1029, 5])
 
+    encode_prompt = getattr(pipeline, "_encode_prompt_impl", pipeline.encode_prompt)
     with pytest.raises(AssertionError, match="text encoder should not run"):
-        pipeline.encode_prompt(prompt="boundary prompt")
+        encode_prompt(prompt="boundary prompt")
 
 
 @pytest.mark.parametrize(
@@ -257,4 +241,8 @@ def test_qwen_edit_validator_excludes_image_placeholders_from_budget(pipeline_cl
     ],
 )
 def test_forward_max_sequence_length_default_is_1024(pipeline_class: type):
-    assert inspect.signature(pipeline_class.forward).parameters["max_sequence_length"].default == 1024
+    signature = inspect.signature(pipeline_class.forward)
+    if pipeline_class is QwenImagePipeline:
+        assert list(signature.parameters) == ["self", "req"]
+    else:
+        assert signature.parameters["max_sequence_length"].default == 1024

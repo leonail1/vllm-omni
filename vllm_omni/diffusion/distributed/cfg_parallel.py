@@ -73,6 +73,19 @@ class CFGParallelMixin(metaclass=ABCMeta):
         and set self.scheduler to a composite scheduler that handles tuples.
     """
 
+    def _predict_noise_impl(
+        self,
+        *args: Any,
+        **kwargs: Any,
+    ) -> torch.Tensor | tuple[torch.Tensor, ...] | IntermediateTensors:
+        """Low-level model call used by CFG dispatch.
+
+        Pipelines that reserve ``predict_noise`` for a higher-level stage atom
+        can override this method while existing kwargs-based pipelines keep the
+        previous behavior.
+        """
+        return self.predict_noise(*args, **kwargs)
+
     def predict_noise_maybe_with_cfg(
         self,
         do_true_cfg: bool,
@@ -112,7 +125,7 @@ class CFGParallelMixin(metaclass=ABCMeta):
 
                 # Each rank computes one branch
                 kwargs = positive_kwargs if cfg_rank == 0 else negative_kwargs
-                local_pred = _wrap(self.predict_noise(**kwargs))
+                local_pred = _wrap(self._predict_noise_impl(**kwargs))
 
                 if output_slice is not None:
                     local_pred = _slice_pred(local_pred, output_slice)
@@ -131,8 +144,8 @@ class CFGParallelMixin(metaclass=ABCMeta):
                 )
             else:
                 # Sequential CFG: compute both positive and negative
-                positive_noise_pred = _wrap(self.predict_noise(**positive_kwargs))
-                negative_noise_pred = _wrap(self.predict_noise(**negative_kwargs))
+                positive_noise_pred = _wrap(self._predict_noise_impl(**positive_kwargs))
+                negative_noise_pred = _wrap(self._predict_noise_impl(**negative_kwargs))
 
                 if output_slice is not None:
                     positive_noise_pred = _slice_pred(positive_noise_pred, output_slice)
@@ -146,7 +159,7 @@ class CFGParallelMixin(metaclass=ABCMeta):
                 )
         else:
             # No CFG: only compute positive/conditional prediction
-            pred = self.predict_noise(**positive_kwargs)
+            pred = self._predict_noise_impl(**positive_kwargs)
             if output_slice is not None:
                 pred = _unwrap(_slice_pred(_wrap(pred), output_slice))
             return pred
@@ -259,14 +272,14 @@ class CFGParallelMixin(metaclass=ABCMeta):
                 # Sequential: run all N branches on single device
                 preds: list[torch.Tensor | tuple[torch.Tensor, ...]] = []
                 for kw in branches_kwargs:
-                    pred = _wrap(self.predict_noise(**kw))
+                    pred = _wrap(self._predict_noise_impl(**kw))
                     if output_slice is not None:
                         pred = _slice_pred(pred, output_slice)
                     preds.append(_unwrap(pred))
                 return self.combine_multi_branch_cfg_noise(preds, true_cfg_scale, cfg_normalize)
         else:
             # No CFG: only compute positive/conditional prediction
-            pred = self.predict_noise(**branches_kwargs[0])
+            pred = self._predict_noise_impl(**branches_kwargs[0])
             if output_slice is not None:
                 pred = _unwrap(_slice_pred(_wrap(pred), output_slice))
             return pred
@@ -300,7 +313,7 @@ class CFGParallelMixin(metaclass=ABCMeta):
         # Run assigned branches
         my_preds: list[tuple[torch.Tensor, ...]] = []
         for bid in my_branch_ids:
-            pred = _wrap(self.predict_noise(**branches_kwargs[bid]))
+            pred = _wrap(self._predict_noise_impl(**branches_kwargs[bid]))
             if output_slice is not None:
                 pred = _slice_pred(pred, output_slice)
             my_preds.append(pred)
@@ -308,7 +321,7 @@ class CFGParallelMixin(metaclass=ABCMeta):
         # Idle ranks (cfg_world_size > n_branches) run a forward pass to get the output shape for all_gather.
         # Output shape cannot be inferred from kwargs — may be tuple, sliced, etc.
         if not my_preds:
-            pred = _wrap(self.predict_noise(**branches_kwargs[0]))
+            pred = _wrap(self._predict_noise_impl(**branches_kwargs[0]))
             if output_slice is not None:
                 pred = _slice_pred(pred, output_slice)
             my_preds.append(pred)
