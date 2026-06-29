@@ -3,19 +3,13 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import (
-    TYPE_CHECKING,
-    Any,
-    ClassVar,
-    Literal,
-    Protocol,
-    runtime_checkable,
-)
+from typing import TYPE_CHECKING, ClassVar, Literal, Protocol, runtime_checkable
 
 if TYPE_CHECKING:
     import torch
 
     from vllm_omni.diffusion.data import DiffusionOutput
+    from vllm_omni.diffusion.worker.input_batch import InputBatch
     from vllm_omni.diffusion.worker.utils import DiffusionRequestState
 
 
@@ -43,27 +37,27 @@ class SupportAudioOutput(Protocol):
 
 @runtime_checkable
 class SupportsStepExecution(Protocol):
-    """State-driven step-level execution protocol for diffusion pipelines.
+    """State-driven stage contract for diffusion step execution.
 
-    Pipelines should split request-level ``forward()`` into:
-    ``prepare_encode()`` (one-time request setup), ``denoise_step()``
-    (one denoise forward), ``step_scheduler()`` (one scheduler update),
-    and ``post_decode()`` (final decode).
+    The old ``prepare_encode`` / ``denoise_step`` / ``step_scheduler`` /
+    ``post_decode`` names are intentionally not part of this protocol.  A
+    step-capable pipeline exposes the composed stage names used by the runner:
+    ``encode_stage`` / ``denoise_stage`` / ``scheduler_stage`` / ``decode_stage``.
     """
 
     supports_step_execution: ClassVar[bool] = True
 
-    def prepare_encode(self, state: DiffusionRequestState, **kwargs: Any) -> DiffusionRequestState:
-        """Prepare request-level inputs and return initialized state."""
+    def encode_stage(self, state: "DiffusionRequestState") -> "DiffusionRequestState":
+        """Run request-local validation, encoding, timestep and latent setup."""
 
-    def denoise_step(self, state: DiffusionRequestState, **kwargs: Any) -> torch.Tensor | None:
-        """Run one denoise step."""
+    def denoise_stage(self, batch: "InputBatch") -> "torch.Tensor | None":
+        """Run one batched DiT denoise forward."""
 
-    def step_scheduler(self, state: DiffusionRequestState, noise_pred: torch.Tensor, **kwargs: Any) -> None:
-        """Run one scheduler step."""
+    def scheduler_stage(self, state: "DiffusionRequestState", noise: "torch.Tensor | None") -> None:
+        """Advance one request-local scheduler step."""
 
-    def post_decode(self, state: DiffusionRequestState, **kwargs: Any) -> DiffusionOutput:
-        """Decode output after denoise loop."""
+    def decode_stage(self, state: "DiffusionRequestState") -> "DiffusionOutput":
+        """Decode final latents into the public diffusion output."""
 
 
 @runtime_checkable
@@ -92,6 +86,15 @@ class SupportsComponentDiscovery(Protocol):
 
 
 def supports_step_execution(pipeline: object) -> bool:
-    """Return whether `pipeline` implements :class:`SupportsStepExecution`."""
+    """Return whether *pipeline* exposes the composed stage contract.
 
-    return isinstance(pipeline, SupportsStepExecution)
+    This helper deliberately checks the new stage names and the explicit
+    capability flag instead of accepting the old step-only method names.
+    """
+
+    if not bool(getattr(pipeline, "supports_step_execution", False)):
+        return False
+    return all(
+        callable(getattr(pipeline, name, None))
+        for name in ("encode_stage", "denoise_stage", "scheduler_stage", "decode_stage")
+    )
