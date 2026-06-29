@@ -32,13 +32,12 @@ from vllm_omni.diffusion.compile import regionally_compile
 from vllm_omni.diffusion.data import DiffusionOutput, OmniDiffusionConfig
 from vllm_omni.diffusion.forward_context import set_forward_context
 from vllm_omni.diffusion.model_loader.diffusers_loader import DiffusersPipelineLoader
-from vllm_omni.diffusion.models.interface import supports_step_execution
 from vllm_omni.diffusion.offloader import get_offload_backend
 from vllm_omni.diffusion.registry import _NO_CACHE_ACCELERATION
 from vllm_omni.diffusion.request import OmniDiffusionRequest
 from vllm_omni.diffusion.sched.interface import DiffusionSchedulerOutput
 from vllm_omni.diffusion.worker.input_batch import InputBatch, scatter_latents
-from vllm_omni.diffusion.worker.utils import BatchRunnerOutput, DiffusionRequestState, RunnerOutput
+from vllm_omni.diffusion.worker.utils import DiffusionRequestState
 from vllm_omni.distributed.omni_connectors.kv_transfer_manager import OmniKVTransferManager
 from vllm_omni.platforms import current_omni_platform
 from vllm_omni.worker.omni_connector_model_runner_mixin import OmniConnectorModelRunnerMixin
@@ -350,7 +349,7 @@ class DiffusionModelRunner(OmniConnectorModelRunnerMixin):
 
     def supports_step_mode(self) -> bool:
         """Return whether current pipeline supports step execution."""
-        return self.pipeline is not None and supports_step_execution(self.pipeline)
+        return self.pipeline is not None and bool(getattr(self.pipeline, "supports_step_execution", False))
 
     def _update_states(
         self, scheduler_output: DiffusionSchedulerOutput
@@ -445,72 +444,3 @@ class DiffusionModelRunner(OmniConnectorModelRunnerMixin):
         if not callable(prepare_attn):
             return {}
         return prepare_attn(input_batch)
-
-    def execute_stepwise(self, scheduler_output: DiffusionSchedulerOutput) -> BatchRunnerOutput:
-        """Execute one step for one scheduled request and return runner output."""
-        assert self.pipeline is not None, "Model not loaded. Call load_model() first."
-        if not self.supports_step_mode():
-            raise ValueError("Current pipeline does not support step execution.")
-        # Stepwise mode only supports the basic state-driven denoise path for now.
-        # Request-mode extras such as cache backends, KV transfer, editing inputs,
-        # and similar features are not supported here yet.
-        if self.od_config.cache_backend not in (None, "none"):
-            raise ValueError("Step mode does not support cache_backend yet.")
-
-        use_hsdp = self.od_config.parallel_config.use_hsdp
-        grad_context = torch.no_grad() if use_hsdp else torch.inference_mode()
-        with grad_context:
-            states, new_request_ids = self._update_states(scheduler_output)
-            input_batch = self._prepare_batch_inputs(states, new_request_ids)
-            attn_metadata = self._prepare_attn_metadata(input_batch)
-
-            with set_forward_context(
-                vllm_config=self.vllm_config,
-                omni_diffusion_config=self.od_config,
-                attn_metadata=attn_metadata,
-            ):
-                noise_pred = self.pipeline.denoise_stage(input_batch)
-
-                runner_output_list = []
-                pipeline_interrupted = getattr(self.pipeline, "interrupt", False)
-                if noise_pred is None and pipeline_interrupted:
-                    for state in states:
-                        runner_output_list.append(
-                            RunnerOutput(
-                                request_id=state.request_id,
-                                step_index=state.step_index,
-                                finished=True,
-                                result=DiffusionOutput(error="stepwise denoise interrupted"),
-                            )
-                        )
-
-                else:
-                    offset = 0
-                    for req in states:
-                        row_num = req.latents.shape[0]
-                        self.pipeline.scheduler_stage(
-                            req, noise_pred[offset : offset + row_num] if noise_pred is not None else None
-                        )
-                        offset = offset + row_num
-                        if req.denoise_completed:
-                            result = self.pipeline.decode_stage(req)
-                        else:
-                            result = None
-                        runner_output_list.append(
-                            RunnerOutput(
-                                request_id=req.request_id,
-                                step_index=req.step_index,
-                                finished=req.denoise_completed,
-                                result=result,
-                            )
-                        )
-
-                    if noise_pred is not None and offset != noise_pred.shape[0]:
-                        raise ValueError(
-                            f"Stepwise noise_pred consumed {offset} rows, "
-                            f"but batched noise_pred has {noise_pred.shape[0]} rows."
-                        )
-
-                self._update_states_after(states, input_batch, pipeline_interrupted)
-
-                return BatchRunnerOutput.from_list(runner_output_list)

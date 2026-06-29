@@ -48,6 +48,7 @@ from vllm_omni.diffusion.request import OmniDiffusionRequest
 from vllm_omni.diffusion.sched.interface import DiffusionSchedulerOutput
 from vllm_omni.diffusion.worker.diffusion_model_runner import DiffusionModelRunner
 from vllm_omni.diffusion.worker.utils import BaseRunnerOutput
+from vllm_omni.diffusion.worker.utils import DiffusionStateTransport
 from vllm_omni.engine.stage_init_utils import set_death_signal
 from vllm_omni.lora.request import LoRARequest
 from vllm_omni.platforms import current_omni_platform
@@ -135,6 +136,24 @@ def _is_unexpected_additional_config_type_error(exc: TypeError) -> bool:
     return "unexpected keyword argument" in message and "additional_config" in message
 
 
+@contextmanager
+def _skip_vllm_platform_config_check() -> Iterator[None]:
+    """Build diffusion-local VllmConfig before attaching its lightweight model config."""
+    from vllm.platforms import current_platform as vllm_current_platform
+
+    platform_cls = type(vllm_current_platform)
+    original = platform_cls.check_and_update_config
+
+    def _noop_check_and_update_config(cls: type, vllm_config: VllmConfig) -> None:
+        return None
+
+    platform_cls.check_and_update_config = classmethod(_noop_check_and_update_config)
+    try:
+        yield
+    finally:
+        platform_cls.check_and_update_config = original
+
+
 def _create_diffusion_worker_vllm_config(device: torch.device, od_config: OmniDiffusionConfig) -> VllmConfig:
     """Create a worker-local VllmConfig while preserving additional_config when supported."""
     config_kwargs: dict[str, Any] = {
@@ -145,14 +164,19 @@ def _create_diffusion_worker_vllm_config(device: torch.device, od_config: OmniDi
         config_kwargs["additional_config"] = od_config.additional_config
 
     try:
-        return VllmConfig(**config_kwargs)
+        with _skip_vllm_platform_config_check():
+            vllm_config = VllmConfig(**config_kwargs)
+        vllm_config.model_config = _make_diffusion_vllm_model_config(od_config)  # type: ignore[assignment]
+        return vllm_config
     except TypeError as exc:
         if not _is_unexpected_additional_config_type_error(exc):
             raise
 
         logger.debug("Worker-local VllmConfig does not accept additional_config in constructor: %s", exc)
         config_kwargs.pop("additional_config", None)
-        vllm_config = VllmConfig(**config_kwargs)
+        with _skip_vllm_platform_config_check():
+            vllm_config = VllmConfig(**config_kwargs)
+        vllm_config.model_config = _make_diffusion_vllm_model_config(od_config)  # type: ignore[assignment]
         try:
             setattr(vllm_config, "additional_config", dict(od_config.additional_config))
         except Exception as set_exc:  # pragma: no cover - defensive for older vLLM builds
@@ -194,9 +218,15 @@ class DiffusionWorker:
         self._step_lora_state: dict[str, tuple[LoRARequest | None, float]] = {}
         self.stage_id = getattr(od_config, "stage_id", 0)
         self.init_device()
-        # Create model runner using the platform-specified class
-        model_runner_cls_path = current_omni_platform.get_diffusion_model_runner_cls()
-        model_runner_cls = resolve_obj_by_qualname(model_runner_cls_path)
+        # Stage execution uses the diffusion RunnerV2 contract. Non-stage
+        # request mode keeps the platform-selected runner.
+        if getattr(od_config, "stage_split", False):
+            from vllm_omni.diffusion.worker.diffusion_model_runner_v2 import DiffusionModelRunnerV2
+
+            model_runner_cls = DiffusionModelRunnerV2
+        else:
+            model_runner_cls_path = current_omni_platform.get_diffusion_model_runner_cls()
+            model_runner_cls = resolve_obj_by_qualname(model_runner_cls_path)
         self.model_runner = model_runner_cls(
             vllm_config=self.vllm_config,
             od_config=self.od_config,
@@ -231,7 +261,6 @@ class DiffusionWorker:
         vllm_config.parallel_config.data_parallel_size = self.od_config.parallel_config.data_parallel_size
         vllm_config.parallel_config.enable_expert_parallel = self.od_config.parallel_config.enable_expert_parallel
         vllm_config.profiler_config = self.od_config.profiler_config
-        vllm_config.model_config = _make_diffusion_vllm_model_config(self.od_config)  # type: ignore[assignment]
         vllm_config.quant_config = self.od_config.quantization_config
         # Since vLLM v0.20.0, IR wraps GPU ops. Set IR op priority preference to enforce GPU op fusion during wrapping.
         # Also need to log, because vLLM internally logs another line in VllmConfig.__post_init__. Avoid confusion.
@@ -382,6 +411,16 @@ class DiffusionWorker:
         if profiler:
             profiler.step()
         return output
+
+    def execute_encode(self, req: OmniDiffusionRequest) -> DiffusionStateTransport:
+        """Execute the encode role and return an encode->DiT payload."""
+        assert self.model_runner is not None, "Model runner not initialized"
+        return self.model_runner.execute_encode(req)
+
+    def execute_decode(self, payload: DiffusionStateTransport) -> DiffusionOutput:
+        """Execute the decode role from a DiT payload."""
+        assert self.model_runner is not None, "Model runner not initialized"
+        return self.model_runner.execute_decode(payload)
 
     def _activate_step_lora(self, scheduler_output: DiffusionSchedulerOutput) -> None:
         """Activate the LoRA adapter for the scheduled step batch.

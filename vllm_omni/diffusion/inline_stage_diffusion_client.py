@@ -20,6 +20,7 @@ from vllm.v1.engine.exceptions import EngineDeadError
 from vllm_omni.diffusion.data import DiffusionRequestAbortedError
 from vllm_omni.diffusion.diffusion_engine import DiffusionEngine
 from vllm_omni.diffusion.request import OmniDiffusionRequest
+from vllm_omni.diffusion.worker.utils import DiffusionRequestState
 from vllm_omni.engine.stage_client import StageClientBase
 from vllm_omni.engine.stage_init_utils import StageMetadata
 from vllm_omni.errors import client_error_metadata
@@ -270,6 +271,82 @@ class InlineStageDiffusionClient(StageClientBase):
                 raise EngineDeadError(f"Stage-{self.stage_id} inline diffusion engine is dead")
             return None
 
+    async def stage_encode_request_async(
+        self,
+        request_id: str,
+        prompt: OmniPromptType,
+        sampling_params: OmniDiffusionSamplingParams,
+        kv_sender_info: dict[int, dict[str, Any]] | None = None,
+        timeout: float | None = None,
+    ) -> Any:
+        request = OmniDiffusionRequest(
+            prompts=[prompt],
+            sampling_params=sampling_params,
+            request_id=request_id,
+            kv_sender_info=kv_sender_info,
+        )
+        return await self.collective_rpc_async(
+            "execute_encode",
+            timeout=timeout,
+            args=(request,),
+            unique_reply_rank=0,
+            exec_all_ranks=True,
+        )
+
+    async def stage_dit_transport_async(
+        self,
+        request_id: str,
+        payload: Any,
+        timeout: float | None = None,
+    ) -> Any:
+        # Inline mode keeps the same role contract without ZMQ serialization.
+        if timeout is None:
+            return await self._engine.async_add_stage_transport_and_wait_for_response(payload)
+        return await asyncio.wait_for(
+            self._engine.async_add_stage_transport_and_wait_for_response(payload),
+            timeout=timeout,
+        )
+
+    async def stage_decode_transport_async(
+        self,
+        request_id: str,
+        payload: Any,
+    ) -> None:
+        # Decode still goes through postprocess_output so outputs match subprocess mode.
+        decode_start = time.perf_counter()
+        state = DiffusionRequestState.from_transport(payload)
+        request = OmniDiffusionRequest(
+            prompts=state.prompts or [{"stage_transport": True}],
+            sampling_params=state.sampling,
+            request_id=request_id,
+        )
+        output = await self.collective_rpc_async(
+            "execute_decode",
+            args=(payload,),
+            unique_reply_rank=0,
+            exec_all_ranks=True,
+        )
+        if isinstance(output, list):
+            if len(output) != 1:
+                raise RuntimeError(
+                    f"Inline decode stage expected one DiffusionOutput for request {request_id}, "
+                    f"got {len(output)}."
+                )
+            output = output[0]
+        formatted_outputs = self._engine.postprocess_output(
+            request,
+            output,
+            diffusion_engine_start_time=decode_start,
+            preprocess_time=0.0,
+            exec_total_time=time.perf_counter() - decode_start,
+        )
+        if not formatted_outputs:
+            raise RuntimeError(f"Inline decode stage produced no output for request {request_id}.")
+        self._output_queue.put_nowait(formatted_outputs[0])
+
+    def put_diffusion_output_nowait(self, output: OmniRequestOutput) -> None:
+        self._output_queue.put_nowait(output)
+
     async def abort_requests_async(self, request_ids: list[str]) -> None:
         for rid in request_ids:
             task = self._tasks.pop(rid, None)
@@ -283,6 +360,8 @@ class InlineStageDiffusionClient(StageClientBase):
         timeout: float | None = None,
         args: tuple[Any, ...] = (),
         kwargs: dict[str, Any] | None = None,
+        unique_reply_rank: int | None = None,
+        exec_all_ranks: bool = False,
     ) -> Any:
         loop = asyncio.get_running_loop()
 
@@ -363,7 +442,8 @@ class InlineStageDiffusionClient(StageClientBase):
             timeout,
             args,
             kwargs,
-            None,
+            unique_reply_rank,
+            exec_all_ranks,
         )
 
     def check_health(self) -> None:

@@ -16,6 +16,7 @@ from typing import Any
 import torch
 
 from vllm_omni.diffusion.data import DiffusionOutput
+from vllm_omni.diffusion.worker.utils import DiffusionStateTransport
 
 _SHM_TENSOR_THRESHOLD = 1_000_000  # 1 MB
 DIFFUSION_RPC_RESULT_ENVELOPE = "diffusion_rpc_result"
@@ -86,6 +87,13 @@ def _pack_tensor_if_large(val: torch.Tensor) -> torch.Tensor | dict:
     return val
 
 
+def _pack_tensor_to_shm(val: torch.Tensor) -> torch.Tensor | dict:
+    """Replace any non-empty tensor with an SHM handle."""
+    if val.nelement() == 0:
+        return val
+    return _tensor_to_shm(val)
+
+
 def _pack_value_if_large(val: object) -> object:
     """Recursively replace large tensors with SHM handles.
 
@@ -106,6 +114,39 @@ def _pack_value_if_large(val: object) -> object:
     return val
 
 
+def _pack_stage_transport_value(val: object) -> object:
+    if isinstance(val, torch.Tensor):
+        return _pack_tensor_to_shm(val)
+    if isinstance(val, dict):
+        if val.get("__tensor_shm__"):
+            return val
+        return {key: _pack_stage_transport_value(value) for key, value in val.items()}
+    if isinstance(val, list):
+        return [_pack_stage_transport_value(item) for item in val]
+    if isinstance(val, tuple):
+        return tuple(_pack_stage_transport_value(item) for item in val)
+    return val
+
+
+def pack_stage_transport_shm(payload: object) -> object:
+    """Replace stage transport tensors with SHM handles.
+
+    Stage-split diffusion sends large per-request state through ZMQ.  Keep the
+    metadata in msgpack, but move named tensor payloads through POSIX shared
+    memory handles so the wire message stays small.
+    """
+    if isinstance(payload, DiffusionStateTransport):
+        # Only tensor slots are rewritten; metadata stays msgpack-friendly.
+        payload.tensors = {key: _pack_stage_transport_value(value) for key, value in payload.tensors.items()}
+        return payload
+    if isinstance(payload, dict) and "tensors" in payload:
+        packed = dict(payload)
+        tensors = packed.get("tensors") or {}
+        packed["tensors"] = {key: _pack_stage_transport_value(value) for key, value in tensors.items()}
+        return packed
+    return _pack_stage_transport_value(payload)
+
+
 def _unpack_if_shm_handle(val: object) -> object:
     """Reconstruct tensors from SHM handles, mirroring ``_pack_value_if_large``."""
     if isinstance(val, dict) and val.get("__tensor_shm__"):
@@ -117,6 +158,14 @@ def _unpack_if_shm_handle(val: object) -> object:
     if isinstance(val, tuple):
         return tuple(_unpack_if_shm_handle(item) for item in val)
     return val
+
+
+def unpack_stage_transport_shm(payload: object) -> object:
+    """Restore tensors from SHM handles inside stage transport payloads."""
+    if isinstance(payload, DiffusionStateTransport):
+        payload.tensors = {key: _unpack_if_shm_handle(value) for key, value in payload.tensors.items()}
+        return payload
+    return _unpack_if_shm_handle(payload)
 
 
 def _pack_diffusion_fields(output: DiffusionOutput) -> DiffusionOutput:

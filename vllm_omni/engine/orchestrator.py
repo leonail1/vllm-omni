@@ -1132,6 +1132,7 @@ class Orchestrator:
         _t_submit_start = _time.perf_counter()
 
         if next_pool.stage_type == "diffusion":
+            next_diffusion_role = getattr(next_pool, "diffusion_stage_role", "all")
             companion_outputs = self._cfg_tracker.pop_companion_outputs(req_id)
             expected = len(self._cfg_tracker.get_companion_request_ids(req_id))
             if expected > len(companion_outputs):
@@ -1143,7 +1144,9 @@ class Orchestrator:
                     expected,
                 )
             diffusion_source_outputs = [output, *companion_outputs]
-            if next_client.custom_process_input_func is not None:
+            if next_diffusion_role in ("dit", "decode"):
+                diffusion_prompt = output
+            elif next_client.custom_process_input_func is not None:
                 _t_ar2d = _time.perf_counter()
                 _fn = next_client.custom_process_input_func
                 _extra_kwargs: dict[str, Any] = {}

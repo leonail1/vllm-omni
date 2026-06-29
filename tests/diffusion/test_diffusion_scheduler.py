@@ -483,13 +483,15 @@ class TestDiffusionEngine:
         assert output.aborted is True
         assert output.abort_message == "Request req-finalize aborted."
 
-    def test_initializes_step_scheduler_when_step_execution_enabled(
+    def test_initializes_step_scheduler_for_stage_step_dit_role(
         self,
         monkeypatch: pytest.MonkeyPatch,
         mocker: MockerFixture,
     ) -> None:
         od_config = SimpleNamespace(model_class_name="mock_model")
         od_config.step_execution = True
+        od_config.stage_split = True
+        od_config.stage_role = "dit"
         fake_executor = mocker.Mock()
         fake_executor_cls = mocker.Mock(return_value=fake_executor)
 
@@ -511,6 +513,36 @@ class TestDiffusionEngine:
         assert isinstance(engine.scheduler, StepScheduler)
         assert engine.execute_fn is fake_executor.execute_step
         fake_executor_cls.assert_called_once_with(od_config)
+
+    def test_rejects_step_execution_without_stage_split(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        mocker: MockerFixture,
+    ) -> None:
+        od_config = SimpleNamespace(
+            model_class_name="mock_model",
+            step_execution=True,
+            stage_split=False,
+            stage_role="all",
+        )
+        fake_executor_cls = mocker.Mock()
+
+        monkeypatch.setattr(
+            "vllm_omni.diffusion.diffusion_engine.get_diffusion_post_process_func",
+            lambda *args, **kwargs: None,
+        )
+        monkeypatch.setattr(
+            "vllm_omni.diffusion.diffusion_engine.get_diffusion_pre_process_func",
+            lambda *args, **kwargs: None,
+        )
+        monkeypatch.setattr(
+            "vllm_omni.diffusion.diffusion_engine.DiffusionExecutor.get_class",
+            lambda *args, **kwargs: fake_executor_cls,
+        )
+
+        with pytest.raises(ValueError, match="stage_split and step_execution"):
+            DiffusionEngine(od_config)
+        fake_executor_cls.assert_not_called()
 
     def test_dummy_run_raises_on_output_error(self, mocker: MockerFixture) -> None:
         engine = DiffusionEngine.__new__(DiffusionEngine)

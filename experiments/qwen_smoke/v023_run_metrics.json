@@ -1,0 +1,765 @@
+{
+  "metadata": {
+    "clean_root": "/home/lzg/vllm-omni-v023rc1-original-baseline-20260626",
+    "clean_rev": "7b837944",
+    "pr1_root": "/home/lzg/vllm-omni-v023rc1-pr1-pipeline-20260629",
+    "pr1_rev": "d3dd1352",
+    "pr2_root": "/home/lzg/vllm-omni-v023rc1-pr2-stage-20260629",
+    "pr2_rev": "d13fb927",
+    "stage_config": "/home/lzg/vllm-omni-v023rc1-pr2-stage-20260629/experiments/qwen_smoke/qwen_image_stage_split_3stage.yaml"
+  },
+  "cases": {
+    "clean_forward_4step": {
+      "model": "/dataset/models/stage_transfer_profile_models/Qwen_Qwen-Image",
+      "prompt": "a cup of coffee on the table",
+      "height": 1024,
+      "width": 1024,
+      "steps": 4,
+      "seed": 123,
+      "step_execution": false,
+      "stage_configs_path": null,
+      "warmup_runs": 1,
+      "repeats": 3,
+      "num_prompts": 1,
+      "batch_trace": null,
+      "max_num_seqs": 1,
+      "vllm_omni_path": "/home/lzg/vllm-omni-v023rc1-original-baseline-20260626/vllm_omni/__init__.py",
+      "ok": true,
+      "init_s": 63.06191970221698,
+      "warmup_gen_s": 2.177767082117498,
+      "warmup_samples": [
+        {
+          "idx": 0,
+          "gen_s": 2.177767082117498,
+          "outputs": [
+            {
+              "idx": 0,
+              "request_id": "0_c276fb87-7bb8-4f74-aafb-4309c8fa1f42",
+              "size": [
+                1024,
+                1024
+              ]
+            }
+          ]
+        }
+      ],
+      "gen_s": 6.424000818282366,
+      "measured_gen_s": 6.424000818282366,
+      "measured_gen_s_mean": 2.141333606094122,
+      "measured_gen_s_min": 2.1344881001859903,
+      "measured_gen_s_max": 2.1546886190772057,
+      "gen_samples": [
+        {
+          "idx": 0,
+          "gen_s": 2.1546886190772057,
+          "outputs": [
+            {
+              "idx": 0,
+              "request_id": "0_4bccc6a6-5ab0-4160-aee1-cffb573dc493",
+              "output": "/home/lzg/vllm-omni-v023rc1-pr2-stage-20260629/experiments/qwen_smoke/tmp_stage_step_compare/clean_forward_4step_m00.png",
+              "size": [
+                1024,
+                1024
+              ]
+            }
+          ]
+        },
+        {
+          "idx": 1,
+          "gen_s": 2.13482409901917,
+          "outputs": [
+            {
+              "idx": 0,
+              "request_id": "0_d1c60952-7502-4dda-8b14-b19d2a3138dc",
+              "output": "/home/lzg/vllm-omni-v023rc1-pr2-stage-20260629/experiments/qwen_smoke/tmp_stage_step_compare/clean_forward_4step_m01.png",
+              "size": [
+                1024,
+                1024
+              ]
+            }
+          ]
+        },
+        {
+          "idx": 2,
+          "gen_s": 2.1344881001859903,
+          "outputs": [
+            {
+              "idx": 0,
+              "request_id": "0_b821b3f0-9378-4f43-9848-39b6262cd4cb",
+              "output": "/home/lzg/vllm-omni-v023rc1-pr2-stage-20260629/experiments/qwen_smoke/tmp_stage_step_compare/clean_forward_4step_m02.png",
+              "size": [
+                1024,
+                1024
+              ]
+            }
+          ]
+        }
+      ],
+      "total_s": 73.70107038877904,
+      "output": "/home/lzg/vllm-omni-v023rc1-pr2-stage-20260629/experiments/qwen_smoke/tmp_stage_step_compare/clean_forward_4step.png",
+      "primary_output": "/home/lzg/vllm-omni-v023rc1-pr2-stage-20260629/experiments/qwen_smoke/tmp_stage_step_compare/clean_forward_4step_m00.png",
+      "size": [
+        1024,
+        1024
+      ]
+    },
+    "pr1_forward_4step": {
+      "model": "/dataset/models/stage_transfer_profile_models/Qwen_Qwen-Image",
+      "prompt": "a cup of coffee on the table",
+      "height": 1024,
+      "width": 1024,
+      "steps": 4,
+      "seed": 123,
+      "step_execution": false,
+      "stage_configs_path": null,
+      "warmup_runs": 1,
+      "repeats": 3,
+      "num_prompts": 1,
+      "batch_trace": null,
+      "max_num_seqs": 1,
+      "vllm_omni_path": "/home/lzg/vllm-omni-v023rc1-pr1-pipeline-20260629/vllm_omni/__init__.py",
+      "ok": true,
+      "init_s": 62.838787282817066,
+      "warmup_gen_s": 2.1782852606847882,
+      "warmup_samples": [
+        {
+          "idx": 0,
+          "gen_s": 2.1782852606847882,
+          "outputs": [
+            {
+              "idx": 0,
+              "request_id": "0_33c806df-4daa-4730-af3f-7fd4ca0143ff",
+              "size": [
+                1024,
+                1024
+              ]
+            }
+          ]
+        }
+      ],
+      "gen_s": 6.400961805135012,
+      "measured_gen_s": 6.400961805135012,
+      "measured_gen_s_mean": 2.133653935045004,
+      "measured_gen_s_min": 2.1300834426656365,
+      "measured_gen_s_max": 2.1363402139395475,
+      "gen_samples": [
+        {
+          "idx": 0,
+          "gen_s": 2.1345381485298276,
+          "outputs": [
+            {
+              "idx": 0,
+              "request_id": "0_88395eef-80d6-4517-91ee-8c7addbe0636",
+              "output": "/home/lzg/vllm-omni-v023rc1-pr2-stage-20260629/experiments/qwen_smoke/tmp_stage_step_compare/pr1_forward_4step_m00.png",
+              "size": [
+                1024,
+                1024
+              ]
+            }
+          ]
+        },
+        {
+          "idx": 1,
+          "gen_s": 2.1363402139395475,
+          "outputs": [
+            {
+              "idx": 0,
+              "request_id": "0_46769363-0a76-4689-8f54-4ae3d04d54a9",
+              "output": "/home/lzg/vllm-omni-v023rc1-pr2-stage-20260629/experiments/qwen_smoke/tmp_stage_step_compare/pr1_forward_4step_m01.png",
+              "size": [
+                1024,
+                1024
+              ]
+            }
+          ]
+        },
+        {
+          "idx": 2,
+          "gen_s": 2.1300834426656365,
+          "outputs": [
+            {
+              "idx": 0,
+              "request_id": "0_70d8b473-1943-4980-aa9e-8ad38e246373",
+              "output": "/home/lzg/vllm-omni-v023rc1-pr2-stage-20260629/experiments/qwen_smoke/tmp_stage_step_compare/pr1_forward_4step_m02.png",
+              "size": [
+                1024,
+                1024
+              ]
+            }
+          ]
+        }
+      ],
+      "total_s": 73.46019710693508,
+      "output": "/home/lzg/vllm-omni-v023rc1-pr2-stage-20260629/experiments/qwen_smoke/tmp_stage_step_compare/pr1_forward_4step.png",
+      "primary_output": "/home/lzg/vllm-omni-v023rc1-pr2-stage-20260629/experiments/qwen_smoke/tmp_stage_step_compare/pr1_forward_4step_m00.png",
+      "size": [
+        1024,
+        1024
+      ]
+    },
+    "pr2_forward_4step": {
+      "model": "/dataset/models/stage_transfer_profile_models/Qwen_Qwen-Image",
+      "prompt": "a cup of coffee on the table",
+      "height": 1024,
+      "width": 1024,
+      "steps": 4,
+      "seed": 123,
+      "step_execution": false,
+      "stage_configs_path": null,
+      "warmup_runs": 1,
+      "repeats": 3,
+      "num_prompts": 1,
+      "batch_trace": null,
+      "max_num_seqs": 1,
+      "vllm_omni_path": "/home/lzg/vllm-omni-v023rc1-pr2-stage-20260629/vllm_omni/__init__.py",
+      "ok": true,
+      "init_s": 62.81404859852046,
+      "warmup_gen_s": 2.2682892279699445,
+      "warmup_samples": [
+        {
+          "idx": 0,
+          "gen_s": 2.2682892279699445,
+          "outputs": [
+            {
+              "idx": 0,
+              "request_id": "0_04db8246-fdd9-472f-9017-27bcaed1fb14",
+              "size": [
+                1024,
+                1024
+              ]
+            }
+          ]
+        }
+      ],
+      "gen_s": 6.41336761508137,
+      "measured_gen_s": 6.41336761508137,
+      "measured_gen_s_mean": 2.1377892050271234,
+      "measured_gen_s_min": 2.1283800564706326,
+      "measured_gen_s_max": 2.1459510987624526,
+      "gen_samples": [
+        {
+          "idx": 0,
+          "gen_s": 2.1459510987624526,
+          "outputs": [
+            {
+              "idx": 0,
+              "request_id": "0_93f9060c-1651-4086-8a50-bb80593dffab",
+              "output": "/home/lzg/vllm-omni-v023rc1-pr2-stage-20260629/experiments/qwen_smoke/tmp_stage_step_compare/pr2_forward_4step_m00.png",
+              "size": [
+                1024,
+                1024
+              ]
+            }
+          ]
+        },
+        {
+          "idx": 1,
+          "gen_s": 2.1390364598482847,
+          "outputs": [
+            {
+              "idx": 0,
+              "request_id": "0_576300cb-9c14-433a-aa99-41c2d7947125",
+              "output": "/home/lzg/vllm-omni-v023rc1-pr2-stage-20260629/experiments/qwen_smoke/tmp_stage_step_compare/pr2_forward_4step_m01.png",
+              "size": [
+                1024,
+                1024
+              ]
+            }
+          ]
+        },
+        {
+          "idx": 2,
+          "gen_s": 2.1283800564706326,
+          "outputs": [
+            {
+              "idx": 0,
+              "request_id": "0_2cda66c3-6565-4e83-8db3-7be5da7d8528",
+              "output": "/home/lzg/vllm-omni-v023rc1-pr2-stage-20260629/experiments/qwen_smoke/tmp_stage_step_compare/pr2_forward_4step_m02.png",
+              "size": [
+                1024,
+                1024
+              ]
+            }
+          ]
+        }
+      ],
+      "total_s": 73.5400050310418,
+      "output": "/home/lzg/vllm-omni-v023rc1-pr2-stage-20260629/experiments/qwen_smoke/tmp_stage_step_compare/pr2_forward_4step.png",
+      "primary_output": "/home/lzg/vllm-omni-v023rc1-pr2-stage-20260629/experiments/qwen_smoke/tmp_stage_step_compare/pr2_forward_4step_m00.png",
+      "size": [
+        1024,
+        1024
+      ]
+    },
+    "pr2_stage_step_4step": {
+      "model": "/dataset/models/stage_transfer_profile_models/Qwen_Qwen-Image",
+      "prompt": "a cup of coffee on the table",
+      "height": 1024,
+      "width": 1024,
+      "steps": 4,
+      "seed": 123,
+      "step_execution": true,
+      "stage_configs_path": "/home/lzg/vllm-omni-v023rc1-pr2-stage-20260629/experiments/qwen_smoke/qwen_image_stage_split_3stage.yaml",
+      "warmup_runs": 1,
+      "repeats": 3,
+      "num_prompts": 1,
+      "batch_trace": null,
+      "max_num_seqs": 1,
+      "vllm_omni_path": "/home/lzg/vllm-omni-v023rc1-pr2-stage-20260629/vllm_omni/__init__.py",
+      "ok": true,
+      "init_s": 110.69096731487662,
+      "warmup_gen_s": 66.85965631809086,
+      "warmup_samples": [
+        {
+          "idx": 0,
+          "gen_s": 66.85965631809086,
+          "outputs": [
+            {
+              "idx": 0,
+              "request_id": "0_a9aecf71-2358-49e8-b66f-63919f284468",
+              "size": [
+                1024,
+                1024
+              ]
+            }
+          ]
+        }
+      ],
+      "gen_s": 6.6893175765872,
+      "measured_gen_s": 6.6893175765872,
+      "measured_gen_s_mean": 2.2297725255290666,
+      "measured_gen_s_min": 2.2156299697235227,
+      "measured_gen_s_max": 2.2413374483585358,
+      "gen_samples": [
+        {
+          "idx": 0,
+          "gen_s": 2.2323501585051417,
+          "outputs": [
+            {
+              "idx": 0,
+              "request_id": "0_a3843ae7-82c7-457d-bda2-27e2fa2879f4",
+              "output": "/home/lzg/vllm-omni-v023rc1-pr2-stage-20260629/experiments/qwen_smoke/tmp_stage_step_compare/pr2_stage_step_4step_m00.png",
+              "size": [
+                1024,
+                1024
+              ]
+            }
+          ]
+        },
+        {
+          "idx": 1,
+          "gen_s": 2.2156299697235227,
+          "outputs": [
+            {
+              "idx": 0,
+              "request_id": "0_e8a4ffcc-d826-47b4-a557-71dabc6c1d2a",
+              "output": "/home/lzg/vllm-omni-v023rc1-pr2-stage-20260629/experiments/qwen_smoke/tmp_stage_step_compare/pr2_stage_step_4step_m01.png",
+              "size": [
+                1024,
+                1024
+              ]
+            }
+          ]
+        },
+        {
+          "idx": 2,
+          "gen_s": 2.2413374483585358,
+          "outputs": [
+            {
+              "idx": 0,
+              "request_id": "0_be4442b2-e890-4f7c-9a75-c381b4223a39",
+              "output": "/home/lzg/vllm-omni-v023rc1-pr2-stage-20260629/experiments/qwen_smoke/tmp_stage_step_compare/pr2_stage_step_4step_m02.png",
+              "size": [
+                1024,
+                1024
+              ]
+            }
+          ]
+        }
+      ],
+      "total_s": 186.2977024372667,
+      "output": "/home/lzg/vllm-omni-v023rc1-pr2-stage-20260629/experiments/qwen_smoke/tmp_stage_step_compare/pr2_stage_step_4step.png",
+      "primary_output": "/home/lzg/vllm-omni-v023rc1-pr2-stage-20260629/experiments/qwen_smoke/tmp_stage_step_compare/pr2_stage_step_4step_m00.png",
+      "size": [
+        1024,
+        1024
+      ]
+    },
+    "clean_forward_20step": {
+      "model": "/dataset/models/stage_transfer_profile_models/Qwen_Qwen-Image",
+      "prompt": "a cup of coffee on the table",
+      "height": 1024,
+      "width": 1024,
+      "steps": 20,
+      "seed": 123,
+      "step_execution": false,
+      "stage_configs_path": null,
+      "warmup_runs": 1,
+      "repeats": 3,
+      "num_prompts": 1,
+      "batch_trace": null,
+      "max_num_seqs": 1,
+      "vllm_omni_path": "/home/lzg/vllm-omni-v023rc1-original-baseline-20260626/vllm_omni/__init__.py",
+      "ok": true,
+      "init_s": 63.60304389614612,
+      "warmup_gen_s": 9.425398238934577,
+      "warmup_samples": [
+        {
+          "idx": 0,
+          "gen_s": 9.425398238934577,
+          "outputs": [
+            {
+              "idx": 0,
+              "request_id": "0_55f634f9-b35d-4936-a72a-005453ec1c40",
+              "size": [
+                1024,
+                1024
+              ]
+            }
+          ]
+        }
+      ],
+      "gen_s": 28.244244929403067,
+      "measured_gen_s": 28.244244929403067,
+      "measured_gen_s_mean": 9.414748309801022,
+      "measured_gen_s_min": 9.401919105090201,
+      "measured_gen_s_max": 9.434641043655574,
+      "gen_samples": [
+        {
+          "idx": 0,
+          "gen_s": 9.401919105090201,
+          "outputs": [
+            {
+              "idx": 0,
+              "request_id": "0_4ecbb738-4a3d-48f6-b2a3-27e7e0044103",
+              "output": "/home/lzg/vllm-omni-v023rc1-pr2-stage-20260629/experiments/qwen_smoke/tmp_stage_step_compare/clean_forward_20step_m00.png",
+              "size": [
+                1024,
+                1024
+              ]
+            }
+          ]
+        },
+        {
+          "idx": 1,
+          "gen_s": 9.434641043655574,
+          "outputs": [
+            {
+              "idx": 0,
+              "request_id": "0_f051fecd-9f4b-416b-9715-342ebfc429db",
+              "output": "/home/lzg/vllm-omni-v023rc1-pr2-stage-20260629/experiments/qwen_smoke/tmp_stage_step_compare/clean_forward_20step_m01.png",
+              "size": [
+                1024,
+                1024
+              ]
+            }
+          ]
+        },
+        {
+          "idx": 2,
+          "gen_s": 9.407684780657291,
+          "outputs": [
+            {
+              "idx": 0,
+              "request_id": "0_be78f137-fa1a-4680-bf62-4ac954b8ae4f",
+              "output": "/home/lzg/vllm-omni-v023rc1-pr2-stage-20260629/experiments/qwen_smoke/tmp_stage_step_compare/clean_forward_20step_m02.png",
+              "size": [
+                1024,
+                1024
+              ]
+            }
+          ]
+        }
+      ],
+      "total_s": 103.24753363896161,
+      "output": "/home/lzg/vllm-omni-v023rc1-pr2-stage-20260629/experiments/qwen_smoke/tmp_stage_step_compare/clean_forward_20step.png",
+      "primary_output": "/home/lzg/vllm-omni-v023rc1-pr2-stage-20260629/experiments/qwen_smoke/tmp_stage_step_compare/clean_forward_20step_m00.png",
+      "size": [
+        1024,
+        1024
+      ]
+    },
+    "pr1_forward_20step": {
+      "model": "/dataset/models/stage_transfer_profile_models/Qwen_Qwen-Image",
+      "prompt": "a cup of coffee on the table",
+      "height": 1024,
+      "width": 1024,
+      "steps": 20,
+      "seed": 123,
+      "step_execution": false,
+      "stage_configs_path": null,
+      "warmup_runs": 1,
+      "repeats": 3,
+      "num_prompts": 1,
+      "batch_trace": null,
+      "max_num_seqs": 1,
+      "vllm_omni_path": "/home/lzg/vllm-omni-v023rc1-pr1-pipeline-20260629/vllm_omni/__init__.py",
+      "ok": true,
+      "init_s": 62.23185417987406,
+      "warmup_gen_s": 9.40747875161469,
+      "warmup_samples": [
+        {
+          "idx": 0,
+          "gen_s": 9.40747875161469,
+          "outputs": [
+            {
+              "idx": 0,
+              "request_id": "0_9da11396-b412-4860-a861-dd36c3bbda7d",
+              "size": [
+                1024,
+                1024
+              ]
+            }
+          ]
+        }
+      ],
+      "gen_s": 28.19988005887717,
+      "measured_gen_s": 28.19988005887717,
+      "measured_gen_s_mean": 9.399960019625723,
+      "measured_gen_s_min": 9.396482887677848,
+      "measured_gen_s_max": 9.406873242929578,
+      "gen_samples": [
+        {
+          "idx": 0,
+          "gen_s": 9.396482887677848,
+          "outputs": [
+            {
+              "idx": 0,
+              "request_id": "0_c327f83e-1914-4ff1-876d-ecf76335cef9",
+              "output": "/home/lzg/vllm-omni-v023rc1-pr2-stage-20260629/experiments/qwen_smoke/tmp_stage_step_compare/pr1_forward_20step_m00.png",
+              "size": [
+                1024,
+                1024
+              ]
+            }
+          ]
+        },
+        {
+          "idx": 1,
+          "gen_s": 9.396523928269744,
+          "outputs": [
+            {
+              "idx": 0,
+              "request_id": "0_da343396-6db0-44da-8868-2456d077db9d",
+              "output": "/home/lzg/vllm-omni-v023rc1-pr2-stage-20260629/experiments/qwen_smoke/tmp_stage_step_compare/pr1_forward_20step_m01.png",
+              "size": [
+                1024,
+                1024
+              ]
+            }
+          ]
+        },
+        {
+          "idx": 2,
+          "gen_s": 9.406873242929578,
+          "outputs": [
+            {
+              "idx": 0,
+              "request_id": "0_c11ae9ce-ef68-460c-8fca-145f7c2e2c8f",
+              "output": "/home/lzg/vllm-omni-v023rc1-pr2-stage-20260629/experiments/qwen_smoke/tmp_stage_step_compare/pr1_forward_20step_m02.png",
+              "size": [
+                1024,
+                1024
+              ]
+            }
+          ]
+        }
+      ],
+      "total_s": 101.82436015736312,
+      "output": "/home/lzg/vllm-omni-v023rc1-pr2-stage-20260629/experiments/qwen_smoke/tmp_stage_step_compare/pr1_forward_20step.png",
+      "primary_output": "/home/lzg/vllm-omni-v023rc1-pr2-stage-20260629/experiments/qwen_smoke/tmp_stage_step_compare/pr1_forward_20step_m00.png",
+      "size": [
+        1024,
+        1024
+      ]
+    },
+    "pr2_forward_20step": {
+      "model": "/dataset/models/stage_transfer_profile_models/Qwen_Qwen-Image",
+      "prompt": "a cup of coffee on the table",
+      "height": 1024,
+      "width": 1024,
+      "steps": 20,
+      "seed": 123,
+      "step_execution": false,
+      "stage_configs_path": null,
+      "warmup_runs": 1,
+      "repeats": 3,
+      "num_prompts": 1,
+      "batch_trace": null,
+      "max_num_seqs": 1,
+      "vllm_omni_path": "/home/lzg/vllm-omni-v023rc1-pr2-stage-20260629/vllm_omni/__init__.py",
+      "ok": true,
+      "init_s": 62.7536445716396,
+      "warmup_gen_s": 9.452593893744051,
+      "warmup_samples": [
+        {
+          "idx": 0,
+          "gen_s": 9.452593893744051,
+          "outputs": [
+            {
+              "idx": 0,
+              "request_id": "0_bc057cd6-6c07-44b7-a546-c8dd29a752aa",
+              "size": [
+                1024,
+                1024
+              ]
+            }
+          ]
+        }
+      ],
+      "gen_s": 28.342722854577005,
+      "measured_gen_s": 28.342722854577005,
+      "measured_gen_s_mean": 9.447574284859002,
+      "measured_gen_s_min": 9.443028525449336,
+      "measured_gen_s_max": 9.45139777008444,
+      "gen_samples": [
+        {
+          "idx": 0,
+          "gen_s": 9.443028525449336,
+          "outputs": [
+            {
+              "idx": 0,
+              "request_id": "0_a127199b-60ac-4807-9cad-1a0a455d461d",
+              "output": "/home/lzg/vllm-omni-v023rc1-pr2-stage-20260629/experiments/qwen_smoke/tmp_stage_step_compare/pr2_forward_20step_m00.png",
+              "size": [
+                1024,
+                1024
+              ]
+            }
+          ]
+        },
+        {
+          "idx": 1,
+          "gen_s": 9.45139777008444,
+          "outputs": [
+            {
+              "idx": 0,
+              "request_id": "0_a7612fef-94dd-4152-8cb9-0f5588f7746e",
+              "output": "/home/lzg/vllm-omni-v023rc1-pr2-stage-20260629/experiments/qwen_smoke/tmp_stage_step_compare/pr2_forward_20step_m01.png",
+              "size": [
+                1024,
+                1024
+              ]
+            }
+          ]
+        },
+        {
+          "idx": 2,
+          "gen_s": 9.448296559043229,
+          "outputs": [
+            {
+              "idx": 0,
+              "request_id": "0_c9873163-8273-48f8-b335-786afceb2cd2",
+              "output": "/home/lzg/vllm-omni-v023rc1-pr2-stage-20260629/experiments/qwen_smoke/tmp_stage_step_compare/pr2_forward_20step_m02.png",
+              "size": [
+                1024,
+                1024
+              ]
+            }
+          ]
+        }
+      ],
+      "total_s": 102.53095534257591,
+      "output": "/home/lzg/vllm-omni-v023rc1-pr2-stage-20260629/experiments/qwen_smoke/tmp_stage_step_compare/pr2_forward_20step.png",
+      "primary_output": "/home/lzg/vllm-omni-v023rc1-pr2-stage-20260629/experiments/qwen_smoke/tmp_stage_step_compare/pr2_forward_20step_m00.png",
+      "size": [
+        1024,
+        1024
+      ]
+    },
+    "pr2_stage_step_20step": {
+      "model": "/dataset/models/stage_transfer_profile_models/Qwen_Qwen-Image",
+      "prompt": "a cup of coffee on the table",
+      "height": 1024,
+      "width": 1024,
+      "steps": 20,
+      "seed": 123,
+      "step_execution": true,
+      "stage_configs_path": "/home/lzg/vllm-omni-v023rc1-pr2-stage-20260629/experiments/qwen_smoke/qwen_image_stage_split_3stage.yaml",
+      "warmup_runs": 1,
+      "repeats": 3,
+      "num_prompts": 1,
+      "batch_trace": null,
+      "max_num_seqs": 1,
+      "vllm_omni_path": "/home/lzg/vllm-omni-v023rc1-pr2-stage-20260629/vllm_omni/__init__.py",
+      "ok": true,
+      "init_s": 110.92873005289584,
+      "warmup_gen_s": 73.98455945588648,
+      "warmup_samples": [
+        {
+          "idx": 0,
+          "gen_s": 73.98455945588648,
+          "outputs": [
+            {
+              "idx": 0,
+              "request_id": "0_5eb7a4a2-d815-4232-9195-36b582d0e945",
+              "size": [
+                1024,
+                1024
+              ]
+            }
+          ]
+        }
+      ],
+      "gen_s": 28.640524787828326,
+      "measured_gen_s": 28.640524787828326,
+      "measured_gen_s_mean": 9.546841595942775,
+      "measured_gen_s_min": 9.537266901694238,
+      "measured_gen_s_max": 9.554120718501508,
+      "gen_samples": [
+        {
+          "idx": 0,
+          "gen_s": 9.554120718501508,
+          "outputs": [
+            {
+              "idx": 0,
+              "request_id": "0_ddcf3098-fafe-46fc-9b32-1a6ca5cccda2",
+              "output": "/home/lzg/vllm-omni-v023rc1-pr2-stage-20260629/experiments/qwen_smoke/tmp_stage_step_compare/pr2_stage_step_20step_m00.png",
+              "size": [
+                1024,
+                1024
+              ]
+            }
+          ]
+        },
+        {
+          "idx": 1,
+          "gen_s": 9.54913716763258,
+          "outputs": [
+            {
+              "idx": 0,
+              "request_id": "0_4cb82b25-c061-48cb-92a1-892940541ba0",
+              "output": "/home/lzg/vllm-omni-v023rc1-pr2-stage-20260629/experiments/qwen_smoke/tmp_stage_step_compare/pr2_stage_step_20step_m01.png",
+              "size": [
+                1024,
+                1024
+              ]
+            }
+          ]
+        },
+        {
+          "idx": 2,
+          "gen_s": 9.537266901694238,
+          "outputs": [
+            {
+              "idx": 0,
+              "request_id": "0_cf77fd67-b425-42a4-a17c-0b8c92e30d99",
+              "output": "/home/lzg/vllm-omni-v023rc1-pr2-stage-20260629/experiments/qwen_smoke/tmp_stage_step_compare/pr2_stage_step_20step_m02.png",
+              "size": [
+                1024,
+                1024
+              ]
+            }
+          ]
+        }
+      ],
+      "total_s": 215.5416391119361,
+      "output": "/home/lzg/vllm-omni-v023rc1-pr2-stage-20260629/experiments/qwen_smoke/tmp_stage_step_compare/pr2_stage_step_20step.png",
+      "primary_output": "/home/lzg/vllm-omni-v023rc1-pr2-stage-20260629/experiments/qwen_smoke/tmp_stage_step_compare/pr2_stage_step_20step_m00.png",
+      "size": [
+        1024,
+        1024
+      ]
+    }
+  }
+}
