@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import asyncio
+import inspect
 import time
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import asdict, dataclass
@@ -14,6 +15,11 @@ from vllm_omni.inputs.data import OmniDiffusionSamplingParams
 
 pytestmark = [pytest.mark.core_model, pytest.mark.diffusion, pytest.mark.cpu]
 
+
+def test_stage_dit_transport_has_no_execute_dit_fallback():
+    source = inspect.getsource(StageDiffusionProc.run_loop)
+
+    assert '"execute_dit"' not in source
 
 def test_process_batch_request_preserves_parent_request_id_and_kv_sender_info():
     async def run_test():
@@ -54,6 +60,7 @@ def test_process_batch_request_preserves_parent_request_id_and_kv_sender_info():
 
         proc = object.__new__(StageDiffusionProc)
         proc._engine = SimpleNamespace(step=step)
+        proc._od_config = SimpleNamespace(streaming_output=False)
         proc._executor = ThreadPoolExecutor(max_workers=1)
 
         try:

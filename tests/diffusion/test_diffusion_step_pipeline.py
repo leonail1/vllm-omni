@@ -3,6 +3,7 @@
 """Tests for step-level diffusion execution across runner / worker / executor / engine."""
 
 import contextlib
+import inspect
 import os
 import queue
 import threading
@@ -14,6 +15,7 @@ import torch
 from pytest_mock import MockerFixture
 
 import vllm_omni.diffusion.worker.diffusion_model_runner as model_runner_module
+import vllm_omni.diffusion.diffusion_engine as diffusion_engine_module
 from tests.helpers.mark import hardware_test
 from vllm_omni.diffusion.data import DiffusionOutput
 from vllm_omni.diffusion.diffusion_engine import DiffusionEngine
@@ -31,7 +33,7 @@ from vllm_omni.diffusion.ipc import (
     unpack_diffusion_output_shm,
 )
 from vllm_omni.diffusion.request import OmniDiffusionRequest
-from vllm_omni.diffusion.sched import StepScheduler
+from vllm_omni.diffusion.sched import RequestScheduler, StepScheduler
 from vllm_omni.diffusion.sched.interface import (
     CachedRequestData,
     DiffusionSchedulerOutput,
@@ -39,8 +41,9 @@ from vllm_omni.diffusion.sched.interface import (
 )
 from vllm_omni.diffusion.worker.diffusion_model_runner import DiffusionModelRunner
 from vllm_omni.diffusion.worker.diffusion_worker import DiffusionWorker
-from vllm_omni.diffusion.worker.utils import RunnerOutput
+from vllm_omni.diffusion.worker.utils import BatchRunnerOutput, DiffusionRequestState, RunnerOutput
 from vllm_omni.engine.async_omni_engine import AsyncOmniEngine
+from vllm_omni.engine.stage_pool import StagePool
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams
 from vllm_omni.platforms import current_omni_platform
 
@@ -79,6 +82,13 @@ class _StepPipeline:
         state.latents = torch.tensor([0.0])
         state.prompt_embeds = torch.tensor([[0.0, 0.0], [1.0, 1.0]])
         return state
+
+    def _state_from_request(self, req):
+        return DiffusionRequestState(
+            request_id=req.request_id,
+            sampling=req.sampling_params,
+            prompts=req.prompts,
+        )
 
     def denoise_stage(self, input_batch):
         self.denoise_calls += 1
@@ -200,12 +210,7 @@ def _make_step_request(num_inference_steps: int = 2):
     return SimpleNamespace(
         prompts=["a prompt"],
         request_id="req-1",
-        sampling_params=SimpleNamespace(
-            generator=None,
-            seed=None,
-            generator_device=None,
-            num_inference_steps=num_inference_steps,
-        ),
+        sampling_params=OmniDiffusionSamplingParams(num_inference_steps=num_inference_steps),
     )
 
 
@@ -235,31 +240,28 @@ def _make_vllm_config():
     )
 
 
-def _make_runner():
-    runner = object.__new__(DiffusionModelRunner)
+def _make_v2_runner(
+    *,
+    step_execution: bool = True,
+    stage_split: bool = False,
+    stage_role: str = "all",
+    pipeline=None,
+    device: torch.device | None = None,
+):
+    from vllm_omni.diffusion.worker.diffusion_model_runner_v2 import DiffusionModelRunnerV2
+
+    runner = object.__new__(DiffusionModelRunnerV2)
     runner.vllm_config = _make_vllm_config()
     runner.od_config = SimpleNamespace(
         cache_backend=None,
         parallel_config=SimpleNamespace(use_hsdp=False),
+        step_execution=step_execution,
+        stage_split=stage_split,
+        stage_role=stage_role,
+        streaming_output=False,
     )
-    runner.device = torch.device("cpu")
-    runner.pipeline = _StepPipeline()
-    runner.cache_backend = None
-    runner.offload_backend = None
-    runner.state_cache = {}
-    runner.kv_transfer_manager = SimpleNamespace()
-    return runner
-
-
-def _make_distributed_runner(mode: str, device: torch.device):
-    runner = object.__new__(DiffusionModelRunner)
-    runner.vllm_config = _make_vllm_config()
-    runner.od_config = SimpleNamespace(
-        cache_backend=None,
-        parallel_config=SimpleNamespace(use_hsdp=False),
-    )
-    runner.device = device
-    runner.pipeline = _DistributedStepPipeline(mode=mode, device=device)
+    runner.device = torch.device("cpu") if device is None else device
+    runner.pipeline = _StepPipeline() if pipeline is None else pipeline
     runner.cache_backend = None
     runner.offload_backend = None
     runner.state_cache = {}
@@ -347,16 +349,41 @@ def _distributed_step_worker(local_rank: int, world_size: int, mode: str, master
         else:
             raise ValueError(f"Unsupported distributed test mode: {mode}")
 
-        runner = _make_distributed_runner(mode, device)
-        result = DiffusionModelRunner.execute_stepwise(
-            runner,
-            _make_scheduler_output(_make_step_request(num_inference_steps=1), step_id=0),
+        from vllm_omni.diffusion.worker import diffusion_model_runner_v2 as model_runner_v2_module
+
+        model_runner_v2_module.set_forward_context = _noop_forward_context
+        encode_pipeline = _DistributedStepPipeline(mode=mode, device=device)
+        state = DiffusionRequestState(
+            request_id="req-1",
+            sampling=_make_step_request(num_inference_steps=1).sampling_params,
+            prompts=["a prompt"],
         )
+        encode_pipeline.encode_stage(state)
+        encode_payload = state.to_transport("encode_to_dit")
+
+        runner = _make_v2_runner(
+            step_execution=True,
+            stage_split=True,
+            stage_role="dit",
+            pipeline=_DistributedStepPipeline(mode=mode, device=device),
+            device=device,
+        )
+        transport_request = _make_step_request(num_inference_steps=1)
+        transport_request.stage_transport_payload = encode_payload
+        result = runner.execute_stepwise(_make_scheduler_output(transport_request, step_id=0))
         output = result.get_request_output("req-1")
 
         assert output.finished is True
         assert output.result is not None
-        torch.testing.assert_close(output.result.output, _expected_output_for_mode(mode), rtol=1e-5, atol=1e-5)
+        decode_runner = _make_v2_runner(
+            step_execution=True,
+            stage_split=True,
+            stage_role="decode",
+            pipeline=_DistributedStepPipeline(mode=mode, device=device),
+            device=device,
+        )
+        final_output = decode_runner.execute_decode(output.result.custom_output["stage_transport"])
+        torch.testing.assert_close(final_output.output, _expected_output_for_mode(mode), rtol=1e-5, atol=1e-5)
         assert "req-1" not in runner.state_cache
     finally:
         destroy_distributed_env()
@@ -369,131 +396,79 @@ def _distributed_step_worker(local_rank: int, world_size: int, mode: str, master
 
 @pytest.mark.cpu
 class TestRunner:
-    """DiffusionModelRunner.execute_stepwise"""
+    """Legacy DiffusionModelRunner step-only path is no longer valid."""
 
-    def test_completes_request_and_clears_state(self, monkeypatch):
-        runner = _make_runner()
-        req = _make_step_request()
-        monkeypatch.setattr(model_runner_module, "set_forward_context", _noop_forward_context)
+    def test_standalone_stepwise_method_is_removed(self):
+        assert not hasattr(DiffusionModelRunner, "execute_stepwise")
 
-        result = DiffusionModelRunner.execute_stepwise(runner, _make_scheduler_output(req, step_id=0))
-        first = result.get_request_output("req-1")
-        assert first.request_id == "req-1"
-        assert first.step_index == 1
-        assert first.finished is False
-        assert first.result is None
-        assert "req-1" in runner.state_cache
 
-        result = DiffusionModelRunner.execute_stepwise(runner, _make_cached_scheduler_output(step_id=1))
-        second = result.get_request_output("req-1")
-        assert second.request_id == "req-1"
-        assert second.step_index == 2
-        assert second.finished is True
-        assert second.result is not None
-        assert second.result.error is None
-        assert torch.equal(second.result.output, torch.tensor([2.0]))
-        assert "req-1" not in runner.state_cache
+@pytest.mark.cpu
+class TestRunnerV2:
+    """DiffusionModelRunnerV2 stage-split routing."""
 
-        assert runner.pipeline.prepare_calls == 1
-        assert runner.pipeline.denoise_calls == 2
-        assert runner.pipeline.scheduler_calls == 2
-        assert runner.pipeline.decode_calls == 1
+    def test_state_transport_moves_sampling_tensors_out_of_sampling_metadata(self):
+        sampling = OmniDiffusionSamplingParams()
+        sampling.latents = torch.tensor([[1.0]])
+        sampling.image_latent = torch.tensor([[2.0]])
+        sampling.trajectory_timesteps = [torch.tensor([3.0])]
+        sampling.output = torch.tensor([[4.0]])
+        state = DiffusionRequestState(request_id="req-1", sampling=sampling, prompts=["prompt"])
+        state.latents = torch.tensor([[5.0]])
+        state.timesteps = torch.tensor([6.0])
 
-    def test_rejects_multi_request_step_batch(self):
-        runner = _make_runner()
-        req_1 = _make_step_request()
-        req_2 = _make_step_request()
-        req_2.request_id = "req-2"
+        payload = state.to_transport("encode_to_dit")
 
-        scheduler_output = DiffusionSchedulerOutput(
-            step_id=0,
-            scheduled_new_reqs=[
-                NewRequestData(request_id="req-1", req=req_1),
-                NewRequestData(request_id="req-2", req=req_2),
-            ],
-            scheduled_cached_reqs=CachedRequestData.make_empty(),
-            finished_req_ids=set(),
-            num_running_reqs=2,
-            num_waiting_reqs=0,
-        )
+        assert payload.sampling.generator is None
+        assert payload.sampling.latents is None
+        assert payload.sampling.image_latent is None
+        assert payload.sampling.trajectory_timesteps is None
+        assert payload.sampling.output is None
+        assert torch.equal(payload.tensors["sampling.latents"], torch.tensor([[1.0]]))
+        assert torch.equal(payload.tensors["sampling.image_latent"], torch.tensor([[2.0]]))
+        assert torch.equal(payload.tensors["sampling.trajectory_timesteps"][0], torch.tensor([3.0]))
+        assert torch.equal(payload.tensors["sampling.output"], torch.tensor([[4.0]]))
 
-        result = DiffusionModelRunner.execute_stepwise(runner, scheduler_output)
-        assert len(result) == 2
+        restored = DiffusionRequestState.from_transport(payload, device=torch.device("cpu"))
 
-    def test_rejects_missing_cached_state(self):
-        runner = _make_runner()
+        assert torch.equal(restored.sampling.latents, torch.tensor([[1.0]]))
+        assert torch.equal(restored.sampling.image_latent, torch.tensor([[2.0]]))
+        assert torch.equal(restored.sampling.trajectory_timesteps[0], torch.tensor([3.0]))
+        assert torch.equal(restored.sampling.output, torch.tensor([[4.0]]))
 
-        with pytest.raises(ValueError, match="Missing cached state"):
-            DiffusionModelRunner.execute_stepwise(runner, _make_cached_scheduler_output(request_id="req-missing"))
+    def test_stage_pool_requires_stage_transport_key(self):
+        payload = {"state": "encoded"}
 
-    def test_interrupt_marks_request_finished_and_clears_state(self, monkeypatch):
-        runner = _make_runner()
-        runner.pipeline = _InterruptingStepPipeline()
-        req = _make_step_request()
-        monkeypatch.setattr(model_runner_module, "set_forward_context", _noop_forward_context)
+        assert StagePool._extract_stage_transport_payload({"stage_transport": payload}) is payload
+        with pytest.raises(ValueError, match="stage_transport"):
+            StagePool._extract_stage_transport_payload({"payload": payload})
 
-        result = DiffusionModelRunner.execute_stepwise(runner, _make_scheduler_output(req, step_id=0))
-        output = result.get_request_output("req-1")
-        assert output.request_id == "req-1"
-        assert output.step_index == 0
-        assert output.finished is True
-        assert output.result is not None
-        assert output.result.error == "stepwise denoise interrupted"
-        assert "req-1" not in runner.state_cache
-        assert runner.pipeline.prepare_calls == 1
-        assert runner.pipeline.denoise_calls == 1
-        assert runner.pipeline.scheduler_calls == 0
-        assert runner.pipeline.decode_calls == 0
+    def test_stage_step_runs_encode_dit_decode_transport(self, monkeypatch):
+        encode_runner = _make_v2_runner(step_execution=True, stage_split=True, stage_role="encode")
+        dit_runner = _make_v2_runner(step_execution=True, stage_split=True, stage_role="dit")
+        decode_runner = _make_v2_runner(step_execution=True, stage_split=True, stage_role="decode")
+        monkeypatch.setattr("vllm_omni.diffusion.worker.diffusion_model_runner_v2.set_forward_context", _noop_forward_context)
 
-    def test_load_model_rejects_unsupported_step_execution(self, monkeypatch):
-        class _RequestOnlyPipeline:
-            pass
+        encode_payload = encode_runner.execute_encode(_make_engine_request("req-1", num_inference_steps=2))
+        assert encode_payload.boundary == "encode_to_dit"
 
-        class _FakeLoader:
-            def __init__(self, *args, **kwargs):
-                del args, kwargs
+        transport_request = _make_engine_request("req-1", num_inference_steps=2)
+        transport_request.stage_transport_payload = encode_payload
+        first_step = dit_runner.execute_stepwise(_make_scheduler_output(transport_request))
+        assert first_step.get_request_output("req-1").finished is False
 
-            def load_model(self, **kwargs):
-                del kwargs
-                return _RequestOnlyPipeline()
+        second_step = dit_runner.execute_stepwise(_make_cached_scheduler_output(request_id="req-1", step_id=1))
+        dit_output = second_step.get_request_output("req-1")
+        assert dit_output.finished is True
+        dit_payload = dit_output.result.custom_output["stage_transport"]
+        assert dit_payload.boundary == "dit_to_decode"
 
-        class _FakeProfiler:
-            consumed_memory = 0
-
-            def __enter__(self):
-                return self
-
-            def __exit__(self, exc_type, exc, tb):
-                del exc_type, exc, tb
-                return False
-
-        runner = object.__new__(DiffusionModelRunner)
-        runner.vllm_config = _make_vllm_config()
-        runner.od_config = SimpleNamespace(
-            enable_cpu_offload=False,
-            enable_layerwise_offload=False,
-            enforce_eager=True,
-            cache_backend=None,
-            cache_config=None,
-            step_execution=True,
-            model_class_name="RequestOnlyPipeline",
-            parallel_config=SimpleNamespace(use_hsdp=False),
-        )
-        runner.device = torch.device("cpu")
-        runner.pipeline = None
-        runner.cache_backend = None
-        runner.offload_backend = None
-        runner.state_cache = {}
-        runner.kv_transfer_manager = SimpleNamespace()
-
-        monkeypatch.setattr(model_runner_module, "DiffusersPipelineLoader", _FakeLoader)
-        monkeypatch.setattr(model_runner_module, "DeviceMemoryProfiler", _FakeProfiler)
-        monkeypatch.setattr(model_runner_module, "get_offload_backend", lambda *args, **kwargs: None)
-        monkeypatch.setattr(model_runner_module, "get_cache_backend", lambda *args, **kwargs: None)
-
-        with pytest.raises(ValueError, match="RequestOnlyPipeline"):
-            DiffusionModelRunner.load_model(runner)
-
+        output = decode_runner.execute_decode(dit_payload)
+        assert output.error is None
+        assert torch.equal(output.output, torch.tensor([2.0]))
+        assert encode_runner.pipeline.prepare_calls == 1
+        assert dit_runner.pipeline.denoise_calls == 2
+        assert dit_runner.pipeline.scheduler_calls == 2
+        assert decode_runner.pipeline.decode_calls == 1
 
 class _RecordingLoRAManager:
     def __init__(self) -> None:
@@ -641,6 +616,119 @@ class TestExecutor:
 class TestEngine:
     """Step-execution paths in DiffusionEngine.add_req_and_wait_for_response"""
 
+    def _patch_engine_init(self, monkeypatch):
+        monkeypatch.setattr(diffusion_engine_module, "get_diffusion_post_process_func", lambda _: None)
+        monkeypatch.setattr(diffusion_engine_module, "get_diffusion_action_post_process_func", lambda _: None)
+        monkeypatch.setattr(diffusion_engine_module, "get_diffusion_pre_process_func", lambda _: None)
+        monkeypatch.setattr(DiffusionEngine, "_dummy_run", lambda self: None)
+
+        class _Executor:
+            def __init__(self, od_config):
+                self.od_config = od_config
+
+            def execute_step(self, scheduler_output):
+                del scheduler_output
+                return BatchRunnerOutput(outputs=[])
+
+            def execute_request(self, request):
+                del request
+                return RunnerOutput(request_id="req-1", result=DiffusionOutput(output=torch.tensor([1.0])))
+
+        monkeypatch.setattr(diffusion_engine_module.DiffusionExecutor, "get_class", lambda _: _Executor)
+
+        return _Executor
+
+    @pytest.mark.parametrize(
+        ("step_execution", "stage_split"),
+        [(True, False), (False, True)],
+    )
+    def test_stage_step_flags_must_match(self, monkeypatch, step_execution, stage_split):
+        self._patch_engine_init(monkeypatch)
+        config = SimpleNamespace(
+            step_execution=step_execution,
+            stage_split=stage_split,
+            stage_role="dit",
+            streaming_output=False,
+        )
+
+        with pytest.raises(ValueError, match="stage_split and step_execution"):
+            DiffusionEngine(config)
+
+    def test_stage_split_with_step_uses_step_scheduler(self, monkeypatch):
+        executor_cls = self._patch_engine_init(monkeypatch)
+        config = SimpleNamespace(
+            step_execution=True,
+            stage_split=True,
+            stage_role="dit",
+            streaming_output=False,
+        )
+
+        engine = DiffusionEngine(config)
+
+        assert config.step_execution is True
+        assert engine.step_execution is True
+        assert engine.stepwise_execution is True
+        assert isinstance(engine.scheduler, StepScheduler)
+        assert engine.execute_fn.__self__ is engine.executor
+        assert engine.execute_fn.__func__ is executor_cls.execute_step
+
+    @pytest.mark.parametrize("stage_role", ["encode", "decode"])
+    def test_split_encode_decode_roles_reject_scheduler_execution(self, monkeypatch, stage_role):
+        self._patch_engine_init(monkeypatch)
+        config = SimpleNamespace(
+            step_execution=True,
+            stage_split=True,
+            stage_role=stage_role,
+            streaming_output=False,
+        )
+
+        engine = DiffusionEngine(config)
+
+        assert engine.stepwise_execution is False
+        assert isinstance(engine.scheduler, RequestScheduler)
+        with pytest.raises(RuntimeError, match=stage_role):
+            engine.execute_fn(_make_scheduler_output(_make_step_request()))
+
+    def test_normal_mode_uses_request_scheduler(self, monkeypatch):
+        executor_cls = self._patch_engine_init(monkeypatch)
+        config = SimpleNamespace(
+            step_execution=False,
+            stage_split=False,
+            stage_role="all",
+            streaming_output=False,
+        )
+
+        engine = DiffusionEngine(config)
+
+        assert engine.stepwise_execution is False
+        assert isinstance(engine.scheduler, RequestScheduler)
+        assert engine.execute_fn.__self__ is engine.executor
+        assert engine.execute_fn.__func__ is executor_cls.execute_request
+
+    def test_non_split_rejects_stage_role(self, monkeypatch):
+        self._patch_engine_init(monkeypatch)
+        config = SimpleNamespace(
+            step_execution=False,
+            stage_split=False,
+            stage_role="dit",
+            streaming_output=False,
+        )
+
+        with pytest.raises(ValueError, match="stage_role must be 'all'"):
+            DiffusionEngine(config)
+
+    def test_split_rejects_all_role(self, monkeypatch):
+        self._patch_engine_init(monkeypatch)
+        config = SimpleNamespace(
+            step_execution=True,
+            stage_split=True,
+            stage_role="all",
+            streaming_output=False,
+        )
+
+        with pytest.raises(ValueError, match="stage_split=True requires stage_role"):
+            DiffusionEngine(config)
+
     @pytest.mark.parametrize(
         ("execute_fn", "expected_error"),
         [
@@ -785,25 +873,79 @@ class TestIPC:
 class TestSupportedPipelines:
     """Step-execution protocol checks for supported pipelines."""
 
-    def test_default_stage_config_includes_step_execution(self):
-        stage_cfg = AsyncOmniEngine._create_default_diffusion_stage_cfg(
-            {
-                "step_execution": True,
-            }
-        )[0]
+    def test_top_level_step_execution_requires_stage_config(self):
+        with pytest.raises(ValueError, match="step_execution=True requires"):
+            AsyncOmniEngine._validate_diffusion_stage_step_configs(
+                [],
+                stage_configs_path=None,
+                top_level_step_execution=True,
+            )
 
-        assert stage_cfg["engine_args"]["step_execution"] is True
+    def test_diffusion_stage_config_requires_lockstep_fields(self):
+        stage_cfg = SimpleNamespace(
+            stage_type="diffusion",
+            engine_args=SimpleNamespace(step_execution=True, stage_split=False, stage_role="all"),
+        )
+
+        with pytest.raises(ValueError, match="step_execution=True requires stage_split=True"):
+            AsyncOmniEngine._validate_diffusion_stage_step_configs(
+                [stage_cfg],
+                stage_configs_path="dummy.yaml",
+                top_level_step_execution=False,
+            )
+
+    def test_diffusion_stage_config_accepts_stage_step_roles(self):
+        stage_cfgs = [
+            SimpleNamespace(
+                stage_type="diffusion",
+                engine_args=SimpleNamespace(step_execution=True, stage_split=True, stage_role=role),
+            )
+            for role in ("encode", "dit", "decode")
+        ]
+
+        AsyncOmniEngine._validate_diffusion_stage_step_configs(
+            stage_cfgs,
+            stage_configs_path="dummy.yaml",
+            top_level_step_execution=False,
+        )
 
     def test_qwen_image_supports_step_execution(self):
-        from vllm_omni.diffusion.models.interface import SupportsStepExecution, supports_step_execution
         from vllm_omni.diffusion.models.qwen_image.pipeline_qwen_image import QwenImagePipeline
 
-        # Avoid loading model weights; protocol membership depends on the class contract.
+        # Avoid loading model weights; capability flags are class-level.
         pipeline = object.__new__(QwenImagePipeline)
 
         assert pipeline.supports_step_execution is True
-        assert supports_step_execution(pipeline) is True
-        assert isinstance(pipeline, SupportsStepExecution) is True
+        assert not hasattr(pipeline, "supports_stage_execution")
+
+    def test_qwen_image_forward_keeps_mixin_entrypoint(self):
+        from vllm_omni.diffusion.models.composed_pipeline import ComposedDiffusionPipeline
+        from vllm_omni.diffusion.models.qwen_image.pipeline_qwen_image import QwenImagePipeline
+
+        signature = inspect.signature(QwenImagePipeline.forward)
+
+        assert QwenImagePipeline.forward is ComposedDiffusionPipeline.forward
+        assert list(signature.parameters) == ["self", "req"]
+
+    def test_stage_only_pipeline_is_not_a_valid_capability(self):
+        from vllm_omni.diffusion.models.interface import supports_step_execution
+
+        class _StageOnlyPipeline(_StepPipeline):
+            supports_step_execution = False
+
+        pipeline = _StageOnlyPipeline()
+
+        assert supports_step_execution(pipeline) is False
+
+    def test_step_capability_requires_callable_stage_methods(self):
+        from vllm_omni.diffusion.models.interface import supports_step_execution
+
+        class _BrokenStagePipeline(_StepPipeline):
+            denoise_stage = None
+
+        pipeline = _BrokenStagePipeline()
+
+        assert supports_step_execution(pipeline) is False
 
 
 @hardware_test(
