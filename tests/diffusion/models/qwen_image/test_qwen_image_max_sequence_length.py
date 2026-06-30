@@ -183,8 +183,9 @@ def test_edit_pipelines_validate_text_prompt_length_before_image_token_expansion
     pipeline.tokenizer = _FakeTokenizer([8, 0])
     pipeline.processor = _FakeProcessor(drop_idx + 1500)
 
+    encode_prompt = getattr(pipeline, "_encode_prompt_impl", pipeline.encode_prompt)
     with pytest.raises(AssertionError, match="text encoder should not run"):
-        pipeline.encode_prompt(prompt="short prompt")
+        encode_prompt(prompt="short prompt")
 
 
 @pytest.mark.parametrize(
@@ -227,8 +228,9 @@ def test_qwen_edit_validator_excludes_image_placeholders_from_budget(pipeline_cl
     pipeline.tokenizer = _FakeTokenizer([30, 20])
     pipeline.processor = _FakeProcessor(1500)
 
+    encode_prompt = getattr(pipeline, "_encode_prompt_impl", pipeline.encode_prompt)
     with pytest.raises(AssertionError, match="text encoder should not run"):
-        pipeline.encode_prompt(prompt="short prompt")
+        encode_prompt(prompt="short prompt")
 
 
 @pytest.mark.parametrize(
@@ -242,7 +244,7 @@ def test_qwen_edit_validator_excludes_image_placeholders_from_budget(pipeline_cl
 )
 def test_forward_max_sequence_length_default_is_1024(pipeline_class: type):
     signature = inspect.signature(pipeline_class.forward)
-    if pipeline_class is QwenImagePipeline:
+    if pipeline_class in (QwenImagePipeline, QwenImageEditPipeline):
         assert list(signature.parameters) == ["self", "req"]
     else:
         assert signature.parameters["max_sequence_length"].default == 1024
