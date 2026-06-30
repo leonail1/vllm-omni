@@ -3,19 +3,13 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import (
-    TYPE_CHECKING,
-    Any,
-    ClassVar,
-    Literal,
-    Protocol,
-    runtime_checkable,
-)
+from typing import TYPE_CHECKING, ClassVar, Literal, Protocol, TypeGuard, runtime_checkable
 
 if TYPE_CHECKING:
     import torch
 
     from vllm_omni.diffusion.data import DiffusionOutput
+    from vllm_omni.diffusion.worker.input_batch import InputBatch
     from vllm_omni.diffusion.worker.utils import DiffusionRequestState
 
 
@@ -43,27 +37,17 @@ class SupportAudioOutput(Protocol):
 
 @runtime_checkable
 class SupportsStepExecution(Protocol):
-    """State-driven step-level execution protocol for diffusion pipelines.
-
-    Pipelines should split request-level ``forward()`` into:
-    ``prepare_encode()`` (one-time request setup), ``denoise_step()``
-    (one denoise forward), ``step_scheduler()`` (one scheduler update),
-    and ``post_decode()`` (final decode).
-    """
+    """Stage-composed execution contract for diffusion pipelines."""
 
     supports_step_execution: ClassVar[bool] = True
 
-    def prepare_encode(self, state: DiffusionRequestState, **kwargs: Any) -> DiffusionRequestState:
-        """Prepare request-level inputs and return initialized state."""
+    def encode_stage(self, state: "DiffusionRequestState") -> "DiffusionRequestState": ...
 
-    def denoise_step(self, state: DiffusionRequestState, **kwargs: Any) -> torch.Tensor | None:
-        """Run one denoise step."""
+    def denoise_stage(self, batch: "InputBatch") -> "torch.Tensor | None": ...
 
-    def step_scheduler(self, state: DiffusionRequestState, noise_pred: torch.Tensor, **kwargs: Any) -> None:
-        """Run one scheduler step."""
+    def scheduler_stage(self, state: "DiffusionRequestState", noise: "torch.Tensor | None") -> None: ...
 
-    def post_decode(self, state: DiffusionRequestState, **kwargs: Any) -> DiffusionOutput:
-        """Decode output after denoise loop."""
+    def decode_stage(self, state: "DiffusionRequestState") -> "DiffusionOutput": ...
 
 
 @runtime_checkable
@@ -91,7 +75,20 @@ class SupportsComponentDiscovery(Protocol):
     _resident_modules: ClassVar[list[str]] = []
 
 
-def supports_step_execution(pipeline: object) -> bool:
-    """Return whether `pipeline` implements :class:`SupportsStepExecution`."""
+def supports_step_execution(pipeline: object) -> TypeGuard[SupportsStepExecution]:
+    """Return whether *pipeline* exposes the composed stage contract.
 
-    return isinstance(pipeline, SupportsStepExecution)
+    ``@runtime_checkable`` protocols only validate attribute presence, so this
+    helper also checks the explicit capability flag and that stage entries are
+    callable.
+    """
+
+    if not isinstance(pipeline, SupportsStepExecution):
+        return False
+    if not bool(getattr(pipeline, "supports_step_execution", False)):
+        return False
+
+    return all(
+        callable(getattr(pipeline, name, None))
+        for name in ("encode_stage", "denoise_stage", "scheduler_stage", "decode_stage")
+    )

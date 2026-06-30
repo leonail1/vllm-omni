@@ -73,25 +73,23 @@ class _StepPipeline:
         self.scheduler_calls = 0
         self.decode_calls = 0
 
-    def prepare_encode(self, state, **kwargs):
-        del kwargs
+    def encode_stage(self, state):
         self.prepare_calls += 1
         state.timesteps = [torch.tensor(10), torch.tensor(5)]
         state.latents = torch.tensor([0.0])
         state.prompt_embeds = torch.tensor([[0.0, 0.0], [1.0, 1.0]])
         return state
 
-    def denoise_step(self, input_batch, **kwargs):
+    def denoise_stage(self, input_batch):
         self.denoise_calls += 1
         return torch.full_like(input_batch.prompt_embeds, fill_value=0.5)
 
-    def step_scheduler(self, state, noise_pred, **kwargs):
-        del noise_pred, kwargs
+    def scheduler_stage(self, state, noise_pred):
+        del noise_pred
         self.scheduler_calls += 1
         state.step_index += 1
 
-    def post_decode(self, state, **kwargs):
-        del kwargs
+    def decode_stage(self, state):
         self.decode_calls += 1
         return DiffusionOutput(output=torch.tensor([state.step_index], dtype=torch.float32))
 
@@ -99,23 +97,22 @@ class _StepPipeline:
 class _InterruptingStepPipeline(_StepPipeline):
     interrupt = True
 
-    def denoise_step(self, state, **kwargs):
-        del state, kwargs
+    def denoise_stage(self, input_batch):
+        del input_batch
         self.denoise_calls += 1
         return None
 
-    def step_scheduler(self, state, noise_pred, **kwargs):
-        del state, noise_pred, kwargs
-        raise AssertionError("step_scheduler should not run after interrupt")
+    def scheduler_stage(self, state, noise_pred):
+        del state, noise_pred
+        raise AssertionError("scheduler_stage should not run after interrupt")
 
-    def post_decode(self, state, **kwargs):
-        del state, kwargs
-        raise AssertionError("post_decode should not run after interrupt")
+    def decode_stage(self, state):
+        del state
+        raise AssertionError("decode_stage should not run after interrupt")
 
 
 class _IdentityNoiseTransformer(torch.nn.Module):
-    def forward(self, x: torch.Tensor, **kwargs):
-        del kwargs
+    def forward(self, x: torch.Tensor):
         return (x,)
 
 
@@ -139,8 +136,7 @@ class _DistributedStepPipeline(CFGParallelMixin):
     def interrupt(self):
         return self._interrupt
 
-    def prepare_encode(self, state, **kwargs):
-        del kwargs
+    def encode_stage(self, state):
         state.timesteps = [torch.tensor(1.0, device=self.device)]
         state.latents = torch.ones((1, 1), device=self.device)
         state.step_index = 0
@@ -149,8 +145,7 @@ class _DistributedStepPipeline(CFGParallelMixin):
         state.prompt_embeds = torch.tensor([[0.0, 0.0], [1.0, 1.0]])
         return state
 
-    def denoise_step(self, state, **kwargs):
-        del kwargs
+    def denoise_stage(self, input_batch):
         if self.mode == "ulysses":
             sp_group = get_sp_group().ulysses_group
             seq_world_size = torch.distributed.get_world_size(sp_group)
@@ -159,7 +154,7 @@ class _DistributedStepPipeline(CFGParallelMixin):
             intermediate = SeqAllToAll4D.apply(sp_group, input_tensor, 2, 1, False)
             output = SeqAllToAll4D.apply(sp_group, intermediate, 1, 2, False)
             torch.testing.assert_close(output, original, rtol=1e-5, atol=1e-5)
-            return torch.ones_like(state.latents)
+            return torch.ones_like(input_batch.latents)
 
         if self.mode == "ring":
             ring_group = get_sp_group().ring_group
@@ -172,10 +167,10 @@ class _DistributedStepPipeline(CFGParallelMixin):
             comm.wait()
             expected = torch.full_like(recv_tensor, float(((rank - 1) % world_size) + 1))
             torch.testing.assert_close(recv_tensor, expected, rtol=1e-5, atol=1e-5)
-            return torch.ones_like(state.latents)
+            return torch.ones_like(input_batch.latents)
 
-        positive_kwargs = {"x": state.latents + 1}
-        negative_kwargs = {"x": state.latents - 1}
+        positive_kwargs = {"x": input_batch.latents + 1}
+        negative_kwargs = {"x": input_batch.latents - 1}
         return self.predict_noise_maybe_with_cfg(
             do_true_cfg=True,
             true_cfg_scale=1.0,
@@ -184,8 +179,7 @@ class _DistributedStepPipeline(CFGParallelMixin):
             cfg_normalize=False,
         )
 
-    def step_scheduler(self, state, noise_pred, **kwargs):
-        del kwargs
+    def scheduler_stage(self, state, noise_pred):
         if self.mode == "cfg":
             state.latents = self.scheduler_step_maybe_with_cfg(
                 noise_pred,
@@ -198,8 +192,7 @@ class _DistributedStepPipeline(CFGParallelMixin):
             state.latents = state.latents + noise_pred
         state.step_index += 1
 
-    def post_decode(self, state, **kwargs):
-        del kwargs
+    def decode_stage(self, state):
         return DiffusionOutput(output=state.latents.detach().cpu())
 
 
