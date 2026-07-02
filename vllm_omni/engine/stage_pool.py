@@ -18,6 +18,7 @@ from vllm_omni.distributed.omni_coordinator import (
     ReplicaStatus,
 )
 from vllm_omni.distributed.omni_coordinator.load_balancer import Task
+from vllm_omni.diffusion.stage_kind import DiffusionStageRole, normalize_diffusion_stage_role
 from vllm_omni.engine.stage_client import (
     StagePoolClient,
     StagePoolDiffusionClient,
@@ -28,6 +29,7 @@ from vllm_omni.metrics import definitions as defs
 from vllm_omni.metrics.stats import StageRequestStats as StageRequestMetrics
 from vllm_omni.metrics.stats import StageStats
 from vllm_omni.metrics.utils import count_tokens_from_outputs
+from vllm_omni.outputs import OmniRequestOutput
 
 if TYPE_CHECKING:
     from vllm_omni.engine.orchestrator import OrchestratorRequestState
@@ -101,6 +103,7 @@ class StagePool:
         self._non_empty_first_output_timestamps_by_request: dict[str, float] = {}
         self._audio_frames_by_request: dict[str, int] = {}
         self._audio_sample_rate_by_request: dict[str, int] = {}
+        self._diffusion_stage_tasks: dict[str, asyncio.Task] = {}
 
         # Distributed-mode state. Populated by add_client / remove_client.
         self._addr_to_replica_id: dict[str, int] = {}
@@ -141,6 +144,14 @@ class StagePool:
     def stage_type(self) -> str | None:
         client = self.stage_client
         return None if client is None else client.stage_type
+
+    @property
+    def diffusion_stage_role(self) -> str:
+        client = self.stage_client
+        if client is None or getattr(client, "stage_type", None) != "diffusion":
+            return DiffusionStageRole.MONOLITHIC.value
+        raw_role = getattr(client, "diffusion_stage_role", None) or getattr(client, "model_stage", None) or "monolithic"
+        return normalize_diffusion_stage_role(raw_role).value
 
     @property
     def final_output(self) -> bool:
@@ -807,12 +818,16 @@ class StagePool:
             final_output_type = getattr(self.stage_client, "final_output_type", None)
         if final_output_type == "text":
             return any(bool(getattr(output, "text", "")) for output in getattr(request_output, "outputs", None) or [])
+        if final_output_type == "stage_transport":
+            return False
 
         if getattr(request_output, "images", None):
             return True
         if getattr(request_output, "video", None) or getattr(request_output, "videos", None):
             return True
         if getattr(request_output, "trajectory_latents", None) is not None:
+            return True
+        if getattr(request_output, "latents", None) is not None:
             return True
         custom_output = getattr(request_output, "_custom_output", None)
         if isinstance(custom_output, dict) and custom_output:
@@ -923,6 +938,16 @@ class StagePool:
                 affinity_request_id=affinity_request_id,
             )
             client = self._diffusion_client(replica_id)
+            if self.diffusion_stage_role != DiffusionStageRole.MONOLITHIC.value:
+                self._start_diffusion_stage_role_task(
+                    request_id,
+                    client,
+                    self.diffusion_stage_role,
+                    request,
+                    params,
+                    kv_sender_info=submit_kwargs.get("kv_sender_info"),
+                )
+                return replica_id
             if isinstance(request, list):
                 await client.add_batch_request_async(request_id, request, params, **submit_kwargs)
             else:
@@ -987,7 +1012,17 @@ class StagePool:
             raise RuntimeError(f"stage {self.stage_id} replica {replica_id} is not attached")
 
         if self.stage_type == "diffusion":
-            await self._diffusion_client(replica_id).add_request_async(request_id, request, params)
+            client = self._diffusion_client(replica_id)
+            if self.diffusion_stage_role != DiffusionStageRole.MONOLITHIC.value:
+                self._start_diffusion_stage_role_task(
+                    request_id,
+                    client,
+                    self.diffusion_stage_role,
+                    request,
+                    params,
+                )
+            else:
+                await client.add_request_async(request_id, request, params)
         else:
             # Refresh the shared output-processor state before yielding to the
             # stage client so streaming segments are merged against the latest
@@ -1001,6 +1036,116 @@ class StagePool:
             )
             await self._llm_client(replica_id).add_request_async(request)
         return replica_id
+
+    def _start_diffusion_stage_role_task(
+        self,
+        request_id: str,
+        client: StagePoolDiffusionClient,
+        role: str,
+        request: Any,
+        sampling_params: OmniDiffusionSamplingParams,
+        *,
+        kv_sender_info: dict[int, dict[str, Any]] | None = None,
+    ) -> None:
+        existing = self._diffusion_stage_tasks.get(request_id)
+        if existing is not None:
+            if not existing.done():
+                logger.warning(
+                    "[StagePool] Cancelling duplicate in-flight diffusion stage task for req=%s stage-%s.",
+                    request_id,
+                    self.stage_id,
+                )
+                existing.cancel()
+            else:
+                self._diffusion_stage_tasks.pop(request_id, None)
+        task = asyncio.create_task(
+            self._run_diffusion_stage_role(
+                request_id,
+                client,
+                role,
+                request,
+                sampling_params,
+                kv_sender_info=kv_sender_info,
+            ),
+            name=f"diffusion-stage-{role}-{request_id}",
+        )
+        self._diffusion_stage_tasks[request_id] = task
+
+    async def _run_diffusion_stage_role(
+        self,
+        request_id: str,
+        client: StagePoolDiffusionClient,
+        role: str,
+        request: Any,
+        sampling_params: OmniDiffusionSamplingParams,
+        *,
+        kv_sender_info: dict[int, dict[str, Any]] | None = None,
+    ) -> None:
+        try:
+            if role == DiffusionStageRole.ENCODER.value:
+                if isinstance(request, list):
+                    payload = await client.stage_encode_batch_request_async(
+                        request_id,
+                        request,
+                        sampling_params,
+                        kv_sender_info=kv_sender_info,
+                    )
+                else:
+                    payload = await client.stage_encode_request_async(
+                        request_id,
+                        request,
+                        sampling_params,
+                        kv_sender_info=kv_sender_info,
+                    )
+                client.put_diffusion_output_nowait(self._make_stage_transport_output(request_id, payload))
+            elif role == DiffusionStageRole.DENOISER.value:
+                # Denoiser stages consume encode payloads and emit decode
+                # payloads; both are represented as synthetic Omni outputs so
+                # the existing orchestrator queue can pass them between stages.
+                payload = await client.stage_dit_transport_async(
+                    request_id,
+                    self._extract_stage_transport_payload(request),
+                )
+                client.put_diffusion_output_nowait(self._make_stage_transport_output(request_id, payload))
+            elif role == DiffusionStageRole.DECODER.value:
+                await client.stage_decode_transport_async(
+                    request_id,
+                    self._extract_stage_transport_payload(request),
+                )
+            else:
+                raise ValueError(f"Invalid diffusion stage role: {role!r}")
+        except Exception as exc:
+            logger.exception(
+                "[StagePool] diffusion stage role %s failed for req=%s stage-%s",
+                role,
+                request_id,
+                self.stage_id,
+            )
+            client.put_diffusion_output_nowait(OmniRequestOutput.from_error(request_id, str(exc)))
+        finally:
+            if self._diffusion_stage_tasks.get(request_id) is asyncio.current_task():
+                self._diffusion_stage_tasks.pop(request_id, None)
+
+    @staticmethod
+    def _make_stage_transport_output(request_id: str, payload: Any) -> OmniRequestOutput:
+        return OmniRequestOutput.from_diffusion(
+            request_id=request_id,
+            images=[],
+            custom_output={"stage_transport": payload},
+            final_output_type="stage_transport",
+        )
+
+    @staticmethod
+    def _extract_stage_transport_payload(request: Any) -> Any:
+        if isinstance(request, dict) and "stage_transport" in request:
+            return request["stage_transport"]
+        custom_output = getattr(request, "custom_output", None)
+        if isinstance(custom_output, dict) and "stage_transport" in custom_output:
+            return custom_output["stage_transport"]
+        raw_custom_output = getattr(request, "_custom_output", None)
+        if isinstance(raw_custom_output, dict) and "stage_transport" in raw_custom_output:
+            return raw_custom_output["stage_transport"]
+        raise ValueError("Diffusion stage role expected a stage_transport payload from the previous stage.")
 
     async def _pick_or_select(
         self,
@@ -1098,6 +1243,12 @@ class StagePool:
         """
         if not request_ids:
             return
+
+        if self.stage_type == "diffusion":
+            for request_id in request_ids:
+                task = self._diffusion_stage_tasks.pop(request_id, None)
+                if task is not None and not task.done():
+                    task.cancel()
 
         request_ids_by_replica: dict[int, list[str]] = {}
         for request_id in request_ids:

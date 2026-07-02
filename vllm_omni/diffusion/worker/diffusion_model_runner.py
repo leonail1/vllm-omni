@@ -11,6 +11,7 @@ model-related operations.
 from __future__ import annotations
 
 import copy
+import gc
 import time
 from collections.abc import Iterable
 from contextlib import nullcontext
@@ -32,13 +33,19 @@ from vllm_omni.diffusion.compile import regionally_compile
 from vllm_omni.diffusion.data import DiffusionOutput, OmniDiffusionConfig
 from vllm_omni.diffusion.forward_context import set_forward_context
 from vllm_omni.diffusion.model_loader.diffusers_loader import DiffusersPipelineLoader
-from vllm_omni.diffusion.models.interface import supports_step_execution
+from vllm_omni.diffusion.models.interface import supports_diffusion_atoms
 from vllm_omni.diffusion.offloader import get_offload_backend
 from vllm_omni.diffusion.registry import _NO_CACHE_ACCELERATION
 from vllm_omni.diffusion.request import OmniDiffusionRequest
 from vllm_omni.diffusion.sched.interface import DiffusionSchedulerOutput
 from vllm_omni.diffusion.worker.input_batch import InputBatch, scatter_latents
-from vllm_omni.diffusion.worker.utils import BatchRunnerOutput, DiffusionRequestState, RunnerOutput
+from vllm_omni.diffusion.worker.utils import (
+    BatchRunnerOutput,
+    DiffusionRequestState,
+    DiffusionStateTransport,
+    RunnerOutput,
+    TransportBoundary,
+)
 from vllm_omni.distributed.omni_connectors.kv_transfer_manager import OmniKVTransferManager
 from vllm_omni.platforms import current_omni_platform
 from vllm_omni.worker.omni_connector_model_runner_mixin import OmniConnectorModelRunnerMixin
@@ -83,6 +90,13 @@ class DiffusionModelRunner(OmniConnectorModelRunnerMixin):
         # Initialize KV cache manager for connector management
         self.kv_transfer_manager = OmniKVTransferManager.from_od_config(od_config)
 
+    def _normalize_step_execution_mode(self) -> None:
+        from vllm_omni.diffusion.stage_kind import DiffusionStageRole, normalize_diffusion_stage_role
+
+        role = normalize_diffusion_stage_role(getattr(self.od_config, "diffusion_stage_role", "monolithic"))
+        self.od_config.diffusion_stage_role = role.value
+        self.od_config.step_execution = role != DiffusionStageRole.MONOLITHIC
+
     def _compile_transformer(self, attr_name: str) -> None:
         """Compile a transformer attribute on the pipeline with torch.compile."""
         model = getattr(self.pipeline, attr_name, None)
@@ -118,6 +132,7 @@ class DiffusionModelRunner(OmniConnectorModelRunnerMixin):
             custom_pipeline_name: Optional custom pipeline class name to use.
         """
 
+        self._normalize_step_execution_mode()
         if load_format == "dummy":
             return
 
@@ -155,9 +170,13 @@ class DiffusionModelRunner(OmniConnectorModelRunnerMixin):
         if getattr(self.od_config, "step_execution", False) and not self.supports_step_mode():
             raise ValueError(
                 "step_execution=True requires a pipeline implementing "
-                "prepare_encode(), denoise_step(), step_scheduler(), and post_decode(); "
+                "the diffusion atom contract "
+                "(init_state, validation, encoding, preparation, predict_noise, "
+                "advance_scheduler, decoding, postprocess); "
                 f"{self.od_config.model_class_name} does not support that contract."
             )
+
+        self._configure_pipeline_stage_role()
 
         # Apply CPU offloading
         self.offload_backend = get_offload_backend(self.od_config, device=self.device)
@@ -207,6 +226,17 @@ class DiffusionModelRunner(OmniConnectorModelRunnerMixin):
             )
 
         logger.info("Model runner: Initialization complete.")
+
+    def _configure_pipeline_stage_role(self) -> None:
+        role = getattr(self.od_config, "diffusion_stage_role", "monolithic")
+        configure = getattr(self.pipeline, "configure_diffusion_stage_role", None)
+        if not callable(configure):
+            return
+
+        configure(role)
+        gc.collect()
+        current_omni_platform.empty_cache()
+        logger.info("Model runner: configured diffusion stage role %s.", role)
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         """Load weights into the pipeline."""
@@ -350,7 +380,103 @@ class DiffusionModelRunner(OmniConnectorModelRunnerMixin):
 
     def supports_step_mode(self) -> bool:
         """Return whether current pipeline supports step execution."""
-        return self.pipeline is not None and supports_step_execution(self.pipeline)
+        return self.pipeline is not None and supports_diffusion_atoms(self.pipeline)
+
+    def _supports_diffusion_atoms(self) -> bool:
+        return self.pipeline is not None and supports_diffusion_atoms(self.pipeline)
+
+    @staticmethod
+    def _coerce_transport_payload(payload: DiffusionStateTransport | dict[str, Any]) -> DiffusionStateTransport:
+        if isinstance(payload, DiffusionStateTransport):
+            return payload
+        if isinstance(payload, dict):
+            return DiffusionStateTransport(**payload)
+        raise TypeError(f"Expected DiffusionStateTransport payload, got {type(payload)!r}.")
+
+    def _pack_conditioning(self, state: DiffusionRequestState) -> Any:
+        pack = getattr(self.pipeline, "pack_conditioning", None)
+        if callable(pack):
+            return pack(state)
+        return state.conditioning
+
+    def _unpack_conditioning(
+        self,
+        payload: DiffusionStateTransport,
+        state: DiffusionRequestState,
+    ) -> DiffusionRequestState:
+        if payload.conditioning is None:
+            return state
+        # from_transport owns device normalization for payload.conditioning.
+        conditioning = state.conditioning
+        unpack = getattr(self.pipeline, "unpack_conditioning", None)
+        if callable(unpack):
+            return unpack(conditioning, state)
+        state.conditioning = conditioning
+        return state
+
+    def _rehydrate_transport_state(self, state: DiffusionRequestState) -> DiffusionRequestState:
+        rehydrate = getattr(self.pipeline, "rehydrate_stage_state", None)
+        if callable(rehydrate):
+            return rehydrate(state)
+        # Remote payloads intentionally avoid serializing scheduler objects.
+        # Recreate a per-request scheduler from the local role pipeline.
+        if state.scheduler is None and getattr(self.pipeline, "scheduler", None) is not None:
+            state.scheduler = copy.deepcopy(self.pipeline.scheduler)
+            set_begin_index = getattr(state.scheduler, "set_begin_index", None)
+            if callable(set_begin_index):
+                set_begin_index(state.step_index)
+        return state
+
+    def _state_from_transport(
+        self,
+        payload: DiffusionStateTransport | dict[str, Any],
+        *,
+        expected_boundary: TransportBoundary,
+    ) -> DiffusionRequestState:
+        payload = self._coerce_transport_payload(payload)
+        if payload.boundary != expected_boundary:
+            raise ValueError(f"Expected {expected_boundary} payload, got {payload.boundary!r}.")
+        state = DiffusionRequestState.from_transport(payload, device=self.device)
+        state = self._unpack_conditioning(payload, state)
+        return self._rehydrate_transport_state(state)
+
+    def _state_to_transport(
+        self,
+        state: DiffusionRequestState,
+        boundary: TransportBoundary,
+    ) -> DiffusionStateTransport:
+        # Only the encode boundary needs model-private conditioning; DiT->decode
+        # remains model-agnostic and transports the final public latents.
+        conditioning = self._pack_conditioning(state) if boundary == "encode_to_dit" else None
+        return state.to_transport(boundary, conditioning=conditioning)
+
+    def execute_encode(
+        self,
+        req: OmniDiffusionRequest,
+        *,
+        boundary: TransportBoundary = "encode_to_dit",
+    ) -> DiffusionStateTransport:
+        if boundary != "encode_to_dit":
+            raise ValueError(f"execute_encode only emits encode_to_dit payloads, got {boundary!r}.")
+        assert self.pipeline is not None, "Model not loaded. Call load_model() first."
+        if not self.supports_step_mode():
+            raise ValueError("Current pipeline does not support stage encode execution.")
+        use_hsdp = self.od_config.parallel_config.use_hsdp
+        grad_context = torch.no_grad() if use_hsdp else torch.inference_mode()
+        with grad_context:
+            state = self.pipeline.init_state(req)
+            state.request_id = req.request_id
+            self._ensure_state_generator(state)
+            state = self.run_encode_stage(state)
+            return self._state_to_transport(state, boundary)
+
+    def execute_decode(self, payload: DiffusionStateTransport | dict[str, Any]) -> DiffusionOutput:
+        assert self.pipeline is not None, "Model not loaded. Call load_model() first."
+        use_hsdp = self.od_config.parallel_config.use_hsdp
+        grad_context = torch.no_grad() if use_hsdp else torch.inference_mode()
+        with grad_context:
+            state = self._state_from_transport(payload, expected_boundary="dit_to_decode")
+            return self.run_decode_stage(state)
 
     def _update_states(
         self, scheduler_output: DiffusionSchedulerOutput
@@ -361,19 +487,28 @@ class DiffusionModelRunner(OmniConnectorModelRunnerMixin):
 
         resolved: list[DiffusionRequestState] = []
         new_request_ids: list[str] = []
+        created_request_ids: list[str] = []
         try:
             # process new requests
             for sched_new_req in scheduler_output.scheduled_new_reqs:
                 request_id = sched_new_req.request_id
                 req = sched_new_req.req
-                new_request_ids.append(request_id)
                 if request_id in self.state_cache:
                     raise ValueError(f"Received duplicate new-request payload for cached request {request_id}.")
-                new_state = DiffusionRequestState(
-                    request_id=request_id,
-                    sampling=copy.deepcopy(req.sampling_params),
-                    prompts=req.prompts,
-                )
+                created_request_ids.append(request_id)
+                transport_payload = getattr(req, "stage_transport_payload", None)
+                if transport_payload is not None:
+                    # A denoiser role receives already-encoded conditioning from
+                    # an encoder worker and should not run encode atoms again.
+                    new_state = self._state_from_transport(
+                        transport_payload,
+                        expected_boundary="encode_to_dit",
+                    )
+                    new_state.request_id = request_id
+                else:
+                    new_request_ids.append(request_id)
+                    new_state = self.pipeline.init_state(req)
+                    new_state.request_id = request_id
                 self.state_cache[request_id] = new_state
                 resolved.append(new_state)
 
@@ -384,32 +519,65 @@ class DiffusionModelRunner(OmniConnectorModelRunnerMixin):
                     raise ValueError(f"Missing cached state for request {request_id}.")
                 resolved.append(state)
         except Exception:
-            for request_id in new_request_ids:
+            for request_id in created_request_ids:
                 self.state_cache.pop(request_id, None)
             raise
 
         return resolved, new_request_ids
 
+    def _ensure_state_generator(self, state: DiffusionRequestState) -> None:
+        if state.sampling.generator is not None or state.sampling.seed is None:
+            return
+        if state.sampling.generator_device is not None:
+            gen_device = state.sampling.generator_device
+        elif self.device.type == "cpu":
+            gen_device = "cpu"
+        else:
+            gen_device = self.device
+        state.sampling.generator = torch.Generator(device=gen_device).manual_seed(state.sampling.seed)
+
+    def run_encode_stage(self, state: DiffusionRequestState) -> DiffusionRequestState:
+        """Run validation/encoding/preparation atoms."""
+        state = self.pipeline.validation(state)
+        state = self.pipeline.encoding(state)
+        state = self.pipeline.preparation(state)
+        return state
+
+    def run_denoise_stage(self, input_batch: InputBatch) -> torch.Tensor | None:
+        return self.pipeline.predict_noise(input_batch)
+
+    def run_scheduler_stage(
+        self,
+        state: DiffusionRequestState,
+        noise_pred: torch.Tensor,
+    ) -> DiffusionRequestState:
+        return self.pipeline.advance_scheduler(state, noise_pred)
+
+    def run_decode_stage(self, state: DiffusionRequestState) -> DiffusionOutput:
+        state = self.pipeline.decoding(state)
+        return self.pipeline.postprocess(state)
+
+    def _attach_model_inputs(self, input_batch: InputBatch) -> None:
+        input_batch.model_inputs.clear()
+        build_model_inputs = getattr(self.pipeline, "build_model_inputs", None)
+        if callable(build_model_inputs):
+            input_batch.model_inputs.update(build_model_inputs(input_batch.states))
+
     def _prepare_batch_inputs(self, states: list[DiffusionRequestState], new_request_ids: list[str]) -> InputBatch:
-        # process new reqs
-        for state in states:
+        for index, state in enumerate(states):
             if state.request_id in new_request_ids:
-                # set generator
-                if state.sampling.generator is None and state.sampling.seed is not None:
-                    if state.sampling.generator_device is not None:
-                        gen_device = state.sampling.generator_device
-                    elif self.device.type == "cpu":
-                        gen_device = "cpu"
-                    else:
-                        gen_device = self.device
-                    state.sampling.generator = torch.Generator(device=gen_device).manual_seed(state.sampling.seed)
-                # encode
-                self.pipeline.prepare_encode(state)
+                self._ensure_state_generator(state)
+                new_state = self.run_encode_stage(state)
+                # Treat the returned state as authoritative even when current
+                # Qwen atoms mutate in place; other pipelines may return a new object.
+                states[index] = new_state
+                self.state_cache[new_state.request_id] = new_state
 
         input_batch = InputBatch.make_batch(
             states,
             cached_batch=getattr(self, "input_batch", None),
         )
+        self._attach_model_inputs(input_batch)
         self.input_batch = input_batch
         return input_batch
 
@@ -438,6 +606,10 @@ class DiffusionModelRunner(OmniConnectorModelRunnerMixin):
                 self.state_cache.pop(state.request_id, None)
 
     def _prepare_attn_metadata(self, input_batch: InputBatch) -> Any:
+        if self._supports_diffusion_atoms():
+            build_attn = getattr(self.pipeline, "build_step_attention_metadata", None)
+            if callable(build_attn):
+                return build_attn(input_batch)
         model_state = getattr(self, "model_state", None)
         if model_state is None:
             return {}
@@ -469,7 +641,7 @@ class DiffusionModelRunner(OmniConnectorModelRunnerMixin):
                 omni_diffusion_config=self.od_config,
                 attn_metadata=attn_metadata,
             ):
-                noise_pred = self.pipeline.denoise_step(input_batch)
+                noise_pred = self.run_denoise_stage(input_batch)
 
                 runner_output_list = []
                 pipeline_interrupted = getattr(self.pipeline, "interrupt", False)
@@ -485,15 +657,29 @@ class DiffusionModelRunner(OmniConnectorModelRunnerMixin):
                         )
 
                 else:
+                    if noise_pred is None:
+                        raise ValueError("Denoise stage returned None without setting pipeline.interrupt.")
                     offset = 0
-                    for req in states:
-                        row_num = req.latents.shape[0]
-                        self.pipeline.step_scheduler(
-                            req, noise_pred[offset : offset + row_num] if noise_pred is not None else None
+                    for index, (req, row_num) in enumerate(zip(states, input_batch.row_counts, strict=True)):
+                        # Each request may expand to multiple CFG/output rows,
+                        # so slice the merged noise tensor using the batch row layout.
+                        new_req = self.run_scheduler_stage(
+                            req,
+                            noise_pred[offset : offset + row_num],
                         )
-                        offset = offset + row_num
+                        if new_req is not req:
+                            states[index] = new_req
+                            self.state_cache[new_req.request_id] = new_req
+                            req = new_req
+                        offset += row_num
                         if req.denoise_completed:
-                            result = self.pipeline.post_decode(req)
+                            # Split deployments hand final latents to a decode
+                            # role instead of decoding inside the denoiser.
+                            result = DiffusionOutput(
+                                custom_output={
+                                    "stage_transport": self._state_to_transport(req, "dit_to_decode")
+                                }
+                            )
                         else:
                             result = None
                         runner_output_list.append(

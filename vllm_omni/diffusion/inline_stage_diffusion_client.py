@@ -20,6 +20,7 @@ from vllm.v1.engine.exceptions import EngineDeadError
 from vllm_omni.diffusion.data import DiffusionRequestAbortedError
 from vllm_omni.diffusion.diffusion_engine import DiffusionEngine
 from vllm_omni.diffusion.request import OmniDiffusionRequest
+from vllm_omni.diffusion.stage_merge import merge_latent_outputs
 from vllm_omni.engine.stage_client import StageClientBase
 from vllm_omni.engine.stage_init_utils import StageMetadata
 from vllm_omni.errors import client_error_metadata
@@ -92,6 +93,10 @@ class InlineStageDiffusionClient(StageClientBase):
             self.replica_id,
         )
 
+    def _raise_if_engine_dead(self) -> None:
+        if self._engine_dead:
+            raise EngineDeadError(f"Stage-{self.stage_id} inline diffusion engine is dead")
+
     # ------------------------------------------------------------------
     # Request processing
     # ------------------------------------------------------------------
@@ -103,6 +108,7 @@ class InlineStageDiffusionClient(StageClientBase):
         sampling_params: OmniDiffusionSamplingParams,
         kv_sender_info: dict[int, dict[str, Any]] | None = None,
     ) -> None:
+        self._raise_if_engine_dead()
         logger.debug(
             "[InlineStageDiffusionClient] stage-%s [rep-%s] add request: %s",
             self.stage_id,
@@ -162,6 +168,7 @@ class InlineStageDiffusionClient(StageClientBase):
         sampling_params: OmniDiffusionSamplingParams,
         kv_sender_info: dict[int, dict[str, Any]] | None = None,
     ) -> None:
+        self._raise_if_engine_dead()
         logger.debug(
             "[InlineStageDiffusionClient] stage-%s [rep-%s] add batch request: %s (%d prompts)",
             self.stage_id,
@@ -202,7 +209,7 @@ class InlineStageDiffusionClient(StageClientBase):
             merged_durations: dict[str, float] = {}
             merged_custom: dict[str, Any] = {}
             peak_mem = 0.0
-            latents = None
+            latent_values: list[Any] = []
             trajectory_latents: list[torch.Tensor] | None = None
             trajectory_timesteps: list[torch.Tensor] | None = None
             trajectory_log_probs: torch.Tensor | None = None
@@ -210,14 +217,15 @@ class InlineStageDiffusionClient(StageClientBase):
             final_output_type = "image"
 
             for r in results:
+                # A batched diffusion submission returns one output per prompt;
+                # fold them back into the single request_id expected upstream.
                 all_images.extend(r.images)
                 merged_mm.update(r._multimodal_output)
                 merged_metrics.update(r.metrics)
                 merged_durations.update(r.stage_durations)
                 merged_custom.update(r._custom_output)
                 peak_mem = max(peak_mem, r.peak_memory_mb)
-                if latents is None and r.latents is not None:
-                    latents = r.latents
+                latent_values.append(r.latents)
                 if trajectory_latents is None:
                     trajectory_latents = r.trajectory_latents
                 if trajectory_timesteps is None:
@@ -234,7 +242,7 @@ class InlineStageDiffusionClient(StageClientBase):
                 images=all_images,
                 prompt=prompts[0] if len(prompts) == 1 else None,
                 metrics=merged_metrics,
-                latents=latents,
+                latents=merge_latent_outputs(latent_values),
                 trajectory_latents=trajectory_latents,
                 trajectory_timesteps=trajectory_timesteps,
                 trajectory_log_probs=trajectory_log_probs,
@@ -284,6 +292,7 @@ class InlineStageDiffusionClient(StageClientBase):
         args: tuple[Any, ...] = (),
         kwargs: dict[str, Any] | None = None,
     ) -> Any:
+        self._raise_if_engine_dead()
         loop = asyncio.get_running_loop()
 
         if method == "profile":

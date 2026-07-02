@@ -2,12 +2,14 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Tests for step-level diffusion execution across runner / worker / executor / engine."""
 
+import asyncio
 import contextlib
 import os
 import queue
 import threading
 from contextlib import contextmanager
 from types import SimpleNamespace
+from typing import Any
 
 import pytest
 import torch
@@ -28,7 +30,9 @@ from vllm_omni.diffusion.distributed.parallel_state import (
 from vllm_omni.diffusion.executor.multiproc_executor import MultiprocDiffusionExecutor
 from vllm_omni.diffusion.ipc import (
     pack_diffusion_output_shm,
+    pack_stage_transport_shm,
     unpack_diffusion_output_shm,
+    unpack_stage_transport_shm,
 )
 from vllm_omni.diffusion.request import OmniDiffusionRequest
 from vllm_omni.diffusion.sched import StepScheduler
@@ -37,9 +41,10 @@ from vllm_omni.diffusion.sched.interface import (
     DiffusionSchedulerOutput,
     NewRequestData,
 )
+from vllm_omni.diffusion.worker.input_batch import get_runner_step_config, set_runner_step_config
 from vllm_omni.diffusion.worker.diffusion_model_runner import DiffusionModelRunner
 from vllm_omni.diffusion.worker.diffusion_worker import DiffusionWorker
-from vllm_omni.diffusion.worker.utils import RunnerOutput
+from vllm_omni.diffusion.worker.utils import DiffusionRequestState, DiffusionStateTransport, RunnerOutput
 from vllm_omni.engine.async_omni_engine import AsyncOmniEngine
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams
 from vllm_omni.platforms import current_omni_platform
@@ -65,7 +70,7 @@ def _update_environment_variables(envs_dict: dict[str, str]) -> None:
 class _StepPipeline:
     """Minimal pipeline stub that supports step-wise execution."""
 
-    supports_step_execution = True
+    supports_diffusion_atoms = True
 
     def __init__(self):
         self.prepare_calls = 0
@@ -73,44 +78,95 @@ class _StepPipeline:
         self.scheduler_calls = 0
         self.decode_calls = 0
 
-    def prepare_encode(self, state, **kwargs):
-        del kwargs
-        self.prepare_calls += 1
-        state.timesteps = [torch.tensor(10), torch.tensor(5)]
-        state.latents = torch.tensor([0.0])
-        state.prompt_embeds = torch.tensor([[0.0, 0.0], [1.0, 1.0]])
+    def forward(self, req, **kwargs):
+        del req, kwargs
+        raise NotImplementedError
+
+    def init_state(self, req):
+        return DiffusionRequestState(
+            request_id=req.request_id,
+            sampling=req.sampling_params,
+            prompts=req.prompts,
+        )
+
+    def validation(self, state):
         return state
 
-    def denoise_step(self, input_batch, **kwargs):
+    def encoding(self, state):
+        return state
+
+    def preparation(self, state):
+        self.prepare_calls += 1
+        num_steps = getattr(state.sampling, "num_inference_steps", None) or 2
+        state.timesteps = [torch.tensor(10 - i) for i in range(num_steps)]
+        state.latents = torch.tensor([0.0])
+        return state
+
+    def denoising(self, state):
+        return state
+
+    def predict_noise(self, input_batch):
         self.denoise_calls += 1
-        return torch.full_like(input_batch.prompt_embeds, fill_value=0.5)
+        return torch.full_like(input_batch.latents, fill_value=0.5)
 
-    def step_scheduler(self, state, noise_pred, **kwargs):
-        del noise_pred, kwargs
+    def advance_scheduler(self, state, noise_pred):
+        del noise_pred
         self.scheduler_calls += 1
+        state.latents = state.latents + 0.5
         state.step_index += 1
+        return state
 
-    def post_decode(self, state, **kwargs):
-        del kwargs
+    def decoding(self, state):
         self.decode_calls += 1
+        return state
+
+    def postprocess(self, state):
         return DiffusionOutput(output=torch.tensor([state.step_index], dtype=torch.float32))
+
+    def build_model_inputs(self, states):
+        del states
+        return {}
+
+    def build_step_attention_metadata(self, batch):
+        del batch
+        return {}
 
 
 class _InterruptingStepPipeline(_StepPipeline):
     interrupt = True
 
-    def denoise_step(self, state, **kwargs):
-        del state, kwargs
+    def predict_noise(self, state):
+        del state
         self.denoise_calls += 1
+        return None
+
+    def advance_scheduler(self, state, noise_pred):
+        del state, noise_pred
+        raise AssertionError("advance_scheduler should not run after interrupt")
+
+    def decoding(self, state):
+        del state
+        raise AssertionError("decoding should not run after interrupt")
+
+
+class _LegacyStepPipeline:
+    """Old four-hook step protocol that should not enable stage-split."""
+
+
+    def prepare_encode(self, state, **kwargs):
+        del kwargs
+        return state
+
+    def denoise_step(self, input_batch, **kwargs):
+        del input_batch, kwargs
         return None
 
     def step_scheduler(self, state, noise_pred, **kwargs):
         del state, noise_pred, kwargs
-        raise AssertionError("step_scheduler should not run after interrupt")
 
     def post_decode(self, state, **kwargs):
         del state, kwargs
-        raise AssertionError("post_decode should not run after interrupt")
+        return DiffusionOutput()
 
 
 class _IdentityNoiseTransformer(torch.nn.Module):
@@ -126,7 +182,7 @@ class _AdditiveScheduler:
 
 
 class _DistributedStepPipeline(CFGParallelMixin):
-    supports_step_execution = True
+    supports_diffusion_atoms = True
 
     def __init__(self, mode: str, device: torch.device):
         self.mode = mode
@@ -139,18 +195,40 @@ class _DistributedStepPipeline(CFGParallelMixin):
     def interrupt(self):
         return self._interrupt
 
-    def prepare_encode(self, state, **kwargs):
-        del kwargs
+    def forward(self, req, **kwargs):
+        del req, kwargs
+        raise NotImplementedError
+
+    def init_state(self, req):
+        return DiffusionRequestState(
+            request_id=req.request_id,
+            sampling=req.sampling_params,
+            prompts=req.prompts,
+        )
+
+    def validation(self, state):
+        return state
+
+    def encoding(self, state):
+        return state
+
+    def preparation(self, state):
         state.timesteps = [torch.tensor(1.0, device=self.device)]
         state.latents = torch.ones((1, 1), device=self.device)
         state.step_index = 0
         state.scheduler = self.scheduler
-        state.do_true_cfg = self.mode == "cfg"
-        state.prompt_embeds = torch.tensor([[0.0, 0.0], [1.0, 1.0]])
+        set_runner_step_config(state, do_true_cfg=self.mode == "cfg")
         return state
 
-    def denoise_step(self, state, **kwargs):
-        del kwargs
+    def denoising(self, state):
+        return state
+
+    def predict_noise(self, input_batch=None, *args, **kwargs):
+        if input_batch is None or not hasattr(input_batch, "latents"):
+            if input_batch is None:
+                return super().predict_noise(*args, **kwargs)
+            return super().predict_noise(input_batch, *args, **kwargs)
+
         if self.mode == "ulysses":
             sp_group = get_sp_group().ulysses_group
             seq_world_size = torch.distributed.get_world_size(sp_group)
@@ -159,7 +237,7 @@ class _DistributedStepPipeline(CFGParallelMixin):
             intermediate = SeqAllToAll4D.apply(sp_group, input_tensor, 2, 1, False)
             output = SeqAllToAll4D.apply(sp_group, intermediate, 1, 2, False)
             torch.testing.assert_close(output, original, rtol=1e-5, atol=1e-5)
-            return torch.ones_like(state.latents)
+            return torch.ones_like(input_batch.latents)
 
         if self.mode == "ring":
             ring_group = get_sp_group().ring_group
@@ -172,10 +250,10 @@ class _DistributedStepPipeline(CFGParallelMixin):
             comm.wait()
             expected = torch.full_like(recv_tensor, float(((rank - 1) % world_size) + 1))
             torch.testing.assert_close(recv_tensor, expected, rtol=1e-5, atol=1e-5)
-            return torch.ones_like(state.latents)
+            return torch.ones_like(input_batch.latents)
 
-        positive_kwargs = {"x": state.latents + 1}
-        negative_kwargs = {"x": state.latents - 1}
+        positive_kwargs = {"x": input_batch.latents + 1}
+        negative_kwargs = {"x": input_batch.latents - 1}
         return self.predict_noise_maybe_with_cfg(
             do_true_cfg=True,
             true_cfg_scale=1.0,
@@ -184,23 +262,34 @@ class _DistributedStepPipeline(CFGParallelMixin):
             cfg_normalize=False,
         )
 
-    def step_scheduler(self, state, noise_pred, **kwargs):
-        del kwargs
+    def advance_scheduler(self, state, noise_pred):
+        do_true_cfg, _, _ = get_runner_step_config(state)
         if self.mode == "cfg":
             state.latents = self.scheduler_step_maybe_with_cfg(
                 noise_pred,
                 state.current_timestep,
                 state.latents,
-                do_true_cfg=True,
+                do_true_cfg=do_true_cfg,
                 per_request_scheduler=state.scheduler,
             )
         else:
             state.latents = state.latents + noise_pred
         state.step_index += 1
+        return state
 
-    def post_decode(self, state, **kwargs):
-        del kwargs
+    def decoding(self, state):
+        return state
+
+    def postprocess(self, state):
         return DiffusionOutput(output=state.latents.detach().cpu())
+
+    def build_model_inputs(self, states):
+        del states
+        return {}
+
+    def build_step_attention_metadata(self, batch):
+        del batch
+        return {}
 
 
 def _make_step_request(num_inference_steps: int = 2):
@@ -311,9 +400,10 @@ def _make_cached_scheduler_output(request_id="req-1", step_id=1, finished_req_id
 
 def _make_engine(scheduler, execute_fn=None) -> DiffusionEngine:
     engine = object.__new__(DiffusionEngine)
-    engine.od_config = SimpleNamespace(model_class_name="QwenImagePipeline")
+    engine.od_config = SimpleNamespace(model_class_name="QwenImagePipeline", enable_cpu_offload=False)
     engine.pre_process_func = None
     engine.post_process_func = None
+    engine._post_process_accepts_sampling_params = False
     engine.scheduler = scheduler
     engine.execute_fn = execute_fn
     engine._rpc_lock = threading.RLock()
@@ -363,7 +453,13 @@ def _distributed_step_worker(local_rank: int, world_size: int, mode: str, master
 
         assert output.finished is True
         assert output.result is not None
-        torch.testing.assert_close(output.result.output, _expected_output_for_mode(mode), rtol=1e-5, atol=1e-5)
+        transport = output.result.custom_output["stage_transport"]
+        torch.testing.assert_close(
+            transport.tensors["latents"].detach().cpu(),
+            _expected_output_for_mode(mode).cpu(),
+            rtol=1e-5,
+            atol=1e-5,
+        )
         assert "req-1" not in runner.state_cache
     finally:
         destroy_distributed_env()
@@ -398,13 +494,83 @@ class TestRunner:
         assert second.finished is True
         assert second.result is not None
         assert second.result.error is None
-        assert torch.equal(second.result.output, torch.tensor([2.0]))
+        transport = second.result.custom_output["stage_transport"]
+        assert transport.boundary == "dit_to_decode"
+        assert transport.meta["step_index"] == 2
+        torch.testing.assert_close(transport.tensors["latents"], torch.tensor([1.0]))
         assert "req-1" not in runner.state_cache
 
         assert runner.pipeline.prepare_calls == 1
         assert runner.pipeline.denoise_calls == 2
         assert runner.pipeline.scheduler_calls == 2
-        assert runner.pipeline.decode_calls == 1
+        assert runner.pipeline.decode_calls == 0
+
+    def test_denoiser_role_returns_decode_transport_without_reencoding(self, monkeypatch):
+        encoder_runner = _make_runner()
+        req = _make_step_request(num_inference_steps=1)
+        encode_payload = DiffusionModelRunner.execute_encode(encoder_runner, req)
+        assert encode_payload.boundary == "encode_to_dit"
+        assert encoder_runner.pipeline.prepare_calls == 1
+
+        denoiser_runner = _make_runner()
+        denoiser_runner.od_config.diffusion_stage_role = "denoiser"
+        denoise_req = _make_step_request(num_inference_steps=1)
+        denoise_req.stage_transport_payload = encode_payload
+        monkeypatch.setattr(model_runner_module, "set_forward_context", _noop_forward_context)
+
+        result = DiffusionModelRunner.execute_stepwise(
+            denoiser_runner,
+            _make_scheduler_output(denoise_req, step_id=0),
+        )
+
+        output = result.get_request_output("req-1")
+        assert output.finished is True
+        assert output.result is not None
+        transport = output.result.custom_output["stage_transport"]
+        assert transport.boundary == "dit_to_decode"
+        assert denoiser_runner.pipeline.prepare_calls == 0
+        assert denoiser_runner.pipeline.denoise_calls == 1
+        assert denoiser_runner.pipeline.scheduler_calls == 1
+        assert denoiser_runner.pipeline.decode_calls == 0
+
+    def test_decoder_role_consumes_decode_transport(self, monkeypatch):
+        monkeypatch.setattr(model_runner_module, "set_forward_context", _noop_forward_context)
+        encoder_runner = _make_runner()
+        encode_payload = DiffusionModelRunner.execute_encode(
+            encoder_runner,
+            _make_step_request(num_inference_steps=1),
+        )
+        denoiser_runner = _make_runner()
+        denoiser_runner.od_config.diffusion_stage_role = "denoiser"
+        denoise_req = _make_step_request(num_inference_steps=1)
+        denoise_req.stage_transport_payload = encode_payload
+        result = DiffusionModelRunner.execute_stepwise(
+            denoiser_runner,
+            _make_scheduler_output(denoise_req, step_id=0),
+        )
+        decode_payload = result.get_request_output("req-1").result.custom_output["stage_transport"]
+
+        decoder_runner = _make_runner()
+        decoder_runner.od_config.diffusion_stage_role = "decoder"
+        output = DiffusionModelRunner.execute_decode(decoder_runner, decode_payload)
+
+        assert torch.equal(output.output, torch.tensor([1.0]))
+        assert decoder_runner.pipeline.decode_calls == 1
+
+    def test_legacy_step_protocol_does_not_enable_stage_split(self, monkeypatch):
+        from vllm_omni.diffusion.models.interface import supports_diffusion_atoms
+
+        runner = _make_runner()
+        runner.pipeline = _LegacyStepPipeline()
+        monkeypatch.setattr(model_runner_module, "set_forward_context", _noop_forward_context)
+
+        assert supports_diffusion_atoms(runner.pipeline) is False
+        assert runner.supports_step_mode() is False
+        with pytest.raises(ValueError, match="does not support step execution"):
+            DiffusionModelRunner.execute_stepwise(
+                runner,
+                _make_scheduler_output(_make_step_request(num_inference_steps=1), step_id=0),
+            )
 
     def test_rejects_multi_request_step_batch(self):
         runner = _make_runner()
@@ -483,6 +649,7 @@ class TestRunner:
             cache_backend=None,
             cache_config=None,
             step_execution=True,
+            diffusion_stage_role="denoiser",
             model_class_name="RequestOnlyPipeline",
             parallel_config=SimpleNamespace(use_hsdp=False),
         )
@@ -772,6 +939,49 @@ class TestEngine:
         assert output.output is None
         assert output.error == "Diffusion execution finished without a final output."
 
+    def test_postprocess_diffusion_output_uses_engine_postprocess(self):
+        scheduler = StepScheduler()
+        scheduler.initialize(SimpleNamespace())
+        engine = _make_engine(scheduler)
+        engine.post_process_func = lambda output: ["converted-image", output.tolist()]
+        request = _make_engine_request("req-post", num_inference_steps=1)
+
+        results = engine.postprocess_diffusion_output(
+            request,
+            DiffusionOutput(output=torch.tensor([1.0])),
+            exec_total_time=0.001,
+        )
+
+        assert len(results) == 1
+        assert results[0].images == ["converted-image", [1.0]]
+        assert results[0].metrics["diffusion_engine_exec_time_ms"] == 1.0
+
+    def test_postprocess_diffusion_output_skips_image_postprocess_for_latents(self):
+        scheduler = StepScheduler()
+        scheduler.initialize(SimpleNamespace())
+        engine = _make_engine(scheduler)
+
+        def _unexpected_postprocess(output):
+            del output
+            raise AssertionError("latent output must not run image postprocess")
+
+        engine.post_process_func = _unexpected_postprocess
+        request = _make_engine_request("req-latent", num_inference_steps=1)
+        request.sampling_params.output_type = "latent"
+        latents = torch.ones((1, 4, 8), dtype=torch.float32)
+
+        results = engine.postprocess_diffusion_output(
+            request,
+            DiffusionOutput(output=latents),
+            exec_total_time=0.001,
+        )
+
+        assert len(results) == 1
+        assert results[0].images == []
+        assert results[0].final_output_type == "latents"
+        torch.testing.assert_close(results[0].latents, latents)
+        assert results[0].metrics["diffusion_engine_exec_time_ms"] == 1.0
+
 
 @pytest.mark.cpu
 class TestIPC:
@@ -787,30 +997,516 @@ class TestIPC:
         assert isinstance(unpacked.result.output, torch.Tensor)
         torch.testing.assert_close(unpacked.result.output, tensor)
 
+    def test_pack_unpack_stage_transport_shm_preserves_tensor_tree(self):
+        sampling = OmniDiffusionSamplingParams(num_inference_steps=2, output_type="pil")
+        state = DiffusionRequestState(
+            request_id="req-transport",
+            sampling=sampling,
+            prompts=["prompt"],
+            latents=torch.ones((1, 4), dtype=torch.float32),
+            timesteps=[torch.tensor(9.0), torch.tensor(3.0)],
+            step_index=1,
+        )
+        state.conditioning = {
+            "prompt_embeds": torch.zeros((300_000,), dtype=torch.float32),
+            "nested": [torch.tensor([1.0])],
+        }
+
+        payload = state.to_transport("encode_to_dit", conditioning=state.conditioning)
+        packed = pack_stage_transport_shm(payload)
+        assert packed.conditioning["prompt_embeds"]["__tensor_shm__"] is True
+
+        unpacked = unpack_stage_transport_shm(packed)
+        restored = DiffusionRequestState.from_transport(unpacked)
+
+        assert restored.request_id == "req-transport"
+        assert restored.step_index == 1
+        assert restored.sampling.output_type == "pil"
+        torch.testing.assert_close(restored.latents, state.latents)
+        torch.testing.assert_close(restored.timesteps[0], torch.tensor(9.0))
+        torch.testing.assert_close(restored.conditioning["prompt_embeds"], state.conditioning["prompt_embeds"])
+        torch.testing.assert_close(restored.conditioning["nested"][0], torch.tensor([1.0]))
+
+    def test_qwen_stage_transport_is_msgpack_safe_and_keeps_runner_cfg(self):
+        from vllm_omni.diffusion.models.qwen_image.step_batch import pack_qwen_conditioning, set_qwen_state
+        from vllm_omni.distributed.omni_connectors.utils.serialization import OmniMsgpackEncoder
+
+        state = DiffusionRequestState(
+            request_id="req-qwen-transport",
+            sampling=OmniDiffusionSamplingParams(num_inference_steps=2, output_type="latent"),
+            prompts=[
+                {
+                    "prompt": "prompt",
+                    "negative_prompt": " ",
+                    "multi_modal_data": {"image": object()},
+                    "additional_information": {
+                        "prompt_image": object(),
+                        "preprocessed_image": torch.zeros((1, 3, 8, 8), dtype=torch.float32),
+                    },
+                }
+            ],
+            latents=torch.ones((1, 4), dtype=torch.float32),
+            timesteps=torch.tensor([9.0, 3.0]),
+            step_index=0,
+        )
+        set_runner_step_config(state, do_true_cfg=True, true_cfg_scale=4.0, cfg_normalize=True)
+        state.sampling.generator = torch.Generator(device="cpu").manual_seed(456)
+        set_qwen_state(
+            state,
+            atom_args={
+                "prompt": "prompt",
+                "height": 512,
+                "width": 512,
+                "layers": 3,
+                "generator": torch.Generator(device="cpu").manual_seed(123),
+                "image": object(),
+            },
+            prompt_embeds=torch.zeros((1, 4, 8), dtype=torch.float32),
+            prompt_embeds_mask=torch.ones((1, 4), dtype=torch.bool),
+            txt_seq_lens=[4],
+            img_shapes=[[(1, 32, 32)]],
+        )
+
+        payload = state.to_transport("encode_to_dit", conditioning=pack_qwen_conditioning(state))
+        assert "generator" not in payload.conditioning["atom_args"]
+        assert "image" not in payload.conditioning["atom_args"]
+        assert payload.conditioning["atom_args"]["layers"] == 3
+
+        packed = pack_stage_transport_shm(payload)
+        OmniMsgpackEncoder().encode(packed)
+        restored = DiffusionRequestState.from_transport(unpack_stage_transport_shm(packed))
+        assert restored.prompts == [{"prompt": "prompt", "negative_prompt": " "}]
+        assert get_runner_step_config(restored) == (True, 4.0, True)
+
+    def test_qwen_model_inputs_keep_multirow_seq_lens_and_shapes(self):
+        from vllm_omni.diffusion.models.qwen_image.step_batch import build_qwen_model_inputs, set_qwen_state
+
+        state = DiffusionRequestState(
+            request_id="req-qwen-batch",
+            sampling=OmniDiffusionSamplingParams(num_outputs_per_prompt=2),
+            prompts=["prompt"],
+        )
+        set_qwen_state(
+            state,
+            prompt_embeds=torch.zeros((2, 4, 8), dtype=torch.float32),
+            prompt_embeds_mask=torch.tensor([[1, 1, 1, 1], [1, 1, 1, 0]], dtype=torch.bool),
+            txt_seq_lens=[4, 3],
+            img_shapes=[[(1, 32, 32)], [(1, 32, 32)]],
+        )
+
+        model_inputs = build_qwen_model_inputs([state])
+
+        assert model_inputs["prompt_embeds"].shape[0] == 2
+        assert model_inputs["txt_seq_lens"] == [4, 3]
+        assert model_inputs["img_shapes"] == [[(1, 32, 32)], [(1, 32, 32)]]
+
+    def test_qwen_model_inputs_use_request_attention_kwargs(self):
+        from vllm_omni.diffusion.models.qwen_image.step_batch import build_qwen_model_inputs, set_qwen_state
+
+        state = DiffusionRequestState(
+            request_id="req-qwen-attn",
+            sampling=OmniDiffusionSamplingParams(),
+            prompts=["prompt"],
+        )
+        set_qwen_state(
+            state,
+            prompt_embeds=torch.zeros((1, 4, 8), dtype=torch.float32),
+            prompt_embeds_mask=torch.ones((1, 4), dtype=torch.bool),
+            txt_seq_lens=[4],
+            attention_kwargs={"scale": 0.5},
+        )
+
+        model_inputs = build_qwen_model_inputs([state])
+
+        assert model_inputs["extra_transformer_kwargs"]["attention_kwargs"] == {"scale": 0.5}
+
+    def test_dit_to_decode_transport_drops_conditioning(self):
+        state = DiffusionRequestState(
+            request_id="req-decode-boundary",
+            sampling=OmniDiffusionSamplingParams(),
+            prompts=["prompt"],
+            conditioning={"prompt_embeds": torch.ones((1, 2), dtype=torch.float32)},
+            latents=torch.ones((1, 4), dtype=torch.float32),
+        )
+
+        payload = state.to_transport("dit_to_decode", conditioning=None)
+
+        assert payload.conditioning is None
+        assert payload.extra == {}
+        torch.testing.assert_close(payload.tensors["latents"], state.latents)
+
+    def test_qwen_predict_noise_preserves_cfg_transformer_kwargs_path(self):
+        from vllm_omni.diffusion.models.qwen_image.pipeline_qwen_image import QwenImagePipeline
+        from vllm_omni.diffusion.models.qwen_image.step_batch import QwenImageStepAtomsMixin
+
+        class _QwenMixinPipeline(QwenImageStepAtomsMixin, CFGParallelMixin):
+            def __init__(self):
+                self.transformer = _IdentityNoiseTransformer()
+
+        x = torch.tensor([1.0])
+        base_pipeline = object.__new__(QwenImagePipeline)
+        torch.nn.Module.__init__(base_pipeline)
+        base_pipeline.transformer = _IdentityNoiseTransformer()
+
+        torch.testing.assert_close(base_pipeline.predict_noise(x=x), x)
+        torch.testing.assert_close(_QwenMixinPipeline().predict_noise(x=x), x)
+
+    def test_qwen_decode_accepts_latents_alias_without_vae_decode(self):
+        from vllm_omni.diffusion.models.qwen_image.pipeline_qwen_image import QwenImagePipeline
+        from vllm_omni.diffusion.models.qwen_image.pipeline_qwen_image_layered import QwenImageLayeredPipeline
+        from vllm_omni.diffusion.models.qwen_image.step_batch import QwenImageStepAtomsMixin
+
+        class _MixinOnly(QwenImageStepAtomsMixin):
+            pass
+
+        latents = torch.ones((2, 4, 8), dtype=torch.float32)
+        for pipeline in (
+            object.__new__(QwenImagePipeline),
+            object.__new__(QwenImageLayeredPipeline),
+            object.__new__(_MixinOnly),
+        ):
+            output = pipeline._decode_latents(latents, height=64, width=64, output_type="latents")
+            torch.testing.assert_close(output.output, latents)
+
+    def test_merge_latent_outputs_keeps_all_prompts(self):
+        from vllm_omni.diffusion.stage_merge import merge_latent_outputs
+
+        first = torch.ones((1, 4, 8), dtype=torch.float32)
+        second = torch.full((2, 4, 8), 2.0, dtype=torch.float32)
+
+        merged = merge_latent_outputs([first, None, second])
+
+        assert merged.shape == (3, 4, 8)
+        torch.testing.assert_close(merged[0], first[0])
+        torch.testing.assert_close(merged[1:], second)
+
+    def test_qwen_stage_role_trimming_drops_unused_modules(self):
+        from vllm_omni.diffusion.models.qwen_image.step_batch import configure_qwen_stage_role
+
+        pipeline = SimpleNamespace(
+            text_encoder=object(),
+            tokenizer=object(),
+            processor=object(),
+            vl_processor=object(),
+            transformer=object(),
+            scheduler=object(),
+            vae=object(),
+            image_processor=object(),
+        )
+
+        dropped = configure_qwen_stage_role(pipeline, "decode")
+
+        assert set(dropped) == {
+            "text_encoder",
+            "tokenizer",
+            "processor",
+            "vl_processor",
+            "transformer",
+        }
+        assert hasattr(pipeline, "vae")
+        assert hasattr(pipeline, "scheduler")
+        assert hasattr(pipeline, "image_processor")
+
+    def test_runner_calls_pipeline_stage_role_config(self, mocker: MockerFixture):
+        runner = object.__new__(DiffusionModelRunner)
+        runner.od_config = SimpleNamespace(diffusion_stage_role="dit")
+        calls = []
+
+        class _Pipeline:
+            def configure_diffusion_stage_role(self, role):
+                calls.append(role)
+
+        runner.pipeline = _Pipeline()
+        mocker.patch.object(model_runner_module.current_omni_platform, "empty_cache", lambda: None)
+
+        runner._configure_pipeline_stage_role()
+
+        assert calls == ["dit"]
+
+    def test_transport_conditioning_is_unpacked_after_device_move(self):
+        captured: dict[str, Any] = {}
+
+        class _Pipeline:
+            def unpack_conditioning(self, payload, state):
+                captured["payload"] = payload
+                state.conditioning = payload
+                return state
+
+        runner = object.__new__(DiffusionModelRunner)
+        runner.pipeline = _Pipeline()
+        runner.device = torch.device("meta")
+        payload = DiffusionStateTransport(
+            boundary="encode_to_dit",
+            request_id="req-device",
+            sampling=OmniDiffusionSamplingParams(),
+            prompts=["prompt"],
+            conditioning={"prompt_embeds": torch.ones((1, 2), dtype=torch.float32)},
+        )
+
+        state = runner._state_from_transport(payload, expected_boundary="encode_to_dit")
+
+        assert captured["payload"]["prompt_embeds"].device.type == "meta"
+        assert state.conditioning["prompt_embeds"].device.type == "meta"
+
+    def test_stage_pool_treats_direct_latents_as_non_empty_output(self):
+        from vllm_omni.engine.stage_pool import StagePool
+
+        pool = StagePool(
+            stage_id=0,
+            clients=SimpleNamespace(
+                final_output_type="latents",
+                final_output=False,
+                stage_type="diffusion",
+            ),
+        )
+        request_output = SimpleNamespace(
+            final_output_type="latents",
+            latents=torch.ones((1, 4, 8), dtype=torch.float32),
+            trajectory_latents=None,
+            images=[],
+            outputs=[],
+        )
+
+        assert pool.has_non_empty_output(request_output) is True
+
+    def test_stage_pool_treats_stage_transport_as_empty_output(self):
+        from vllm_omni.engine.stage_pool import StagePool
+
+        pool = StagePool(
+            stage_id=0,
+            clients=SimpleNamespace(
+                final_output_type="stage_transport",
+                final_output=False,
+                stage_type="diffusion",
+            ),
+        )
+        request_output = StagePool._make_stage_transport_output(
+            "req-transport",
+            {"latents": torch.ones((1, 4), dtype=torch.float32)},
+        )
+
+        assert pool.has_non_empty_output(request_output) is False
+
+    @pytest.mark.asyncio
+    async def test_stage_pool_abort_cancels_inflight_diffusion_task(self):
+        from vllm_omni.engine.stage_pool import StagePool
+
+        class _Client:
+            stage_type = "diffusion"
+            final_output = False
+            final_output_type = "stage_transport"
+            diffusion_stage_role = "denoiser"
+
+            def __init__(self):
+                self.abort_calls = []
+
+            async def abort_requests_async(self, request_ids):
+                self.abort_calls.append(list(request_ids))
+
+        client = _Client()
+        pool = StagePool(stage_id=0, clients=[client])
+        pool._request_bindings["req-abort"] = 0
+        task = asyncio.create_task(asyncio.sleep(60))
+        pool._diffusion_stage_tasks["req-abort"] = task
+
+        await pool.abort_requests(["req-abort"])
+        await asyncio.sleep(0)
+
+        assert task.cancelled()
+        assert "req-abort" not in pool._diffusion_stage_tasks
+        assert client.abort_calls == [["req-abort"]]
+
+    @pytest.mark.asyncio
+    async def test_stage_pool_encoder_role_accepts_batched_prompts(self):
+        from vllm_omni.engine.stage_pool import StagePool
+
+        class _Client:
+            def __init__(self):
+                self.batch_calls = []
+                self.outputs = []
+
+            async def stage_encode_request_async(self, *args, **kwargs):
+                raise AssertionError("single-prompt encoder path should not be used")
+
+            async def stage_encode_batch_request_async(
+                self,
+                request_id,
+                prompts,
+                sampling_params,
+                *,
+                kv_sender_info=None,
+            ):
+                self.batch_calls.append((request_id, list(prompts), sampling_params, kv_sender_info))
+                return {"prompts": list(prompts)}
+
+            def put_diffusion_output_nowait(self, output):
+                self.outputs.append(output)
+
+        pool = object.__new__(StagePool)
+        pool.stage_id = 0
+        pool._diffusion_stage_tasks = {}
+        client = _Client()
+        sampling_params = OmniDiffusionSamplingParams()
+        kv_sender_info = {0: {"host": "127.0.0.1", "zmq_port": 50151}}
+
+        await pool._run_diffusion_stage_role(
+            "req-batch",
+            client,
+            "encoder",
+            ["prompt-1", "prompt-2"],
+            sampling_params,
+            kv_sender_info=kv_sender_info,
+        )
+
+        assert client.batch_calls == [("req-batch", ["prompt-1", "prompt-2"], sampling_params, kv_sender_info)]
+        assert client.outputs[0].request_id == "req-batch"
+        assert client.outputs[0].custom_output["stage_transport"] == {"prompts": ["prompt-1", "prompt-2"]}
+        assert client.outputs[0].final_output_type == "stage_transport"
+
 
 @pytest.mark.cpu
 class TestSupportedPipelines:
     """Step-execution protocol checks for supported pipelines."""
 
-    def test_default_stage_config_includes_step_execution(self):
+    def test_default_stage_config_keeps_monolithic_on_forward_path(self):
         stage_cfg = AsyncOmniEngine._create_default_diffusion_stage_cfg(
             {
                 "step_execution": True,
             }
         )[0]
 
+        assert stage_cfg["engine_args"]["step_execution"] is False
+        assert stage_cfg["engine_args"]["diffusion_stage_role"] == "monolithic"
+
+    def test_default_stage_config_enables_step_execution_for_split_role(self):
+        stage_cfg = AsyncOmniEngine._create_default_diffusion_stage_cfg(
+            {
+                "diffusion_stage_role": "denoiser",
+            }
+        )[0]
+
         assert stage_cfg["engine_args"]["step_execution"] is True
+        assert stage_cfg["engine_args"]["diffusion_stage_role"] == "denoiser"
 
-    def test_qwen_image_supports_step_execution(self):
-        from vllm_omni.diffusion.models.interface import SupportsStepExecution, supports_step_execution
-        from vllm_omni.diffusion.models.qwen_image.pipeline_qwen_image import QwenImagePipeline
+    def test_default_stage_config_maps_model_stage_alias_to_split_role(self):
+        stage_cfg = AsyncOmniEngine._create_default_diffusion_stage_cfg(
+            {
+                "model_stage": "dit",
+            }
+        )[0]
 
+        assert stage_cfg["engine_args"]["step_execution"] is True
+        assert stage_cfg["engine_args"]["diffusion_stage_role"] == "denoiser"
+        assert stage_cfg["engine_args"]["model_stage"] == "dit"
+
+    def test_diffusion_stage_role_mapping(self):
+        from vllm_omni.diffusion.stage_kind import DiffusionStageKind, diffusion_role_from_model_stage, role_affinity
+
+        assert diffusion_role_from_model_stage("diffusion").value == "monolithic"
+        assert diffusion_role_from_model_stage("encode").value == "encoder"
+        assert diffusion_role_from_model_stage("dit").value == "denoiser"
+        assert diffusion_role_from_model_stage("decode").value == "decoder"
+        assert role_affinity("denoiser", DiffusionStageKind.DENOISING) is True
+        assert role_affinity("denoiser", DiffusionStageKind.DECODING) is False
+
+    def test_split_diffusion_stage_skips_monolithic_dummy_run(self):
+        engine = object.__new__(DiffusionEngine)
+        engine.od_config = SimpleNamespace(diffusion_stage_role="encoder")
+
+        engine._dummy_run()
+
+    def test_orchestrator_forwards_stage_transport_as_diffusion_prompt(self):
+        from vllm_omni.engine.orchestrator import Orchestrator
+        from vllm_omni.engine.stage_pool import StagePool
+
+        payload = {"latents": torch.tensor([1.0])}
+        output = StagePool._make_stage_transport_output("req-transport", payload)
+
+        prompt = Orchestrator._stage_transport_prompt_from_output(output)
+
+        assert prompt is not None
+        torch.testing.assert_close(prompt["stage_transport"]["latents"], payload["latents"])
+
+    @pytest.mark.parametrize(
+        "pipeline_cls_path",
+        [
+            "vllm_omni.diffusion.models.qwen_image.pipeline_qwen_image.QwenImagePipeline",
+            "vllm_omni.diffusion.models.qwen_image.pipeline_qwen_image_edit.QwenImageEditPipeline",
+            "vllm_omni.diffusion.models.qwen_image.pipeline_qwen_image_edit_plus.QwenImageEditPlusPipeline",
+            "vllm_omni.diffusion.models.qwen_image.pipeline_qwen_image_layered.QwenImageLayeredPipeline",
+        ],
+    )
+    def test_qwen_image_supports_diffusion_atoms(self, pipeline_cls_path):
+        import importlib
+
+        from vllm_omni.diffusion.models.interface import (
+            SupportsDiffusionAtoms,
+            supports_diffusion_atoms,
+        )
+
+        module_name, cls_name = pipeline_cls_path.rsplit(".", 1)
+        pipeline_cls = getattr(importlib.import_module(module_name), cls_name)
         # Avoid loading model weights; protocol membership depends on the class contract.
-        pipeline = object.__new__(QwenImagePipeline)
+        pipeline = object.__new__(pipeline_cls)
 
-        assert pipeline.supports_step_execution is True
-        assert supports_step_execution(pipeline) is True
-        assert isinstance(pipeline, SupportsStepExecution) is True
+        assert pipeline.supports_diffusion_atoms is True
+        assert supports_diffusion_atoms(pipeline) is True
+        assert isinstance(pipeline, SupportsDiffusionAtoms) is True
+        assert getattr(pipeline, "interrupt", False) is False
+        assert getattr(pipeline, "attention_kwargs", None) == {}
+        assert getattr(pipeline, "current_timestep", "unset") is None
+
+    @pytest.mark.parametrize(
+        "pipeline_cls_path",
+        [
+            "vllm_omni.diffusion.models.qwen_image.pipeline_qwen_image.QwenImagePipeline",
+            "vllm_omni.diffusion.models.qwen_image.pipeline_qwen_image_edit.QwenImageEditPipeline",
+            "vllm_omni.diffusion.models.qwen_image.pipeline_qwen_image_edit_plus.QwenImageEditPlusPipeline",
+            "vllm_omni.diffusion.models.qwen_image.pipeline_qwen_image_layered.QwenImageLayeredPipeline",
+        ],
+    )
+    def test_qwen_image_forward_stays_upstream_shaped(self, pipeline_cls_path):
+        import importlib
+        import inspect
+
+        module_name, cls_name = pipeline_cls_path.rsplit(".", 1)
+        pipeline_cls = getattr(importlib.import_module(module_name), cls_name)
+
+        source = inspect.getsource(pipeline_cls.forward)
+
+        assert "run_qwen_atom_forward" not in source
+        assert "req.sampling_params.true_cfg_scale or true_cfg_scale" not in source
+        assert "req.sampling_params.true_cfg_scale is not None" in source
+        assert "req.sampling_params.output_type is not None" in source
+        if cls_name == "QwenImageLayeredPipeline":
+            assert "images = image" in source
+
+    @pytest.mark.parametrize(
+        "pipeline_cls_path",
+        [
+            "vllm_omni.diffusion.models.qwen_image.step_batch.QwenImageStepAtomsMixin",
+            "vllm_omni.diffusion.models.qwen_image.pipeline_qwen_image.QwenImagePipeline",
+            "vllm_omni.diffusion.models.qwen_image.pipeline_qwen_image_layered.QwenImageLayeredPipeline",
+        ],
+    )
+    def test_qwen_rehydrate_restores_transport_attention_kwargs(self, pipeline_cls_path):
+        import importlib
+
+        from vllm_omni.diffusion.models.qwen_image.step_batch import set_qwen_state
+
+        module_name, cls_name = pipeline_cls_path.rsplit(".", 1)
+        pipeline_cls = getattr(importlib.import_module(module_name), cls_name)
+        pipeline = object.__new__(pipeline_cls)
+        object.__setattr__(pipeline, "scheduler", None)
+        state = DiffusionRequestState(
+            request_id="req-attention",
+            sampling=OmniDiffusionSamplingParams(),
+        )
+        set_qwen_state(state, atom_args={"attention_kwargs": {"scale": 0.5}})
+
+        pipeline.rehydrate_stage_state(state)
+
+        assert getattr(pipeline, "_attention_kwargs") == {"scale": 0.5}
 
 
 @hardware_test(

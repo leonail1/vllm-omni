@@ -92,6 +92,8 @@ class StagePoolLLMClient(StagePoolClient, Protocol):
 class StagePoolDiffusionClient(StagePoolClient, Protocol):
     """Pool-facing API for diffusion stages."""
 
+    diffusion_stage_role: str
+
     async def add_request_async(
         self,
         request_id: str,
@@ -107,5 +109,38 @@ class StagePoolDiffusionClient(StagePoolClient, Protocol):
         sampling_params: OmniDiffusionSamplingParams,
         kv_sender_info: dict[int, dict[str, Any]] | None = None,
     ) -> None: ...
+
+    async def stage_encode_request_async(
+        self,
+        request_id: str,
+        prompt: OmniPromptType,
+        sampling_params: OmniDiffusionSamplingParams,
+        kv_sender_info: dict[int, dict[str, Any]] | None = None,
+        timeout: float | None = None,
+    ) -> Any: ...
+
+    async def stage_encode_batch_request_async(
+        self,
+        request_id: str,
+        prompts: list[OmniPromptType],
+        sampling_params: OmniDiffusionSamplingParams,
+        kv_sender_info: dict[int, dict[str, Any]] | None = None,
+        timeout: float | None = None,
+    ) -> Any: ...
+
+    async def stage_dit_transport_async(
+        self,
+        request_id: str,
+        payload: Any,
+        timeout: float | None = None,
+    ) -> Any: ...
+
+    async def stage_decode_transport_async(
+        self,
+        request_id: str,
+        payload: Any,
+    ) -> None: ...
+
+    def put_diffusion_output_nowait(self, output: OmniRequestOutput) -> None: ...
 
     def get_diffusion_output_nowait(self) -> OmniRequestOutput | None: ...

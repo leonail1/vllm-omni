@@ -21,6 +21,7 @@ import zmq.asyncio
 from vllm.logger import init_logger
 from vllm.v1.engine.exceptions import EngineDeadError
 
+from vllm_omni.diffusion.ipc import discard_stage_transport_shm, pack_stage_transport_shm, unpack_stage_transport_shm
 from vllm_omni.diffusion.stage_diffusion_proc import (
     StageDiffusionProc,
     complete_diffusion_handshake,
@@ -120,6 +121,7 @@ class StageDiffusionClient(StageClientBase):
         self.final_output = metadata.final_output
         self.final_output_type = metadata.final_output_type
         self.model_stage = getattr(metadata, "model_stage", None)
+        self.diffusion_stage_role = getattr(metadata, "diffusion_stage_role", "monolithic")
         self.default_sampling_params = metadata.default_sampling_params
         self.requires_multimodal_data = getattr(metadata, "requires_multimodal_data", False)
         self.custom_process_input_func = getattr(metadata, "custom_process_input_func", None)
@@ -146,6 +148,9 @@ class StageDiffusionClient(StageClientBase):
 
         self._output_queue: asyncio.Queue[OmniRequestOutput] = asyncio.Queue()
         self._rpc_results: dict[str, Any] = {}
+        self._stage_payloads: dict[str, Any] = {}
+        self._stage_errors: dict[str, tuple[str, int | None, str | None]] = {}
+        self._pending_stage_payloads: set[str] = set()
         self._pending_rpcs: set[str] = set()
         self._tasks: dict[str, asyncio.Task] = {}
         self._shutting_down = False
@@ -223,6 +228,18 @@ class StageDiffusionClient(StageClientBase):
 
             if msg_type == "result":
                 self._output_queue.put_nowait(msg["output"])
+            elif msg_type == "stage_transport":
+                req_id = msg["request_id"]
+                if req_id in self._pending_stage_payloads:
+                    self._stage_payloads[req_id] = unpack_stage_transport_shm(msg["payload"])
+                else:
+                    discard_stage_transport_shm(msg["payload"])
+                    logger.debug(
+                        "[StageDiffusionClient] stage-%s [rep-%s] dropped unawaited stage payload for req=%s.",
+                        self.stage_id,
+                        self.replica_id,
+                        req_id,
+                    )
             elif msg_type == "rpc_result":
                 self._rpc_results[msg["rpc_id"]] = msg["result"]
             elif msg_type == "error":
@@ -244,6 +261,8 @@ class StageDiffusionClient(StageClientBase):
                         "error": True,
                         "reason": error_msg,
                     }
+                if req_id is not None and req_id in self._pending_stage_payloads:
+                    self._stage_errors[req_id] = (error_msg, status_code, error_type)
                 # Route request errors as error outputs so the Orchestrator
                 # sees the request complete (instead of hanging forever).
                 if req_id is not None:
@@ -403,6 +422,115 @@ class StageDiffusionClient(StageClientBase):
             await self._output_queue.put(OmniRequestOutput.from_error(request_id, str(e)))
         finally:
             self._tasks.pop(request_id, None)
+
+    def _send_stage_message(self, msg: dict[str, Any]) -> None:
+        if self._engine_dead:
+            raise EngineDeadError()
+        self._request_socket.send(self._encoder.encode(msg))
+
+    async def _stage_payload_call_async(
+        self,
+        msg: dict[str, Any],
+        request_id: str,
+        timeout: float | None,
+    ) -> Any:
+        self._send_stage_message(msg)
+        # Encode and DiT stages return intermediate transport payloads, not
+        # final OmniRequestOutput objects, so wait on the stage-payload map.
+        return await self._wait_stage_payload(request_id, timeout)
+
+    async def stage_encode_request_async(
+        self,
+        request_id: str,
+        prompt: OmniPromptType,
+        sampling_params: OmniDiffusionSamplingParams,
+        kv_sender_info: dict[int, dict[str, Any]] | None = None,
+        timeout: float | None = None,
+    ) -> Any:
+        return await self._stage_payload_call_async(
+            {
+                "type": "stage_encode_request",
+                "request_id": request_id,
+                "prompt": prompt,
+                "sampling_params": self._sampling_params_to_dict(sampling_params),
+                "kv_sender_info": kv_sender_info,
+            },
+            request_id,
+            timeout,
+        )
+
+    async def stage_encode_batch_request_async(
+        self,
+        request_id: str,
+        prompts: list[OmniPromptType],
+        sampling_params: OmniDiffusionSamplingParams,
+        kv_sender_info: dict[int, dict[str, Any]] | None = None,
+        timeout: float | None = None,
+    ) -> Any:
+        return await self._stage_payload_call_async(
+            {
+                "type": "stage_encode_batch_request",
+                "request_id": request_id,
+                "prompts": prompts,
+                "sampling_params": self._sampling_params_to_dict(sampling_params),
+                "kv_sender_info": kv_sender_info,
+            },
+            request_id,
+            timeout,
+        )
+
+    async def stage_dit_transport_async(
+        self,
+        request_id: str,
+        payload: Any,
+        timeout: float | None = None,
+    ) -> Any:
+        return await self._stage_payload_call_async(
+            {
+                "type": "stage_dit_transport",
+                "request_id": request_id,
+                "payload": pack_stage_transport_shm(payload),
+            },
+            request_id,
+            timeout,
+        )
+
+    async def stage_decode_transport_async(
+        self,
+        request_id: str,
+        payload: Any,
+    ) -> None:
+        self._send_stage_message(
+            {
+                "type": "stage_decode_transport",
+                "request_id": request_id,
+                "payload": pack_stage_transport_shm(payload),
+            }
+        )
+
+    def put_diffusion_output_nowait(self, output: OmniRequestOutput) -> None:
+        self._output_queue.put_nowait(output)
+
+    async def _wait_stage_payload(self, request_id: str, timeout: float | None) -> Any:
+        deadline = time.monotonic() + timeout if timeout else None
+        self._pending_stage_payloads.add(request_id)
+        try:
+            while True:
+                # Polling can deliver either the desired payload or an async
+                # stage error for the same request_id.
+                self._drain_responses()
+                if request_id in self._stage_payloads:
+                    return self._stage_payloads.pop(request_id)
+                if request_id in self._stage_errors:
+                    error_msg, _, _ = self._stage_errors.pop(request_id)
+                    raise RuntimeError(error_msg)
+                if self._engine_dead:
+                    raise EngineDeadError()
+                if deadline is not None and time.monotonic() > deadline:
+                    raise TimeoutError(f"Timed out waiting for stage payload {request_id}.")
+                await self._response_poller.poll(timeout=100)
+        finally:
+            self._pending_stage_payloads.discard(request_id)
 
     def get_diffusion_output_nowait(self) -> OmniRequestOutput | None:
         self._drain_responses()

@@ -383,6 +383,16 @@ class DiffusionWorker:
             profiler.step()
         return output
 
+    def execute_encode(self, req: OmniDiffusionRequest):
+        """Execute the encode role and return a stage transport payload."""
+        assert self.model_runner is not None, "Model runner not initialized"
+        return self.model_runner.execute_encode(req)
+
+    def execute_decode(self, payload):
+        """Execute the decode role from a stage transport payload."""
+        assert self.model_runner is not None, "Model runner not initialized"
+        return self.model_runner.execute_decode(payload)
+
     def _activate_step_lora(self, scheduler_output: DiffusionSchedulerOutput) -> None:
         """Activate the LoRA adapter for the scheduled step batch.
 

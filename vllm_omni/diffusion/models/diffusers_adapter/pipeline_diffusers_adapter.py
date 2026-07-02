@@ -46,8 +46,6 @@ class DiffusersAdapterPipeline(nn.Module, DiffusionPipelineProfilerMixin):
     batching mode.
     """
 
-    supports_step_execution: bool = False
-
     def __init__(self, *, od_config: OmniDiffusionConfig, device: torch.device | None = None):
         super().__init__()
         self._pipeline: DiffusionPipeline
@@ -118,34 +116,6 @@ class DiffusersAdapterPipeline(nn.Module, DiffusionPipelineProfilerMixin):
 
         # Attention backend
         self._set_attention_backend()
-
-    # ------------------------------------------------------------------
-    # Step-wise execution — explicitly rejected
-    # ------------------------------------------------------------------
-
-    def prepare_encode(self, **_: Any) -> Any:
-        raise NotImplementedError(
-            "Step-wise execution is not yet supported with the diffusers backend. "
-            "Use a native pipeline for continuous batching mode."
-        )
-
-    def denoise_step(self, **_: Any) -> torch.Tensor | None:
-        raise NotImplementedError(
-            "Step-wise execution is not yet supported with the diffusers backend. "
-            "Use a native pipeline for continuous batching mode."
-        )
-
-    def step_scheduler(self, **_: Any) -> None:
-        raise NotImplementedError(
-            "Step-wise execution is not yet supported with the diffusers backend. "
-            "Use a native pipeline for continuous batching mode."
-        )
-
-    def post_decode(self, **_: Any) -> Any:
-        raise NotImplementedError(
-            "Step-wise execution is not yet supported with the diffusers backend. "
-            "Use a native pipeline for continuous batching mode."
-        )
 
     # ------------------------------------------------------------------
     # Forward pass

@@ -1087,7 +1087,11 @@ class AsyncOmniEngine:
                                     plan.metadata,
                                     stage_init_timeout=stage_init_timeout,
                                     batch_size=self.diffusion_batch_size,
-                                    use_inline=self.num_stages == 1 and plan.num_replicas == 1,
+                                    use_inline=(
+                                        self.num_stages == 1
+                                        and plan.num_replicas == 1
+                                        and getattr(plan.metadata, "diffusion_stage_role", "monolithic") == "monolithic"
+                                    ),
                                 )
                     finally:
                         if previous_visible_devices is None:
@@ -1943,13 +1947,29 @@ class AsyncOmniEngine:
                 attention_backend=kwargs.get("diffusion_attention_backend"),
             )
 
+        from vllm_omni.diffusion.stage_kind import (
+            DiffusionStageRole,
+            diffusion_role_from_model_stage,
+            normalize_diffusion_stage_role,
+        )
+
+        explicit_role = kwargs.get("diffusion_stage_role")
+        model_stage = kwargs.get("model_stage")
+        diffusion_stage_role = (
+            normalize_diffusion_stage_role(explicit_role)
+            if explicit_role is not None
+            else diffusion_role_from_model_stage(model_stage)
+        )
+        stage_split_enabled = diffusion_stage_role != DiffusionStageRole.MONOLITHIC
         stage_engine_args = {
             "max_num_seqs": kwargs.get("max_num_seqs") or 1,
             "parallel_config": parallel_config,
             "model_class_name": kwargs.get("model_class_name", None),
             "model_config": kwargs.get("model_config", None),
             "additional_config": kwargs.get("additional_config", None),
-            "step_execution": kwargs.get("step_execution", False),
+            "step_execution": stage_split_enabled,
+            "diffusion_stage_role": diffusion_stage_role.value,
+            "diffusion_stage_kinds": kwargs.get("diffusion_stage_kinds", None),
             "vae_use_slicing": kwargs.get("vae_use_slicing", False),
             "vae_use_tiling": kwargs.get("vae_use_tiling", False),
             "cache_backend": cache_backend,
@@ -2018,7 +2038,7 @@ class AsyncOmniEngine:
                 "final_output_type": final_output_type,
             }
         ]
-        default_stage_cfg[0]["engine_args"]["model_stage"] = "diffusion"
+        default_stage_cfg[0]["engine_args"]["model_stage"] = model_stage or "diffusion"
         return default_stage_cfg
 
     @staticmethod

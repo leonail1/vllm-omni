@@ -253,6 +253,43 @@ def test_initialize_diffusion_replica_passes_stage_init_timeout_and_inline_flag(
     }
 
 
+def test_initialize_split_diffusion_replica_disables_inline(monkeypatch):
+    import vllm_omni.engine.async_omni_engine as engine_mod
+
+    engine = object.__new__(AsyncOmniEngine)
+    engine.model = "dummy-model"
+    engine.num_stages = 1
+    engine.diffusion_batch_size = 4
+    engine.single_stage_mode = False
+    engine._omni_master_server = None
+    engine.stage_configs = []
+
+    plan = _make_diffusion_plan(0, configured_stage_id=0).replicas[0]
+    plan.metadata.diffusion_stage_role = "denoiser"
+
+    captured: dict[str, object] = {}
+
+    @contextmanager
+    def _noop_stage_runtime_setup(*_):
+        yield
+
+    monkeypatch.setattr(engine_mod, "stage_runtime_setup", _noop_stage_runtime_setup)
+    monkeypatch.setattr(engine_mod, "inject_kv_stage_info", lambda *_: None)
+
+    def _capture_initialize_diffusion_stage(
+        stage_id, _model, _stage_cfg, _metadata, *, stage_init_timeout, batch_size, use_inline
+    ):
+        del stage_id, stage_init_timeout, batch_size
+        captured["use_inline"] = use_inline
+        return types.SimpleNamespace()
+
+    monkeypatch.setattr(engine_mod, "initialize_diffusion_stage", _capture_initialize_diffusion_stage)
+
+    engine._initialize_diffusion_replica(plan, stage_init_timeout=302, stage_launch_lock=threading.Lock())
+
+    assert captured["use_inline"] is False
+
+
 def test_initialize_stages_exposes_logical_stage_views_and_builds_top_level_input_processor(monkeypatch):
     import vllm_omni.engine.async_omni_engine as engine_mod
 

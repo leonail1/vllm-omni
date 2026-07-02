@@ -11,11 +11,13 @@ serialised through the queue.
 
 from __future__ import annotations
 
+from contextlib import suppress
 from typing import Any
 
 import torch
 
 from vllm_omni.diffusion.data import DiffusionOutput
+from vllm_omni.diffusion.worker.utils import DiffusionStateTransport
 
 _SHM_TENSOR_THRESHOLD = 1_000_000  # 1 MB
 DIFFUSION_RPC_RESULT_ENVELOPE = "diffusion_rpc_result"
@@ -117,6 +119,74 @@ def _unpack_if_shm_handle(val: object) -> object:
     if isinstance(val, tuple):
         return tuple(_unpack_if_shm_handle(item) for item in val)
     return val
+
+
+def _discard_if_shm_handle(val: object) -> None:
+    """Free shared-memory tensor handles without reconstructing tensors."""
+    if isinstance(val, dict) and val.get("__tensor_shm__"):
+        from multiprocessing import shared_memory
+
+        with suppress(FileNotFoundError):
+            shm = shared_memory.SharedMemory(name=val["name"])
+            try:
+                shm.unlink()
+            finally:
+                shm.close()
+        return
+    if isinstance(val, dict):
+        for value in val.values():
+            _discard_if_shm_handle(value)
+    elif isinstance(val, (list, tuple)):
+        for item in val:
+            _discard_if_shm_handle(item)
+
+
+def pack_stage_transport_shm(payload: object) -> object:
+    """Replace stage transport tensors with shared-memory handles."""
+    if isinstance(payload, DiffusionStateTransport):
+        return DiffusionStateTransport(
+            boundary=payload.boundary,
+            request_id=payload.request_id,
+            sampling=payload.sampling,
+            prompts=list(payload.prompts) if payload.prompts is not None else None,
+            meta=_pack_value_if_large(dict(payload.meta)),
+            tensors={key: _pack_value_if_large(value) for key, value in payload.tensors.items()},
+            conditioning=_pack_value_if_large(payload.conditioning),
+            extra=_pack_value_if_large(dict(payload.extra)),
+        )
+    if isinstance(payload, dict) and "tensors" in payload:
+        packed = dict(payload)
+        packed["meta"] = _pack_value_if_large(dict(packed.get("meta") or {}))
+        packed["tensors"] = {
+            key: _pack_value_if_large(value)
+            for key, value in (packed.get("tensors") or {}).items()
+        }
+        packed["conditioning"] = _pack_value_if_large(packed.get("conditioning"))
+        packed["extra"] = _pack_value_if_large(dict(packed.get("extra") or {}))
+        return packed
+    return _pack_value_if_large(payload)
+
+
+def unpack_stage_transport_shm(payload: object) -> object:
+    """Restore tensors from shared-memory handles inside stage transport."""
+    if isinstance(payload, DiffusionStateTransport):
+        payload.meta = _unpack_if_shm_handle(payload.meta)
+        payload.tensors = {key: _unpack_if_shm_handle(value) for key, value in payload.tensors.items()}
+        payload.conditioning = _unpack_if_shm_handle(payload.conditioning)
+        payload.extra = _unpack_if_shm_handle(payload.extra)
+        return payload
+    return _unpack_if_shm_handle(payload)
+
+
+def discard_stage_transport_shm(payload: object) -> None:
+    """Release shared-memory handles from a stage transport payload that is dropped."""
+    if isinstance(payload, DiffusionStateTransport):
+        _discard_if_shm_handle(payload.meta)
+        _discard_if_shm_handle(payload.tensors)
+        _discard_if_shm_handle(payload.conditioning)
+        _discard_if_shm_handle(payload.extra)
+        return
+    _discard_if_shm_handle(payload)
 
 
 def _pack_diffusion_fields(output: DiffusionOutput) -> DiffusionOutput:

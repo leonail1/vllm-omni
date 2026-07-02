@@ -26,7 +26,10 @@ from vllm.v1.utils import shutdown
 
 from vllm_omni.diffusion.data import DiffusionRequestAbortedError
 from vllm_omni.diffusion.diffusion_engine import DiffusionEngine
+from vllm_omni.diffusion.ipc import pack_stage_transport_shm, unpack_stage_transport_shm
 from vllm_omni.diffusion.request import OmniDiffusionRequest
+from vllm_omni.diffusion.stage_merge import merge_latent_outputs
+from vllm_omni.diffusion.worker.utils import DiffusionRequestState
 from vllm_omni.distributed.omni_connectors.utils.serialization import (
     OmniMsgpackDecoder,
     OmniMsgpackEncoder,
@@ -202,7 +205,7 @@ class StageDiffusionProc:
         merged_durations: dict[str, float] = {}
         merged_custom: dict[str, Any] = {}
         peak_mem = 0.0
-        latents = None
+        latent_values: list[Any] = []
         trajectory_latents: list[torch.Tensor] | None = None
         trajectory_timesteps: list[torch.Tensor] | None = None
         trajectory_log_probs: torch.Tensor | None = None
@@ -210,14 +213,15 @@ class StageDiffusionProc:
         final_output_type = "image"
 
         for r in results:
+            # A batched diffusion submission returns one output per prompt;
+            # fold them back into the single request_id expected upstream.
             all_images.extend(r.images)
             merged_mm.update(r._multimodal_output)
             merged_metrics.update(r.metrics)
             merged_durations.update(r.stage_durations)
             merged_custom.update(r._custom_output)
             peak_mem = max(peak_mem, r.peak_memory_mb)
-            if latents is None and r.latents is not None:
-                latents = r.latents
+            latent_values.append(r.latents)
             if trajectory_latents is None:
                 trajectory_latents = r.trajectory_latents
             if trajectory_timesteps is None:
@@ -234,7 +238,7 @@ class StageDiffusionProc:
             images=all_images,
             prompt=prompts[0] if len(prompts) == 1 else None,
             metrics=merged_metrics,
-            latents=latents,
+            latents=merge_latent_outputs(latent_values),
             trajectory_latents=trajectory_latents,
             trajectory_timesteps=trajectory_timesteps,
             trajectory_log_probs=trajectory_log_probs,
@@ -514,6 +518,216 @@ class StageDiffusionProc:
                             msg["sampling_params"],
                             msg.get("kv_sender_info"),
                         )
+                    )
+                    tasks[request_id] = task
+
+                elif msg_type == "stage_encode_request":
+                    request_id = msg["request_id"]
+
+                    async def _dispatch_stage_encode(rid: str, msg_in: dict[str, Any]) -> None:
+                        try:
+                            sampling_params = self._reconstruct_sampling_params(msg_in["sampling_params"])
+                            request = OmniDiffusionRequest(
+                                prompts=[msg_in["prompt"]],
+                                sampling_params=sampling_params,
+                                request_id=rid,
+                                kv_sender_info=msg_in.get("kv_sender_info"),
+                            )
+                            if self._engine.pre_process_func is not None:
+                                request = self._engine.pre_process_func(request)
+                            payload = await self._engine.async_collective_rpc(
+                                "execute_encode",
+                                args=(request,),
+                                unique_reply_rank=0,
+                            )
+                            await response_socket.send(
+                                encoder.encode(
+                                    {
+                                        "type": "stage_transport",
+                                        "request_id": rid,
+                                        "payload": pack_stage_transport_shm(payload),
+                                    }
+                                )
+                            )
+                        except DiffusionRequestAbortedError as e:
+                            logger.info("stage encode request_id: %s aborted: %s", rid, str(e))
+                        except Exception as e:
+                            logger.exception("Stage encode request %s failed: %s", rid, e)
+                            status_code, error_type = client_error_metadata(e)
+                            await response_socket.send(
+                                encoder.encode(
+                                    {
+                                        "type": "error",
+                                        "request_id": rid,
+                                        "error": str(e),
+                                        "status_code": status_code,
+                                        "error_type": error_type,
+                                    }
+                                )
+                            )
+                            if self._is_executor_dead():
+                                self._signal_fatal_engine_failure(f"stage_encode_request {rid}: {e!s}")
+                        finally:
+                            tasks.pop(rid, None)
+
+                    task = asyncio.create_task(
+                        _dispatch_stage_encode(request_id, msg),
+                        name=f"diffusion-stage-encode-{request_id}",
+                    )
+                    tasks[request_id] = task
+
+                elif msg_type == "stage_encode_batch_request":
+                    request_id = msg["request_id"]
+
+                    async def _dispatch_stage_encode_batch(rid: str, msg_in: dict[str, Any]) -> None:
+                        try:
+                            sampling_params = self._reconstruct_sampling_params(msg_in["sampling_params"])
+                            request = OmniDiffusionRequest(
+                                prompts=list(msg_in["prompts"]),
+                                sampling_params=sampling_params,
+                                request_id=rid,
+                                kv_sender_info=msg_in.get("kv_sender_info"),
+                            )
+                            if self._engine.pre_process_func is not None:
+                                request = self._engine.pre_process_func(request)
+                            payload = await self._engine.async_collective_rpc(
+                                "execute_encode",
+                                args=(request,),
+                                unique_reply_rank=0,
+                            )
+                            await response_socket.send(
+                                encoder.encode(
+                                    {
+                                        "type": "stage_transport",
+                                        "request_id": rid,
+                                        "payload": pack_stage_transport_shm(payload),
+                                    }
+                                )
+                            )
+                        except DiffusionRequestAbortedError as e:
+                            logger.info("stage encode batch request_id: %s aborted: %s", rid, str(e))
+                        except Exception as e:
+                            logger.exception("Stage encode batch request %s failed: %s", rid, e)
+                            status_code, error_type = client_error_metadata(e)
+                            await response_socket.send(
+                                encoder.encode(
+                                    {
+                                        "type": "error",
+                                        "request_id": rid,
+                                        "error": str(e),
+                                        "status_code": status_code,
+                                        "error_type": error_type,
+                                    }
+                                )
+                            )
+                            if self._is_executor_dead():
+                                self._signal_fatal_engine_failure(f"stage_encode_batch_request {rid}: {e!s}")
+                        finally:
+                            tasks.pop(rid, None)
+
+                    task = asyncio.create_task(
+                        _dispatch_stage_encode_batch(request_id, msg),
+                        name=f"diffusion-stage-encode-batch-{request_id}",
+                    )
+                    tasks[request_id] = task
+
+                elif msg_type == "stage_dit_transport":
+                    request_id = msg["request_id"]
+
+                    async def _dispatch_stage_dit(rid: str, payload_in: Any) -> None:
+                        try:
+                            payload_in = unpack_stage_transport_shm(payload_in)
+                            payload_out = await self._engine.async_add_stage_transport_and_wait_for_response(payload_in)
+                            await response_socket.send(
+                                encoder.encode(
+                                    {
+                                        "type": "stage_transport",
+                                        "request_id": rid,
+                                        "payload": pack_stage_transport_shm(payload_out),
+                                    }
+                                )
+                            )
+                        except DiffusionRequestAbortedError as e:
+                            logger.info("stage DiT request_id: %s aborted: %s", rid, str(e))
+                        except Exception as e:
+                            logger.exception("Stage DiT request %s failed: %s", rid, e)
+                            status_code, error_type = client_error_metadata(e)
+                            await response_socket.send(
+                                encoder.encode(
+                                    {
+                                        "type": "error",
+                                        "request_id": rid,
+                                        "error": str(e),
+                                        "status_code": status_code,
+                                        "error_type": error_type,
+                                    }
+                                )
+                            )
+                            if self._is_executor_dead():
+                                self._signal_fatal_engine_failure(f"stage_dit_transport {rid}: {e!s}")
+                        finally:
+                            tasks.pop(rid, None)
+
+                    task = asyncio.create_task(
+                        _dispatch_stage_dit(request_id, msg["payload"]),
+                        name=f"diffusion-stage-dit-{request_id}",
+                    )
+                    tasks[request_id] = task
+
+                elif msg_type == "stage_decode_transport":
+                    request_id = msg["request_id"]
+
+                    async def _dispatch_stage_decode(rid: str, payload_in: Any) -> None:
+                        try:
+                            payload_in = unpack_stage_transport_shm(payload_in)
+                            decode_start = time.perf_counter()
+                            state = DiffusionRequestState.from_transport(payload_in)
+                            # Decode is executed through a collective RPC so all
+                            # ranks rehydrate the same final-latent payload.
+                            request = OmniDiffusionRequest(
+                                prompts=state.prompts or [{"stage_transport": True}],
+                                sampling_params=state.sampling,
+                                request_id=rid,
+                            )
+                            output = await self._engine.async_collective_rpc(
+                                "execute_decode",
+                                args=(payload_in,),
+                                unique_reply_rank=0,
+                            )
+                            results = self._engine.postprocess_diffusion_output(
+                                request,
+                                output,
+                                exec_total_time=time.perf_counter() - decode_start,
+                                diffusion_engine_start_time=decode_start,
+                            )
+                            for result in results:
+                                await response_socket.send(
+                                    encoder.encode({"type": "result", "request_id": rid, "output": result})
+                                )
+                        except DiffusionRequestAbortedError as e:
+                            logger.info("stage decode request_id: %s aborted: %s", rid, str(e))
+                        except Exception as e:
+                            logger.exception("Stage decode request %s failed: %s", rid, e)
+                            status_code, error_type = client_error_metadata(e)
+                            await response_socket.send(
+                                encoder.encode(
+                                    {
+                                        "type": "error",
+                                        "request_id": rid,
+                                        "error": str(e),
+                                        "status_code": status_code,
+                                        "error_type": error_type,
+                                    }
+                                )
+                            )
+                            if self._is_executor_dead():
+                                self._signal_fatal_engine_failure(f"stage_decode_transport {rid}: {e!s}")
+                        finally:
+                            tasks.pop(rid, None)
+
+                    task = asyncio.create_task(
+                        _dispatch_stage_decode(request_id, msg["payload"]),
+                        name=f"diffusion-stage-decode-{request_id}",
                     )
                     tasks[request_id] = task
 

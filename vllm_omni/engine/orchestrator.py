@@ -973,6 +973,14 @@ class Orchestrator:
     def _next_stage_already_submitted(self, stage_id: int, req_state: OrchestratorRequestState) -> bool:
         return (stage_id + 1) in req_state.stage_submit_ts
 
+    @staticmethod
+    def _stage_transport_prompt_from_output(output: Any) -> dict[str, Any] | None:
+        try:
+            payload = StagePool._extract_stage_transport_payload(output)
+        except ValueError:
+            return None
+        return {"stage_transport": payload}
+
     async def _handle_cfg_companion_ready(self, req_id: str) -> None:
         """Mark a CFG companion as done; if all companions are done, flush deferred parent."""
         parent_id = self._cfg_tracker.on_companion_completed(req_id)
@@ -1143,7 +1151,10 @@ class Orchestrator:
                     expected,
                 )
             diffusion_source_outputs = [output, *companion_outputs]
-            if next_client.custom_process_input_func is not None:
+            stage_transport_prompt = self._stage_transport_prompt_from_output(output)
+            if stage_transport_prompt is not None:
+                diffusion_prompt = stage_transport_prompt
+            elif next_client.custom_process_input_func is not None:
                 _t_ar2d = _time.perf_counter()
                 _fn = next_client.custom_process_input_func
                 _extra_kwargs: dict[str, Any] = {}

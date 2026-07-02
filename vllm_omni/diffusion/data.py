@@ -618,6 +618,8 @@ class OmniDiffusionConfig:
 
     # Step mode settings
     step_execution: bool = False
+    diffusion_stage_role: str = "monolithic"
+    diffusion_stage_kinds: tuple[str, ...] = field(default_factory=tuple)
 
     # Maximum number of sequences to generate in a batch
     max_num_seqs: int = 1
@@ -706,6 +708,21 @@ class OmniDiffusionConfig:
             self.additional_config = dict(self.additional_config)
         else:
             raise TypeError(f"additional_config must be a mapping or None, got {type(self.additional_config)!r}")
+
+        from vllm_omni.diffusion.stage_kind import (
+            normalize_diffusion_stage_role,
+            parse_diffusion_stage_kinds,
+        )
+
+        # Normalize user-facing YAML/CLI aliases once so downstream workers can
+        # rely on canonical role and stage-kind strings.
+        role = normalize_diffusion_stage_role(self.diffusion_stage_role)
+        self.diffusion_stage_role = role.value
+        self.diffusion_stage_kinds = parse_diffusion_stage_kinds(self.diffusion_stage_kinds, role=role)
+        # Stage split is the only step-execution mode exposed by this runtime:
+        # monolithic diffusion keeps the upstream forward path, while split
+        # encoder/denoiser/decoder roles always use the step scheduler.
+        self.step_execution = role.value != "monolithic"
 
         # Convert parallel_config dict/DictConfig to DiffusionParallelConfig
         # Use Mapping to handle both plain dicts and OmegaConf DictConfig

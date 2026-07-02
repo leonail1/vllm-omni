@@ -483,13 +483,13 @@ class TestDiffusionEngine:
         assert output.aborted is True
         assert output.abort_message == "Request req-finalize aborted."
 
-    def test_initializes_step_scheduler_when_step_execution_enabled(
+    def test_initializes_step_scheduler_for_split_role(
         self,
         monkeypatch: pytest.MonkeyPatch,
         mocker: MockerFixture,
     ) -> None:
-        od_config = SimpleNamespace(model_class_name="mock_model")
-        od_config.step_execution = True
+        od_config = SimpleNamespace(model_class_name="mock_model", diffusion_stage_role="denoiser")
+        od_config.step_execution = False
         fake_executor = mocker.Mock()
         fake_executor_cls = mocker.Mock(return_value=fake_executor)
 

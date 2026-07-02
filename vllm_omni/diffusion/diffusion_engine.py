@@ -25,6 +25,7 @@ from vllm_omni.diffusion.data import (
     OmniDiffusionConfig,
 )
 from vllm_omni.diffusion.executor.abstract import DiffusionExecutor
+from vllm_omni.diffusion.latent_output import is_latent_output_request, make_latent_request_outputs
 from vllm_omni.diffusion.registry import (
     DiffusionModelRegistry,
     get_diffusion_post_process_func,
@@ -33,7 +34,13 @@ from vllm_omni.diffusion.registry import (
 from vllm_omni.diffusion.request import DUMMY_DIFFUSION_REQUEST_ID, OmniDiffusionRequest
 from vllm_omni.diffusion.sched import RequestScheduler, SchedulerInterface, StepScheduler
 from vllm_omni.diffusion.sched.interface import DiffusionRequestStatus
-from vllm_omni.diffusion.worker.utils import BaseRunnerOutput, BatchRunnerOutput, RunnerOutput
+from vllm_omni.diffusion.worker.utils import (
+    BaseRunnerOutput,
+    BatchRunnerOutput,
+    DiffusionRequestState as WorkerDiffusionRequestState,
+    DiffusionStateTransport,
+    RunnerOutput,
+)
 from vllm_omni.errors import client_error_from_metadata, is_client_error_status
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams, OmniTextPrompt
 from vllm_omni.outputs import OmniRequestOutput
@@ -159,7 +166,12 @@ class DiffusionEngine:
 
         executor_class = DiffusionExecutor.get_class(od_config)
         self.executor = executor_class(od_config)
-        self.step_execution = bool(getattr(od_config, "step_execution", False))
+        from vllm_omni.diffusion.stage_kind import DiffusionStageRole, normalize_diffusion_stage_role
+
+        diffusion_stage_role = normalize_diffusion_stage_role(getattr(od_config, "diffusion_stage_role", "monolithic"))
+        od_config.diffusion_stage_role = diffusion_stage_role.value
+        od_config.step_execution = diffusion_stage_role != DiffusionStageRole.MONOLITHIC
+        self.step_execution = bool(od_config.step_execution)
         self.scheduler: SchedulerInterface = scheduler or (
             StepScheduler() if self.step_execution else RequestScheduler()
         )
@@ -261,8 +273,9 @@ class DiffusionEngine:
         if self.od_config.enable_cpu_offload:
             output_data = _move_tensor_tree_to_cpu(output_data)
 
+        is_latent_output = is_latent_output_request(request, getattr(self.od_config, "output_type", None))
         postprocess_start_time = time.perf_counter()
-        if self.post_process_func is not None:
+        if self.post_process_func is not None and not is_latent_output:
             # Some video pipelines need request-level controls during
             # postprocess (for example worker-side frame interpolation).
             if self._post_process_accepts_sampling_params:
@@ -309,6 +322,9 @@ class DiffusionEngine:
             "resolution": int(request.sampling_params.resolution),
             "postprocess_time_ms": postprocess_time * 1000,
         }
+
+        if is_latent_output:
+            return make_latent_request_outputs(request, output, output_data, metrics)
 
         # Detect text output: when the pipeline returns a string (e.g.,
         # SenseNova-U1 / BAGEL single-stage img2text / text2text), wrap it
@@ -474,6 +490,252 @@ class DiffusionEngine:
                     )
 
             return results
+
+    def postprocess_diffusion_output(
+        self,
+        request: OmniDiffusionRequest,
+        output: DiffusionOutput,
+        *,
+        preprocess_time: float = 0.0,
+        exec_total_time: float = 0.0,
+        diffusion_engine_start_time: float | None = None,
+    ) -> list[OmniRequestOutput]:
+        """Convert a worker DiffusionOutput into public request outputs."""
+        if output.aborted:
+            raise DiffusionRequestAbortedError(output.abort_message or "Diffusion request aborted.")
+        if output.error:
+            if is_client_error_status(output.error_status_code):
+                raise client_error_from_metadata(
+                    output.error,
+                    status_code=output.error_status_code,
+                    error_type=output.error_type,
+                )
+            raise RuntimeError(output.error)
+
+        if output.output is None:
+            logger.warning("Output is None, returning empty OmniRequestOutput")
+            return [
+                OmniRequestOutput.from_diffusion(
+                    request_id=request.request_id,
+                    images=[],
+                    prompt=prompt,
+                    metrics={},
+                    latents=None,
+                )
+                for prompt in request.prompts
+            ]
+
+        output_data = output.output
+        if self.od_config.enable_cpu_offload:
+            output_data = _move_tensor_tree_to_cpu(output_data)
+
+        is_latent_output = is_latent_output_request(request, getattr(self.od_config, "output_type", None))
+        postprocess_start_time = time.perf_counter()
+        if self.post_process_func is not None and not is_latent_output:
+            if self._post_process_accepts_sampling_params:
+                outputs = self.post_process_func(output_data, sampling_params=request.sampling_params)
+            else:
+                outputs = self.post_process_func(output_data)
+        else:
+            outputs = output_data
+        audio_payload = None
+        custom_output = output.custom_output or {}
+        model_audio_sample_rate = None
+        model_fps = None
+        action_payload = None
+        if isinstance(outputs, dict):
+            audio_payload = outputs.get("audio")
+            action_payload = outputs.get("actions")
+            custom_output.update(outputs.get("custom_output") or {})
+            model_audio_sample_rate = outputs.get("audio_sample_rate")
+            model_fps = outputs.get("fps")
+            outputs = outputs.get("video", outputs)
+        postprocess_time = time.perf_counter() - postprocess_start_time
+        logger.debug("Post-processing completed in %.4f seconds", postprocess_time)
+
+        if diffusion_engine_start_time is not None:
+            step_total_ms = (time.perf_counter() - diffusion_engine_start_time) * 1000
+        else:
+            step_total_ms = (preprocess_time + exec_total_time + postprocess_time) * 1000
+        logger.debug(
+            "DiffusionEngine output breakdown: preprocess=%.2f ms, "
+            "add_req_and_wait=%.2f ms, postprocess=%.2f ms, total=%.2f ms",
+            preprocess_time * 1000,
+            exec_total_time * 1000,
+            postprocess_time * 1000,
+            step_total_ms,
+        )
+
+        if not isinstance(outputs, list):
+            outputs = [outputs] if outputs is not None else []
+
+        metrics = {
+            "preprocess_time_ms": preprocess_time * 1000,
+            "diffusion_engine_exec_time_ms": exec_total_time * 1000,
+            "diffusion_engine_total_time_ms": step_total_ms,
+            "image_num": int(request.sampling_params.num_outputs_per_prompt),
+            "resolution": int(request.sampling_params.resolution),
+            "postprocess_time_ms": postprocess_time * 1000,
+        }
+
+        if is_latent_output:
+            return make_latent_request_outputs(request, output, output_data, metrics)
+
+        is_text_output = isinstance(output_data, str) and custom_output.get("text_output") is not None
+        is_audio_output = supports_audio_output(self.od_config.model_class_name)
+        if is_audio_output and model_audio_sample_rate is None:
+            model_cls = DiffusionModelRegistry._try_load_model_cls(self.od_config.model_class_name)
+            model_audio_sample_rate = getattr(model_cls, "audio_sample_rate", None)
+
+        def _audio_mm(payload: Any) -> dict[str, Any]:
+            mm: dict[str, Any] = {"audio": payload}
+            if model_audio_sample_rate is not None:
+                mm["audio_sample_rate"] = model_audio_sample_rate
+            return mm
+
+        if len(request.prompts) == 1:
+            prompt = request.prompts[0]
+            request_id = request.request_id
+
+            if is_text_output:
+                return [
+                    OmniRequestOutput.from_diffusion(
+                        request_id=request_id,
+                        images=[],
+                        prompt=prompt,
+                        metrics=metrics,
+                        custom_output=custom_output,
+                        final_output_type="text",
+                        stage_durations=output.stage_durations,
+                        peak_memory_mb=output.peak_memory_mb,
+                    ),
+                ]
+            if is_audio_output:
+                request_audio_payload = outputs[0] if len(outputs) == 1 else outputs
+                return [
+                    OmniRequestOutput.from_diffusion(
+                        request_id=request_id,
+                        images=[],
+                        prompt=prompt,
+                        metrics=metrics,
+                        latents=output.trajectory_latents,
+                        trajectory_latents=output.trajectory_latents,
+                        trajectory_timesteps=output.trajectory_timesteps,
+                        trajectory_log_probs=output.trajectory_log_probs,
+                        trajectory_decoded=output.trajectory_decoded,
+                        multimodal_output=_audio_mm(request_audio_payload),
+                        final_output_type="audio",
+                        stage_durations=output.stage_durations,
+                        peak_memory_mb=output.peak_memory_mb,
+                    ),
+                ]
+
+            mm_output = {}
+            if audio_payload is not None:
+                mm_output["audio"] = audio_payload
+            if model_audio_sample_rate is not None:
+                mm_output["audio_sample_rate"] = model_audio_sample_rate
+            if model_fps is not None:
+                mm_output["fps"] = model_fps
+            if action_payload is not None:
+                mm_output["actions"] = action_payload
+            return [
+                OmniRequestOutput.from_diffusion(
+                    request_id=request_id,
+                    images=outputs,
+                    prompt=prompt,
+                    metrics=metrics,
+                    latents=output.trajectory_latents,
+                    trajectory_latents=output.trajectory_latents,
+                    trajectory_timesteps=output.trajectory_timesteps,
+                    trajectory_log_probs=output.trajectory_log_probs,
+                    trajectory_decoded=output.trajectory_decoded,
+                    custom_output=custom_output,
+                    multimodal_output=mm_output,
+                    stage_durations=output.stage_durations,
+                    peak_memory_mb=output.peak_memory_mb,
+                ),
+            ]
+
+        results = []
+        output_idx = 0
+        request_id = request.request_id
+
+        for prompt in request.prompts:
+            num_outputs = request.sampling_params.num_outputs_per_prompt
+            start_idx = output_idx
+            end_idx = start_idx + num_outputs
+            request_outputs = outputs[start_idx:end_idx] if output_idx < len(outputs) else []
+            output_idx = end_idx
+
+            if is_audio_output:
+                request_audio_payload = request_outputs[0] if len(request_outputs) == 1 else request_outputs
+                results.append(
+                    OmniRequestOutput.from_diffusion(
+                        request_id=request_id,
+                        images=[],
+                        prompt=prompt,
+                        metrics=metrics,
+                        latents=output.trajectory_latents,
+                        trajectory_latents=output.trajectory_latents,
+                        trajectory_timesteps=output.trajectory_timesteps,
+                        trajectory_log_probs=output.trajectory_log_probs,
+                        trajectory_decoded=output.trajectory_decoded,
+                        multimodal_output=_audio_mm(request_audio_payload),
+                        final_output_type="audio",
+                        stage_durations=output.stage_durations,
+                        peak_memory_mb=output.peak_memory_mb,
+                    ),
+                )
+            else:
+                mm_output = {}
+                if audio_payload is not None:
+                    sliced_audio = audio_payload
+                    if isinstance(audio_payload, (list, tuple)):
+                        sliced_audio = audio_payload[start_idx:end_idx]
+                        if len(sliced_audio) == 1:
+                            sliced_audio = sliced_audio[0]
+                    elif hasattr(audio_payload, "shape") and getattr(audio_payload, "shape", None) is not None:
+                        if len(audio_payload.shape) > 0 and audio_payload.shape[0] >= end_idx:
+                            sliced_audio = audio_payload[start_idx:end_idx]
+                            if num_outputs == 1:
+                                sliced_audio = sliced_audio[0]
+                    mm_output["audio"] = sliced_audio
+                if model_audio_sample_rate is not None:
+                    mm_output["audio_sample_rate"] = model_audio_sample_rate
+                if model_fps is not None:
+                    mm_output["fps"] = model_fps
+                if action_payload is not None:
+                    sliced_actions = action_payload
+                    if isinstance(action_payload, (list, tuple)):
+                        sliced_actions = action_payload[start_idx:end_idx]
+                        if len(sliced_actions) == 1:
+                            sliced_actions = sliced_actions[0]
+                    elif hasattr(action_payload, "shape") and getattr(action_payload, "shape", None) is not None:
+                        if len(action_payload.shape) > 0 and action_payload.shape[0] >= end_idx:
+                            sliced_actions = action_payload[start_idx:end_idx]
+                            if num_outputs == 1:
+                                sliced_actions = sliced_actions[0]
+                    mm_output["actions"] = sliced_actions
+                results.append(
+                    OmniRequestOutput.from_diffusion(
+                        request_id=request_id,
+                        images=request_outputs,
+                        prompt=prompt,
+                        metrics=metrics,
+                        latents=output.trajectory_latents,
+                        trajectory_latents=output.trajectory_latents,
+                        trajectory_timesteps=output.trajectory_timesteps,
+                        trajectory_log_probs=output.trajectory_log_probs,
+                        trajectory_decoded=output.trajectory_decoded,
+                        custom_output=custom_output,
+                        multimodal_output=mm_output,
+                        stage_durations=output.stage_durations,
+                        peak_memory_mb=output.peak_memory_mb,
+                    ),
+                )
+
+        return results
 
     def _busy_loop(self):
         while not self.stop_event.is_set():
@@ -641,6 +903,27 @@ class DiffusionEngine:
         request_id = self.add_request(request)
         return await self.get_result(request_id)
 
+    async def async_add_stage_transport_and_wait_for_response(
+        self,
+        payload: DiffusionStateTransport,
+    ) -> DiffusionStateTransport:
+        """Schedule an encode->DiT payload through the step scheduler."""
+        await self._check_and_start_background_loop()
+        state = WorkerDiffusionRequestState.from_transport(payload)
+        request = OmniDiffusionRequest(
+            prompts=state.prompts or [{"stage_transport": True}],
+            sampling_params=state.sampling,
+            request_id=state.request_id,
+        )
+        # Preserve the transport payload on the synthetic request so the runner
+        # can rehydrate it as cached request state before the first DiT step.
+        request.stage_transport_payload = payload
+        output = await self.async_add_req_and_wait_for_response(request)
+        transport = output.custom_output.get("stage_transport")
+        if transport is None:
+            raise RuntimeError(f"DiT stage request {state.request_id} finished without stage_transport output.")
+        return transport
+
     def add_req_and_wait_for_response(self, request: OmniDiffusionRequest) -> DiffusionOutput:
         with self._rpc_lock:
             if self._closed:
@@ -713,6 +996,12 @@ class DiffusionEngine:
 
     def _dummy_run(self):
         """A dummy run to warm up the model."""
+        raw_stage_role = getattr(self.od_config, "diffusion_stage_role", "monolithic")
+        diffusion_stage_role = str(getattr(raw_stage_role, "value", raw_stage_role)).lower()
+        if diffusion_stage_role != "monolithic":
+            logger.info("Skipping dummy warmup run for diffusion stage role %r", diffusion_stage_role)
+            return
+
         num_inference_steps = 1
         height = 512
         width = 512

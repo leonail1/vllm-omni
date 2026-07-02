@@ -4,9 +4,10 @@
 
 from __future__ import annotations
 
+import copy
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Literal
 
 import torch
 
@@ -15,15 +16,117 @@ if TYPE_CHECKING:
     from vllm_omni.inputs.data import OmniDiffusionSamplingParams, OmniPromptType
 
 
+TransportBoundary = Literal["encode_to_dit", "dit_to_decode"]
+_SAMPLING_TENSOR_FIELDS = (
+    "latents",
+    "audio_latents",
+    "raw_latent_shape",
+    "noise_pred",
+    "image_latent",
+    "timesteps",
+    "timestep",
+    "trajectory_timesteps",
+    "trajectory_latents",
+)
+_RUNNER_STEP_EXTRA_KEY = "_runner_step"
+_CONDITIONING_UNSET = object()
+
+
+@dataclass
+class DiffusionStateTransport:
+    """Plain payload for diffusion stage-split state transport."""
+
+    boundary: TransportBoundary
+    request_id: str
+    sampling: OmniDiffusionSamplingParams
+    prompts: list[OmniPromptType] | None
+    meta: dict[str, Any] = field(default_factory=dict)
+    tensors: dict[str, Any] = field(default_factory=dict)
+    conditioning: Any | None = None
+    extra: dict[str, Any] = field(default_factory=dict)
+
+
+def _clone_sampling_for_transport(sampling: "OmniDiffusionSamplingParams") -> "OmniDiffusionSamplingParams":
+    sampling_for_copy = copy.copy(sampling)
+    if hasattr(sampling_for_copy, "generator"):
+        sampling_for_copy.generator = None
+    cloned = copy.deepcopy(sampling_for_copy)
+    if hasattr(cloned, "generator"):
+        cloned.generator = None
+    for name in _SAMPLING_TENSOR_FIELDS:
+        if hasattr(cloned, name):
+            setattr(cloned, name, None)
+    return cloned
+
+
+def _sampling_from_transport(value: OmniDiffusionSamplingParams | dict[str, Any]) -> OmniDiffusionSamplingParams:
+    if not isinstance(value, dict):
+        return value
+    from vllm_omni.inputs.data import OmniDiffusionSamplingParams
+
+    return OmniDiffusionSamplingParams(**value)
+
+
+def _contains_tensor(value: Any) -> bool:
+    if torch.is_tensor(value):
+        return True
+    if isinstance(value, dict):
+        return any(_contains_tensor(item) for item in value.values())
+    if isinstance(value, (list, tuple)):
+        return any(_contains_tensor(item) for item in value)
+    return False
+
+
+def _move_tensor_tree(value: Any, device: torch.device | str | None) -> Any:
+    if device is None:
+        return value
+    if torch.is_tensor(value):
+        return value.to(device)
+    if isinstance(value, dict):
+        return {key: _move_tensor_tree(item, device) for key, item in value.items()}
+    if isinstance(value, list):
+        return [_move_tensor_tree(item, device) for item in value]
+    if isinstance(value, tuple):
+        return tuple(_move_tensor_tree(item, device) for item in value)
+    return value
+
+
+def _sanitize_prompt_for_transport(value: Any) -> Any:
+    if value is None or isinstance(value, (str, int, float, bool)):
+        return value
+    if torch.is_tensor(value) or isinstance(value, torch.Generator) or callable(value):
+        return None
+    if isinstance(value, dict):
+        sanitized: dict[str, Any] = {}
+        for key, item in value.items():
+            if key in {"multi_modal_data", "additional_information"}:
+                continue
+            cleaned = _sanitize_prompt_for_transport(item)
+            if cleaned is not None:
+                sanitized[key] = cleaned
+        return sanitized
+    if isinstance(value, list):
+        return [cleaned for item in value if (cleaned := _sanitize_prompt_for_transport(item)) is not None]
+    if isinstance(value, tuple):
+        return tuple(cleaned for item in value if (cleaned := _sanitize_prompt_for_transport(item)) is not None)
+    return None
+
+
+def _sanitize_prompts_for_transport(prompts: list[OmniPromptType] | None) -> list[OmniPromptType] | None:
+    if prompts is None:
+        return None
+    return [_sanitize_prompt_for_transport(prompt) for prompt in prompts]
+
+
 @dataclass
 class DiffusionRequestState:
     """Per-request mutable state across all pipeline stages.
 
     Owned by Runner and passed through all step-execution stages:
-    ``prepare_encode()`` initializes/updates fields, ``denoise_step()`` and
-    ``step_scheduler()`` mutate per-step fields, and ``post_decode()``
-    consumes final latents. This state object is also the cache unit for
-    future continuous batching.
+    ``validation()`` / ``encoding()`` / ``preparation()`` initialize request
+    inputs, ``predict_noise()`` / ``advance_scheduler()`` mutate per-step
+    fields, and ``decoding()`` / ``postprocess()`` consume final latents. This
+    state object is also the cache unit for continuous batching.
 
     This dataclass keeps only the minimal cross-model state required by the
     step-execution contract. Pipeline-specific state should be stored in
@@ -42,30 +145,19 @@ class DiffusionRequestState:
     sampling: OmniDiffusionSamplingParams
     prompts: list[OmniPromptType] | None = None
 
-    # ── Encoded prompts (set once by prepare_encode) ──
-    prompt_embeds: torch.Tensor | None = None
-    prompt_embeds_mask: torch.Tensor | None = None
-    negative_prompt_embeds: torch.Tensor | None = None
-    negative_prompt_embeds_mask: torch.Tensor | None = None
-
-    # ── Latent state (mutated every step by step_scheduler) ──
+    # ── Latent state (mutated every step by advance_scheduler) ──
     latents: torch.Tensor | None = None
 
-    # ── Timestep schedule (set once by prepare_encode) ──
+    # ── Timestep schedule (set once by preparation) ──
     timesteps: torch.Tensor | list[torch.Tensor] | None = None
     step_index: int = 0
 
-    # ── Per-request scheduler instance (set once by prepare_encode) ──
+    # ── Per-request scheduler instance (set once by preparation) ──
     scheduler: Any | None = None
 
-    # ── CFG config (set once by prepare_encode) ──
-    do_true_cfg: bool = False
-    guidance: torch.Tensor | None = None
-
-    # ── Spatial / sequence metadata (set once by prepare_encode) ──
-    img_shapes: list | None = None
-    txt_seq_lens: list[int] | None = None
-    negative_txt_seq_lens: list[int] | None = None
+    # Optional typed/opaque model-private conditioning payload. Pipelines may
+    # use this instead of ``extra`` when a local typed object is convenient.
+    conditioning: Any | None = None
 
     # Pipeline-specific extras. Keep model-private fields here unless they
     # become part of the shared step-execution contract.
@@ -108,6 +200,87 @@ class DiffusionRequestState:
         # TODO: this is only an approximation for current stepwise mode.
         # A real "new request" signal should eventually come from scheduler/runner state transitions.
         return self.step_index == 0 or self.timesteps is None
+
+    def to_transport(
+        self,
+        boundary: TransportBoundary,
+        *,
+        conditioning: Any = _CONDITIONING_UNSET,
+    ) -> DiffusionStateTransport:
+        tensors: dict[str, torch.Tensor] = {}
+        if torch.is_tensor(self.latents):
+            tensors["latents"] = self.latents
+        timesteps_in_tensors = boundary == "encode_to_dit" and _contains_tensor(self.timesteps)
+        if timesteps_in_tensors:
+            tensors["timesteps"] = self.timesteps
+        for name in _SAMPLING_TENSOR_FIELDS:
+            value = getattr(self.sampling, name, None)
+            if _contains_tensor(value):
+                tensors[f"sampling.{name}"] = value
+
+        model_conditioning = self.conditioning if conditioning is _CONDITIONING_UNSET else conditioning
+        runner_step_config = self.extra.get(_RUNNER_STEP_EXTRA_KEY)
+        # Encode->DiT carries model-private conditioning. Once DiT finishes,
+        # decode only needs public state such as final latents and sampling.
+        extra = copy.deepcopy(self.extra) if model_conditioning is None and boundary == "encode_to_dit" else {}
+        return DiffusionStateTransport(
+            boundary=boundary,
+            request_id=self.request_id,
+            sampling=_clone_sampling_for_transport(self.sampling),
+            prompts=_sanitize_prompts_for_transport(self.prompts),
+            meta={
+                "step_index": self.step_index,
+                "timesteps_is_tensor": timesteps_in_tensors,
+                "timesteps_value": None if timesteps_in_tensors else self.timesteps,
+                "runner_step_config": copy.deepcopy(runner_step_config),
+            },
+            tensors=tensors,
+            conditioning=copy.deepcopy(model_conditioning),
+            extra=extra,
+        )
+
+    @classmethod
+    def from_transport(
+        cls,
+        payload: DiffusionStateTransport | dict[str, Any],
+        *,
+        device: torch.device | str | None = None,
+    ) -> DiffusionRequestState:
+        if isinstance(payload, dict):
+            payload = DiffusionStateTransport(**payload)
+        tensors = payload.tensors
+
+        def _tensor(name: str) -> torch.Tensor | None:
+            value = tensors.get(name)
+            if value is not None and device is not None:
+                return value.to(device)
+            return value
+
+        state = cls(
+            request_id=payload.request_id,
+            sampling=_sampling_from_transport(payload.sampling),
+            prompts=payload.prompts,
+        )
+        meta = payload.meta
+        state.latents = _tensor("latents")
+        # Timesteps may be tensor-valued on NPU/GPU and must keep device
+        # placement, but simple Python schedules are cheaper to keep in meta.
+        state.timesteps = (
+            _move_tensor_tree(tensors.get("timesteps"), device)
+            if meta.get("timesteps_is_tensor")
+            else _move_tensor_tree(meta.get("timesteps_value"), device)
+        )
+        state.step_index = int(meta.get("step_index", 0))
+        state.conditioning = _move_tensor_tree(payload.conditioning, device)
+        state.extra = _move_tensor_tree(copy.deepcopy(payload.extra), device)
+        runner_step_config = meta.get("runner_step_config")
+        if runner_step_config is not None:
+            state.extra[_RUNNER_STEP_EXTRA_KEY] = copy.deepcopy(runner_step_config)
+        for name in _SAMPLING_TENSOR_FIELDS:
+            value = tensors.get(f"sampling.{name}")
+            if value is not None:
+                setattr(state.sampling, name, _move_tensor_tree(value, device))
+        return state
 
 
 class BaseRunnerOutput(ABC):

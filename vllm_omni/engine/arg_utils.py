@@ -448,6 +448,8 @@ class OrchestratorArgs:
     cache_config: str | None = None
     enable_cache_dit_summary: bool = False
     step_execution: bool = False
+    diffusion_stage_role: str | None = None
+    diffusion_stage_kinds: str | list[str] | None = None
     vae_use_slicing: bool = False
     vae_use_tiling: bool = False
     enable_multithread_weight_load: bool = True

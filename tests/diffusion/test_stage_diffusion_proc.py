@@ -9,6 +9,7 @@ from types import SimpleNamespace
 
 import pytest
 
+from vllm_omni.diffusion.stage_diffusion_client import StageDiffusionClient
 from vllm_omni.diffusion.stage_diffusion_proc import StageDiffusionProc
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams
 
@@ -74,6 +75,48 @@ def test_process_batch_request_preserves_parent_request_id_and_kv_sender_info():
         assert result.images == ["img-1", "img-2"]
 
     asyncio.run(run_test())
+
+
+@pytest.mark.asyncio
+async def test_stage_diffusion_client_sends_stage_encode_batch_message():
+    messages = []
+
+    class _Socket:
+        def send(self, message):
+            messages.append(message)
+
+    client = object.__new__(StageDiffusionClient)
+    client._engine_dead = False
+    client._request_socket = _Socket()
+    client._encoder = SimpleNamespace(encode=lambda message: message)
+
+    async def _wait_stage_payload(request_id, timeout):
+        assert request_id == "req-encode-batch"
+        assert timeout == 11.0
+        return {"payload": True}
+
+    client._wait_stage_payload = _wait_stage_payload
+    sampling_params = OmniDiffusionSamplingParams(seed=123)
+    kv_sender_info = {0: {"host": "127.0.0.1", "zmq_port": 50151}}
+
+    payload = await client.stage_encode_batch_request_async(
+        "req-encode-batch",
+        ["prompt-a", "prompt-b"],
+        sampling_params,
+        kv_sender_info=kv_sender_info,
+        timeout=11.0,
+    )
+
+    assert payload == {"payload": True}
+    assert messages == [
+        {
+            "type": "stage_encode_batch_request",
+            "request_id": "req-encode-batch",
+            "prompts": ["prompt-a", "prompt-b"],
+            "sampling_params": StageDiffusionClient._sampling_params_to_dict(sampling_params),
+            "kv_sender_info": kv_sender_info,
+        }
+    ]
 
 
 @dataclass

@@ -16,6 +16,8 @@ if TYPE_CHECKING:
     import torch
 
     from vllm_omni.diffusion.data import DiffusionOutput
+    from vllm_omni.diffusion.request import OmniDiffusionRequest
+    from vllm_omni.diffusion.worker.input_batch import InputBatch
     from vllm_omni.diffusion.worker.utils import DiffusionRequestState
 
 
@@ -42,28 +44,59 @@ class SupportAudioOutput(Protocol):
 
 
 @runtime_checkable
-class SupportsStepExecution(Protocol):
-    """State-driven step-level execution protocol for diffusion pipelines.
+class SupportsDiffusionAtoms(Protocol):
+    """Atomized diffusion pipeline contract used by the step/batch runner.
 
-    Pipelines should split request-level ``forward()`` into:
-    ``prepare_encode()`` (one-time request setup), ``denoise_step()``
-    (one denoise forward), ``step_scheduler()`` (one scheduler update),
-    and ``post_decode()`` (final decode).
+    ``forward(req)`` remains the request-mode golden path. Step/batch execution
+    uses these atoms so the runner can own state lifetime, batching,
+    scatter/gather, and stage transport while the pipeline owns model math.
     """
 
-    supports_step_execution: ClassVar[bool] = True
+    supports_diffusion_atoms: ClassVar[bool] = True
+    supports_varlen_batch: ClassVar[bool] = False
+    supports_stage_split: ClassVar[bool] = False
 
-    def prepare_encode(self, state: DiffusionRequestState, **kwargs: Any) -> DiffusionRequestState:
-        """Prepare request-level inputs and return initialized state."""
+    def forward(self, req: OmniDiffusionRequest, **kwargs: Any) -> DiffusionOutput:
+        """Run the request-mode golden path."""
 
-    def denoise_step(self, state: DiffusionRequestState, **kwargs: Any) -> torch.Tensor | None:
-        """Run one denoise step."""
+    def init_state(self, req: OmniDiffusionRequest) -> DiffusionRequestState:
+        """Create a request state for runner-owned step execution."""
 
-    def step_scheduler(self, state: DiffusionRequestState, noise_pred: torch.Tensor, **kwargs: Any) -> None:
-        """Run one scheduler step."""
+    def validation(self, state: DiffusionRequestState) -> DiffusionRequestState:
+        """Validate request inputs and normalize request-local arguments."""
 
-    def post_decode(self, state: DiffusionRequestState, **kwargs: Any) -> DiffusionOutput:
-        """Decode output after denoise loop."""
+    def encoding(self, state: DiffusionRequestState) -> DiffusionRequestState:
+        """Encode text/image/audio conditioning into model-private state."""
+
+    def preparation(self, state: DiffusionRequestState) -> DiffusionRequestState:
+        """Prepare latents, timesteps, scheduler state, and runner metadata."""
+
+    def denoising(self, state: DiffusionRequestState) -> DiffusionRequestState:
+        """Run the full request-mode denoising loop over one state."""
+
+    def decoding(self, state: DiffusionRequestState) -> DiffusionRequestState:
+        """Decode final latents into a pipeline-private output payload."""
+
+    def postprocess(self, state: DiffusionRequestState) -> DiffusionOutput:
+        """Convert decoded payload into ``DiffusionOutput``."""
+
+    def predict_noise(self, batch: InputBatch) -> torch.Tensor | None:
+        """Run one denoise step and return CFG-merged noise."""
+
+    def advance_scheduler(self, state: DiffusionRequestState, noise: torch.Tensor) -> DiffusionRequestState:
+        """Apply one scheduler step and advance ``state.step_index``."""
+
+    def build_model_inputs(self, states: list[DiffusionRequestState]) -> dict[str, Any]:
+        """Pack pipeline-private per-request state into batch-local model inputs."""
+
+    def build_step_attention_metadata(self, batch: InputBatch) -> Any:
+        """Build attention metadata for one step, if needed."""
+
+    def pack_conditioning(self, state: DiffusionRequestState) -> Any:
+        """Pack opaque conditioning for remote stage transport."""
+
+    def unpack_conditioning(self, payload: Any, state: DiffusionRequestState) -> DiffusionRequestState:
+        """Unpack opaque conditioning received from another stage."""
 
 
 @runtime_checkable
@@ -91,7 +124,22 @@ class SupportsComponentDiscovery(Protocol):
     _resident_modules: ClassVar[list[str]] = []
 
 
-def supports_step_execution(pipeline: object) -> bool:
-    """Return whether `pipeline` implements :class:`SupportsStepExecution`."""
+def supports_diffusion_atoms(pipeline: object) -> bool:
+    """Return whether `pipeline` implements the atomized diffusion contract."""
 
-    return isinstance(pipeline, SupportsStepExecution)
+    if not getattr(pipeline, "supports_diffusion_atoms", False):
+        return False
+    required = (
+        "init_state",
+        "validation",
+        "encoding",
+        "preparation",
+        "denoising",
+        "decoding",
+        "postprocess",
+        "predict_noise",
+        "advance_scheduler",
+        "build_model_inputs",
+        "build_step_attention_metadata",
+    )
+    return all(callable(getattr(pipeline, method, None)) for method in required)

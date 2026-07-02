@@ -377,6 +377,8 @@ class StageMetadata:
     runtime_cfg: Any
     prompt_expand_func: Callable | None = None
     cfg_kv_collect_func: Callable | None = None
+    diffusion_stage_role: str | None = None
+    diffusion_stage_kinds: tuple[str, ...] = ()
     # Multi-replica: replica_id distinguishes replicas of the same stage.
     # For single-replica stages this defaults to 0.
     replica_id: int = 0
@@ -431,6 +433,21 @@ def extract_stage_metadata(stage_config: Any) -> StageMetadata:
     model_stage = getattr(engine_args, "model_stage", None)
 
     if stage_type == "diffusion":
+        from vllm_omni.diffusion.stage_kind import (
+            diffusion_role_from_model_stage,
+            normalize_diffusion_stage_role,
+            parse_diffusion_stage_kinds,
+        )
+
+        explicit_role = getattr(engine_args, "diffusion_stage_role", None)
+        # Prefer the explicit diffusion role, but keep model_stage as a legacy
+        # alias so existing stage configs continue to route correctly.
+        role = (
+            normalize_diffusion_stage_role(explicit_role)
+            if explicit_role is not None
+            else diffusion_role_from_model_stage(model_stage)
+        )
+        stage_kinds = parse_diffusion_stage_kinds(getattr(engine_args, "diffusion_stage_kinds", None), role=role)
         return StageMetadata(
             stage_id=stage_id,
             stage_type="diffusion",
@@ -445,6 +462,8 @@ def extract_stage_metadata(stage_config: Any) -> StageMetadata:
             model_stage=model_stage,
             runtime_cfg=runtime_cfg,
             cfg_kv_collect_func=cfg_kv_collect_func,
+            diffusion_stage_role=role.value,
+            diffusion_stage_kinds=stage_kinds,
         )
 
     engine_output_type = getattr(engine_args, "engine_output_type", None)
@@ -1153,6 +1172,14 @@ def build_diffusion_config(
     od_config.num_gpus = num_devices_per_stage
     if metadata.cfg_kv_collect_func is not None:
         od_config.cfg_kv_collect_func = metadata.cfg_kv_collect_func
+    if metadata.diffusion_stage_role is not None:
+        from vllm_omni.diffusion.stage_kind import DiffusionStageRole, normalize_diffusion_stage_role
+
+        role = normalize_diffusion_stage_role(metadata.diffusion_stage_role)
+        od_config.diffusion_stage_role = role.value
+        od_config.step_execution = role != DiffusionStageRole.MONOLITHIC
+    if metadata.diffusion_stage_kinds:
+        od_config.diffusion_stage_kinds = metadata.diffusion_stage_kinds
     return od_config
 
 
