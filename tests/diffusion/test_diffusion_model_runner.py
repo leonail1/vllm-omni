@@ -8,10 +8,14 @@ import pytest
 import torch
 
 import vllm_omni.diffusion.worker.diffusion_model_runner as model_runner_module
+import vllm_omni.diffusion.worker.diffusion_model_runner_v2 as model_runner_v2_module
 from tests.helpers.mark import hardware_test
 from vllm_omni.diffusion.data import DiffusionOutput
 from vllm_omni.diffusion.worker.diffusion_model_runner import DiffusionModelRunner
+from vllm_omni.diffusion.worker.diffusion_model_runner_v2 import DiffusionModelRunnerV2
 from vllm_omni.diffusion.worker.request_batch import DiffusionRequestBatch, split_diffusion_output_by_request
+from vllm_omni.distributed.omni_connectors.factory import OmniConnectorFactory
+from vllm_omni.distributed.omni_connectors.utils.config import ConnectorSpec
 
 pytestmark = [pytest.mark.diffusion]
 
@@ -67,9 +71,18 @@ class _ChunkStepPipeline:
         self.prepare_calls = 0
         self.decode_calls = 0
 
-    def prepare_encode(self, state):
-        self.prepare_calls += 1
+    def init_state(self, state):
+        return state
+
+    def check_inputs(self, state):
+        return state
+
+    def encode(self, state):
         state.prompt_embeds = torch.zeros(1, 1, 1)
+        return state
+
+    def prepare(self, state):
+        self.prepare_calls += 1
         state.latents = torch.zeros(1, 1)
         state.timesteps = torch.tensor([1.0, 0.0])
         state.step_index = 0
@@ -78,16 +91,29 @@ class _ChunkStepPipeline:
         state.total_chunks = len(self._outputs)
         return state
 
-    def denoise_step(self, input_batch, states):
+    def diffuse(self, state):
+        while not state.denoise_completed:
+            state.step_index += 1
+        return state
+
+    def build_model_inputs(self, states):
         del states
+        return {}
+
+    def build_step_attention_metadata(self, input_batch):
+        del input_batch
+        return {}
+
+    def predict_noise(self, input_batch):
         return torch.ones_like(input_batch.latents)
 
-    def step_scheduler(self, state, noise_pred):
+    def scheduler_step(self, state, noise_pred):
         state.latents = noise_pred
         state.step_index += 1
         state.step_in_chunk += 1
+        return state
 
-    def post_decode(self, state):
+    def decode(self, state):
         output = self._outputs[self.decode_calls]
         self.decode_calls += 1
         state.chunk_index += 1
@@ -95,7 +121,59 @@ class _ChunkStepPipeline:
         state.step_in_chunk = 0
         if not state.request_denoise_completed:
             state.latents = torch.zeros(1, 1)
-        return output
+        state.extra["decoded_output"] = output
+        return state
+
+    def postprocess(self, state):
+        return state.extra["decoded_output"]
+
+    def pack_encode_payload(self, state):
+        return {
+            "request_id": state.request_id,
+            "prompt_embeds": state.prompt_embeds,
+            "latents": state.latents,
+            "timesteps": state.timesteps,
+            "step_index": state.step_index,
+            "chunk_index": state.chunk_index,
+            "step_in_chunk": state.step_in_chunk,
+            "total_chunks": state.total_chunks,
+            "chunk_num_steps": state.chunk_num_steps,
+        }
+
+    def unpack_encode_payload(self, payload, state):
+        state.prompt_embeds = payload["prompt_embeds"]
+        state.latents = payload["latents"]
+        state.timesteps = payload["timesteps"]
+        state.step_index = int(payload["step_index"])
+        state.chunk_index = int(payload["chunk_index"])
+        state.step_in_chunk = int(payload["step_in_chunk"])
+        state.total_chunks = int(payload["total_chunks"])
+        state.chunk_num_steps = payload["chunk_num_steps"]
+
+    def pack_decode_payload(self, state):
+        return {
+            "request_id": state.request_id,
+            "latents": state.latents,
+            "step_index": state.step_index,
+            "chunk_index": state.chunk_index,
+            "step_in_chunk": state.step_in_chunk,
+            "total_chunks": state.total_chunks,
+            "chunk_num_steps": state.chunk_num_steps,
+        }
+
+    def unpack_decode_payload(self, payload, state):
+        state.latents = payload["latents"]
+        state.step_index = int(payload["step_index"])
+        state.chunk_index = int(payload["chunk_index"])
+        state.step_in_chunk = int(payload["step_in_chunk"])
+        state.total_chunks = int(payload["total_chunks"])
+        state.chunk_num_steps = payload["chunk_num_steps"]
+
+    def pack_output_payload(self, output, request_id):
+        return {"request_id": request_id, "output": output}
+
+    def unpack_output_payload(self, payload):
+        return payload["output"]
 
 
 def _make_request(skip_cache_refresh: bool = True):
@@ -126,10 +204,26 @@ def _make_request_with_params(req_id: str, sampling_params):
 
 def _fake_platform_for_peak_memory():
     return SimpleNamespace(
+        is_available=lambda: True,
         reset_peak_memory_stats=lambda: None,
         max_memory_reserved=lambda: 0,
         max_memory_allocated=lambda: 0,
     )
+
+
+def _attach_runner_v2_transport(runner):
+    runner._omni_connector = OmniConnectorFactory.create_connector(
+        ConnectorSpec(
+            name="SharedMemoryConnector",
+            extra={"stage_id": 0, "shm_threshold_bytes": 0},
+        )
+    )
+    runner._boundary_put_chunks = {}
+    runner._boundary_get_chunks = {}
+    runner._local_stage_payload_cache = {}
+    runner._local_rank = 0
+    runner._stage_id = 0
+    return runner
 
 
 def _make_runner(cache_backend, cache_backend_name: str, enable_cache_dit_summary: bool = True):
@@ -195,24 +289,41 @@ def test_execute_stepwise_streaming_returns_chunks_at_boundaries(monkeypatch):
         DiffusionOutput(output="chunk-0", finished=False, chunk_index=0, total_chunks=2),
         DiffusionOutput(output="chunk-1", finished=True, chunk_index=1, total_chunks=2),
     ]
-    runner = _make_runner(cache_backend=None, cache_backend_name=None)
+    runner = object.__new__(DiffusionModelRunnerV2)
+    runner.vllm_config = object()
+    runner.device = torch.device("cpu")
     runner.pipeline = _ChunkStepPipeline(chunks)
-    runner.od_config.streaming_output = True
-    runner.od_config.step_execution = True
+    runner.cache_backend = None
+    runner.offload_backend = None
+    runner.state_cache = {}
+    runner.prompt_embed_cache = None
+    runner.od_config = SimpleNamespace(
+        cache_backend=None,
+        enable_cache_dit_summary=True,
+        parallel_config=SimpleNamespace(use_hsdp=False),
+        streaming_output=True,
+        step_execution=True,
+        cfg_kv_collect_func=None,
+    )
+    runner.kv_transfer_manager = SimpleNamespace(
+        receive_multi_kv_cache_distributed=lambda *a, **k: None,
+    )
+    runner._kv_prefetch_enabled = False
+    _attach_runner_v2_transport(runner)
     req = _make_request(skip_cache_refresh=True)
     req.request_id = "req"
 
-    monkeypatch.setattr(model_runner_module, "set_forward_context", _noop_forward_context)
-    monkeypatch.setattr(model_runner_module.current_omni_platform, "reset_peak_memory_stats", lambda: None)
-    monkeypatch.setattr(model_runner_module.current_omni_platform, "max_memory_reserved", lambda: 0)
-    monkeypatch.setattr(model_runner_module.current_omni_platform, "max_memory_allocated", lambda: 0)
+    fake_platform = _fake_platform_for_peak_memory()
+    monkeypatch.setattr(model_runner_v2_module, "set_forward_context", _noop_forward_context)
+    monkeypatch.setattr(model_runner_module, "current_omni_platform", fake_platform)
+    monkeypatch.setattr(model_runner_v2_module, "current_omni_platform", fake_platform)
     scheduler_output = SimpleNamespace(
         finished_req_ids=set(),
         scheduled_new_reqs=[SimpleNamespace(request_id="req", req=req)],
         scheduled_cached_reqs=SimpleNamespace(request_ids=[]),
     )
 
-    first = DiffusionModelRunner.execute_stepwise(runner, scheduler_output)
+    first = DiffusionModelRunnerV2.execute_stepwise(runner, scheduler_output)
     assert first.get_request_output("req").result is None
 
     scheduler_output = SimpleNamespace(
@@ -220,12 +331,12 @@ def test_execute_stepwise_streaming_returns_chunks_at_boundaries(monkeypatch):
         scheduled_new_reqs=[],
         scheduled_cached_reqs=SimpleNamespace(request_ids=["req"]),
     )
-    second = DiffusionModelRunner.execute_stepwise(runner, scheduler_output)
+    second = DiffusionModelRunnerV2.execute_stepwise(runner, scheduler_output)
     assert second.get_request_output("req").result == chunks[0]
     assert second.get_request_output("req").finished is False
 
-    DiffusionModelRunner.execute_stepwise(runner, scheduler_output)
-    fourth = DiffusionModelRunner.execute_stepwise(runner, scheduler_output)
+    DiffusionModelRunnerV2.execute_stepwise(runner, scheduler_output)
+    fourth = DiffusionModelRunnerV2.execute_stepwise(runner, scheduler_output)
     assert fourth.get_request_output("req").result == chunks[1]
     assert fourth.get_request_output("req").finished is True
 
@@ -291,6 +402,7 @@ def test_execute_model_passes_single_request_batch_to_non_admission_pipeline(mon
     req = _make_request(skip_cache_refresh=True)
 
     monkeypatch.setattr(model_runner_module, "set_forward_context", _noop_forward_context)
+    monkeypatch.setattr(model_runner_module, "current_omni_platform", _fake_platform_for_peak_memory())
 
     output = DiffusionModelRunner.execute_model(runner, req)
 
@@ -307,6 +419,7 @@ def test_execute_model_accepts_bare_diffusion_output_from_single_request_pipelin
     req = _make_request(skip_cache_refresh=True)
 
     monkeypatch.setattr(model_runner_module, "set_forward_context", _noop_forward_context)
+    monkeypatch.setattr(model_runner_module, "current_omni_platform", _fake_platform_for_peak_memory())
 
     output = DiffusionModelRunner.execute_model(runner, req)
 

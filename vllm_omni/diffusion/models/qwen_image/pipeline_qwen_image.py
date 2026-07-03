@@ -28,7 +28,10 @@ from vllm_omni.diffusion.distributed.utils import get_local_device
 from vllm_omni.diffusion.model_loader.diffusers_loader import DiffusersPipelineLoader
 from vllm_omni.diffusion.model_loader.hub_prefetch import from_pretrained_with_prefetch, prefetch_subfolders
 from vllm_omni.diffusion.models.dmd2 import DMD2PipelineMixin
-from vllm_omni.diffusion.models.interface import SupportsComponentDiscovery
+from vllm_omni.diffusion.models.interface import (
+    DefaultDiffusionStepAtomsMixin,
+    SupportsComponentDiscovery,
+)
 from vllm_omni.diffusion.models.qwen_image.cfg_parallel import (
     QwenImageCFGParallelMixin,
 )
@@ -47,6 +50,7 @@ from vllm_omni.diffusion.utils.tf_utils import get_transformer_config_kwargs
 from vllm_omni.diffusion.worker.request_batch import DiffusionRequestBatch, split_diffusion_output_by_request
 
 if TYPE_CHECKING:
+    from vllm_omni.data_entry_keys import OmniPayload
     from vllm_omni.diffusion.worker.input_batch import InputBatch
     from vllm_omni.diffusion.worker.utils import DiffusionRequestState
 
@@ -253,7 +257,11 @@ def apply_rotary_emb_qwen(
 
 
 class QwenImagePipeline(
-    nn.Module, QwenImageCFGParallelMixin, DiffusionPipelineProfilerMixin, SupportsComponentDiscovery
+    nn.Module,
+    QwenImageCFGParallelMixin,
+    DiffusionPipelineProfilerMixin,
+    DefaultDiffusionStepAtomsMixin,
+    SupportsComponentDiscovery,
 ):
     supports_request_batch = True
     _dit_modules: ClassVar[list[str]] = ["transformer"]
@@ -357,7 +365,7 @@ class QwenImagePipeline(
             enable_diffusion_pipeline_profiler=self.od_config.enable_diffusion_pipeline_profiler
         )
 
-    def check_inputs(
+    def _check_inputs_raw(
         self,
         prompt,
         height,
@@ -656,12 +664,12 @@ class QwenImagePipeline(
         attention_kwargs=None,
         callback_on_step_end_tensor_inputs=None,
     ):
-        """Shared preparation logic for forward() and prepare_encode().
+        """Shared preparation logic for request-mode forward().
 
         Validates inputs, encodes prompts, prepares latents, computes timesteps,
         and returns all intermediate values as a dict.
         """
-        self.check_inputs(
+        self._check_inputs_raw(
             prompt,
             height,
             width,
@@ -758,55 +766,373 @@ class QwenImagePipeline(
             "negative_txt_seq_lens": negative_txt_seq_lens,
         }
 
-    def prepare_encode(
+    def _state_prompt_inputs(
         self,
         state: "DiffusionRequestState",
-        **kwargs: Any,
-    ) -> "DiffusionRequestState":
-        """Populate *state* with encoded prompts, latents, timesteps, and CFG config."""
-        sampling = state.sampling
-        prompt, negative_prompt = self._extract_prompts([state.prompt] if state.prompt is not None else [])
-
-        ctx = self._prepare_generation_context(
-            prompt=prompt,
-            negative_prompt=negative_prompt,
-            height=sampling.height or self.default_sample_size * self.vae_scale_factor,
-            width=sampling.width or self.default_sample_size * self.vae_scale_factor,
-            num_inference_steps=sampling.num_inference_steps or 50,
-            sigmas=sampling.sigmas,
-            guidance_scale=sampling.guidance_scale if sampling.guidance_scale_provided else 1.0,
-            num_images_per_prompt=sampling.num_outputs_per_prompt if sampling.num_outputs_per_prompt > 0 else 1,
-            generator=sampling.generator,
-            true_cfg_scale=sampling.true_cfg_scale or 4.0,
-            max_sequence_length=sampling.max_sequence_length or self.tokenizer_max_length,
-            attention_kwargs=kwargs.get("attention_kwargs"),
+    ) -> tuple[
+        list[str] | None,
+        list[str] | None,
+        torch.Tensor | None,
+        torch.Tensor | None,
+        torch.Tensor | None,
+        torch.Tensor | None,
+    ]:
+        prompts = [state.prompt] if state.prompt is not None else []
+        prompt, negative_prompt = self._extract_prompts(prompts)
+        prompt_fields = DiffusionRequestBatch.collate_prompt_field_map(
+            prompts,
+            {
+                "prompt_embeds": None,
+                "prompt_embeds_mask": None,
+                "negative_prompt_embeds": None,
+                "negative_prompt_embeds_mask": None,
+            },
+        )
+        prompt_embeds = prompt_fields["prompt_embeds"]
+        prompt_embeds_mask = prompt_fields["prompt_embeds_mask"]
+        negative_prompt_embeds = prompt_fields["negative_prompt_embeds"]
+        negative_prompt_embeds_mask = prompt_fields["negative_prompt_embeds_mask"]
+        if prompt_embeds is not None:
+            prompt = None
+        if negative_prompt_embeds is not None:
+            negative_prompt = None
+        return (
+            prompt,
+            negative_prompt,
+            prompt_embeds,
+            prompt_embeds_mask,
+            negative_prompt_embeds,
+            negative_prompt_embeds_mask,
         )
 
-        # prepare_timesteps() has already materialized request-specific timestep
-        # state on self.scheduler, so deepcopy preserves dynamic-shifting state
-        # without replaying set_timesteps() on the per-request scheduler.
-        # Per-request scheduler (must not share state with self.scheduler)
+    def init_state(
+        self,
+        state: "DiffusionRequestState",
+    ) -> "DiffusionRequestState":
+        state.extra.pop("decoded_output", None)
+        return state
+
+    def check_inputs(
+        self,
+        state: "DiffusionRequestState",
+    ) -> "DiffusionRequestState":
+        """Validate Qwen request inputs before encode/prepare atoms run."""
+        (
+            prompt,
+            negative_prompt,
+            prompt_embeds,
+            prompt_embeds_mask,
+            negative_prompt_embeds,
+            negative_prompt_embeds_mask,
+        ) = self._state_prompt_inputs(state)
+        height = getattr(state.sampling, "height", None) or self.default_sample_size * self.vae_scale_factor
+        width = getattr(state.sampling, "width", None) or self.default_sample_size * self.vae_scale_factor
+        height, width = normalize_min_aligned_size(height, width, self.vae_scale_factor * 2)
+        state.sampling.height = int(height)
+        state.sampling.width = int(width)
+        max_sequence_length = getattr(state.sampling, "max_sequence_length", None) or self.tokenizer_max_length
+        self._check_inputs_raw(
+            prompt,
+            height,
+            width,
+            negative_prompt,
+            prompt_embeds,
+            negative_prompt_embeds,
+            prompt_embeds_mask,
+            negative_prompt_embeds_mask,
+            None,
+            max_sequence_length,
+        )
+        return state
+
+    def encode(
+        self,
+        state: "DiffusionRequestState",
+    ) -> "DiffusionRequestState":
+        """Run Qwen text encoders and store prompt embeddings on state."""
+        (
+            prompt,
+            negative_prompt,
+            prompt_embeds,
+            prompt_embeds_mask,
+            negative_prompt_embeds,
+            negative_prompt_embeds_mask,
+        ) = self._state_prompt_inputs(state)
+
+        requested_outputs = getattr(state.sampling, "num_outputs_per_prompt", 1)
+        num_images_per_prompt = requested_outputs if requested_outputs > 0 else 1
+        max_sequence_length = getattr(state.sampling, "max_sequence_length", None) or self.tokenizer_max_length
+
+        true_cfg_scale = getattr(state.sampling, "true_cfg_scale", None) or 4.0
+        if getattr(state.sampling, "guidance_scale_provided", False):
+            guidance_scale = state.sampling.guidance_scale
+        else:
+            guidance_scale = 1.0
+        self._guidance_scale = guidance_scale
+        self._attention_kwargs = {}
+        self._current_timestep = None
+        self._interrupt = False
+
+        has_neg_prompt = negative_prompt is not None or (
+            negative_prompt_embeds is not None and negative_prompt_embeds_mask is not None
+        )
+        do_true_cfg = true_cfg_scale > 1 and has_neg_prompt
+        self.check_cfg_parallel_validity(true_cfg_scale, has_neg_prompt)
+
+        prompt_embeds, prompt_embeds_mask = self.encode_prompt(
+            prompt=prompt,
+            prompt_embeds=prompt_embeds,
+            prompt_embeds_mask=prompt_embeds_mask,
+            num_images_per_prompt=num_images_per_prompt,
+            max_sequence_length=max_sequence_length,
+        )
+        if do_true_cfg:
+            negative_prompt_embeds, negative_prompt_embeds_mask = self.encode_prompt(
+                prompt=negative_prompt,
+                prompt_embeds=negative_prompt_embeds,
+                prompt_embeds_mask=negative_prompt_embeds_mask,
+                num_images_per_prompt=num_images_per_prompt,
+                max_sequence_length=max_sequence_length,
+                prompt_name="negative_prompt",
+            )
+        else:
+            negative_prompt_embeds = None
+            negative_prompt_embeds_mask = None
+
+        state.prompt_embeds = prompt_embeds
+        state.prompt_embeds_mask = prompt_embeds_mask
+        state.negative_prompt_embeds = negative_prompt_embeds
+        state.negative_prompt_embeds_mask = negative_prompt_embeds_mask
+        state.do_true_cfg = do_true_cfg
+        return state
+
+    def prepare(
+        self,
+        state: "DiffusionRequestState",
+    ) -> "DiffusionRequestState":
+        """Prepare Qwen latents, timesteps, scheduler state, and DiT metadata."""
+        if state.prompt_embeds is None:
+            raise ValueError(f"Request {state.request_id} has no prompt_embeds after encode().")
+        height = int(state.sampling.height)
+        width = int(state.sampling.width)
+        requested_outputs = getattr(state.sampling, "num_outputs_per_prompt", 1)
+        num_images_per_prompt = requested_outputs if requested_outputs > 0 else 1
+        num_channels_latents = self.transformer.in_channels // 4
+        effective_batch_size = int(state.prompt_embeds.shape[0])
+        latents = getattr(state.sampling, "latents", None)
+        state.latents = self.prepare_latents(
+            effective_batch_size,
+            num_channels_latents,
+            height,
+            width,
+            state.prompt_embeds.dtype,
+            self.device,
+            getattr(state.sampling, "generator", None),
+            latents,
+        )
+        batch_size = max(1, effective_batch_size // num_images_per_prompt)
+        state.img_shapes = [
+            [
+                (
+                    1,
+                    height // self.vae_scale_factor // 2,
+                    width // self.vae_scale_factor // 2,
+                )
+            ]
+        ] * batch_size
+        if state.latents is None:
+            raise ValueError(f"Request {state.request_id} has no latents after prepare().")
+        timesteps, _ = self.prepare_timesteps(
+            getattr(state.sampling, "num_inference_steps", None) or 50,
+            getattr(state.sampling, "sigmas", None),
+            state.latents.shape[1],
+        )
+        self._num_timesteps = len(timesteps)
+        state.timesteps = timesteps
+        if getattr(state.sampling, "guidance_scale_provided", False):
+            guidance_scale = state.sampling.guidance_scale
+        else:
+            guidance_scale = 1.0
+        if self.transformer.guidance_embeds:
+            guidance = torch.full([1], guidance_scale, dtype=torch.float32)
+            state.guidance = guidance.expand(state.latents.shape[0])
+        else:
+            state.guidance = None
+        state.txt_seq_lens = txt_seq_lens_from_embeds(state.prompt_embeds)
+        state.negative_txt_seq_lens = txt_seq_lens_from_embeds(state.negative_prompt_embeds)
+
         req_scheduler = copy.deepcopy(self.scheduler)
         req_scheduler.set_begin_index(0)
-
-        # Populate state from generation context
-        state.prompt_embeds = ctx["prompt_embeds"]
-        state.prompt_embeds_mask = ctx["prompt_embeds_mask"]
-        state.negative_prompt_embeds = ctx["negative_prompt_embeds"]
-        state.negative_prompt_embeds_mask = ctx["negative_prompt_embeds_mask"]
-        state.latents = ctx["latents"]
-        state.timesteps = ctx["timesteps"]
         state.step_index = 0
         state.scheduler = req_scheduler
-        state.do_true_cfg = ctx["do_true_cfg"]
-        state.guidance = ctx["guidance"]
-        state.img_shapes = ctx["img_shapes"]
-        state.txt_seq_lens = ctx["txt_seq_lens"]
-        state.negative_txt_seq_lens = ctx["negative_txt_seq_lens"]
-        # QwenImage always normalizes CFG output (matching forward())
         state.sampling.cfg_normalize = True
-
         return state
+
+    @staticmethod
+    def _required_payload_tensor(payload: dict[str, Any], key: str) -> torch.Tensor:
+        value = payload[key]
+        if not torch.is_tensor(value):
+            raise TypeError(f"Qwen step payload field {key!r} must be a torch.Tensor.")
+        return value
+
+    @staticmethod
+    def _required_payload_list(payload: dict[str, Any], key: str) -> list[Any]:
+        value = payload[key]
+        if not isinstance(value, list):
+            raise TypeError(f"Qwen step payload field {key!r} must be a list.")
+        return value
+
+    def pack_encode_payload(self, state: "DiffusionRequestState") -> "OmniPayload":
+        """Pack encoder outputs required by the DiT stage."""
+        payload: dict[str, Any] = {
+            "request_id": state.request_id,
+            "meta": {
+                "height": int(state.sampling.height),
+                "width": int(state.sampling.width),
+            },
+            "latent": state.latents,
+            "qwen_step_index": int(state.step_index),
+            "qwen_do_true_cfg": bool(state.do_true_cfg),
+            "qwen_cfg_normalize": bool(getattr(state.sampling, "cfg_normalize", True)),
+            "qwen_true_cfg_scale": float(getattr(state.sampling, "true_cfg_scale", None) or 4.0),
+            "qwen_output_type": getattr(state.sampling, "output_type", None) or "pil",
+            "qwen_prompt_embeds": state.prompt_embeds,
+            "qwen_prompt_embeds_mask": state.prompt_embeds_mask,
+            "qwen_negative_prompt_embeds": state.negative_prompt_embeds,
+            "qwen_negative_prompt_embeds_mask": state.negative_prompt_embeds_mask,
+            "qwen_guidance": state.guidance,
+            "qwen_timesteps": state.timesteps,
+            "qwen_img_shapes": state.img_shapes,
+            "qwen_txt_seq_lens": state.txt_seq_lens,
+            "qwen_negative_txt_seq_lens": state.negative_txt_seq_lens,
+        }
+        scheduler = state.scheduler
+        if scheduler is not None:
+            sigmas = getattr(scheduler, "sigmas", None)
+            if torch.is_tensor(sigmas):
+                payload["qwen_scheduler_sigmas"] = sigmas
+            begin_index = getattr(scheduler, "begin_index", getattr(scheduler, "_begin_index", 0))
+            payload["qwen_scheduler_begin_index"] = int(begin_index or 0)
+        return {k: v for k, v in payload.items() if v is not None}  # type: ignore[return-value]
+
+    def unpack_encode_payload(
+        self,
+        payload: "OmniPayload",
+        state: "DiffusionRequestState",
+    ) -> None:
+        """Materialize encoder-stage payload into runner-owned request state."""
+        raw_payload: dict[str, Any] = dict(payload)
+        meta = raw_payload["meta"]
+        if not isinstance(meta, dict):
+            raise TypeError("Qwen step payload field 'meta' must be a dict.")
+        state.sampling.height = int(meta["height"])
+        state.sampling.width = int(meta["width"])
+        def model_tensor(key: str) -> torch.Tensor:
+            return self._required_payload_tensor(raw_payload, key).to(self.device)
+
+        state.prompt_embeds = model_tensor("qwen_prompt_embeds")
+        state.prompt_embeds_mask = model_tensor("qwen_prompt_embeds_mask")
+        state.latents = model_tensor("latent")
+        state.timesteps = self._required_payload_tensor(raw_payload, "qwen_timesteps").cpu()
+        state.img_shapes = self._required_payload_list(raw_payload, "qwen_img_shapes")
+        state.txt_seq_lens = self._required_payload_list(raw_payload, "qwen_txt_seq_lens")
+        state.do_true_cfg = bool(raw_payload["qwen_do_true_cfg"])
+        if state.do_true_cfg:
+            state.negative_prompt_embeds = model_tensor("qwen_negative_prompt_embeds")
+            state.negative_prompt_embeds_mask = model_tensor("qwen_negative_prompt_embeds_mask")
+            state.negative_txt_seq_lens = self._required_payload_list(raw_payload, "qwen_negative_txt_seq_lens")
+        else:
+            state.negative_prompt_embeds = None
+            state.negative_prompt_embeds_mask = None
+            state.negative_txt_seq_lens = None
+        if self.transformer.guidance_embeds:
+            state.guidance = self._required_payload_tensor(raw_payload, "qwen_guidance").cpu()
+        else:
+            state.guidance = None
+        state.step_index = int(raw_payload["qwen_step_index"])
+        state.sampling.cfg_normalize = bool(raw_payload["qwen_cfg_normalize"])
+        state.sampling.true_cfg_scale = float(raw_payload["qwen_true_cfg_scale"])
+        state.sampling.output_type = raw_payload["qwen_output_type"]
+        req_scheduler = copy.deepcopy(self.scheduler)
+        req_scheduler.timesteps = self._required_payload_tensor(raw_payload, "qwen_timesteps").cpu()
+        if hasattr(req_scheduler, "sigmas"):
+            req_scheduler.sigmas = self._required_payload_tensor(raw_payload, "qwen_scheduler_sigmas").cpu()
+        req_scheduler.set_begin_index(int(raw_payload["qwen_scheduler_begin_index"]))
+        state.scheduler = req_scheduler
+
+    def pack_decode_payload(self, state: "DiffusionRequestState") -> "OmniPayload":
+        """Pack denoised latents required by the decoder stage."""
+        payload: dict[str, Any] = {
+            "request_id": state.request_id,
+            "meta": {
+                "height": int(state.sampling.height),
+                "width": int(state.sampling.width),
+            },
+            "latent": state.latents,
+            "qwen_step_index": int(state.step_index),
+            "qwen_output_type": getattr(state.sampling, "output_type", None) or "pil",
+        }
+        return {k: v for k, v in payload.items() if v is not None}  # type: ignore[return-value]
+
+    def unpack_decode_payload(
+        self,
+        payload: "OmniPayload",
+        state: "DiffusionRequestState",
+    ) -> None:
+        """Materialize DiT-stage payload before VAE decode."""
+        raw_payload: dict[str, Any] = dict(payload)
+        meta = raw_payload["meta"]
+        if not isinstance(meta, dict):
+            raise TypeError("Qwen step payload field 'meta' must be a dict.")
+        state.sampling.height = int(meta["height"])
+        state.sampling.width = int(meta["width"])
+        state.latents = self._required_payload_tensor(raw_payload, "latent").to(self.device)
+        state.step_index = int(raw_payload["qwen_step_index"])
+        state.sampling.output_type = raw_payload["qwen_output_type"]
+
+    def pack_output_payload(
+        self,
+        output: DiffusionOutput,
+        request_id: str,
+    ) -> "OmniPayload":
+        """Pack decoder output for downstream/local delivery."""
+        payload: dict[str, Any] = {
+            "request_id": request_id,
+            "meta": {
+                "req_id": [request_id],
+                "finished": torch.tensor(bool(output.finished)),
+            },
+            "qwen_output": output.output,
+            "qwen_error": output.error,
+            "qwen_error_status_code": output.error_status_code,
+            "qwen_error_type": output.error_type,
+            "qwen_aborted": bool(output.aborted),
+            "qwen_abort_message": output.abort_message,
+            "qwen_peak_memory_mb": float(output.peak_memory_mb),
+        }
+        return {k: v for k, v in payload.items() if v is not None}  # type: ignore[return-value]
+
+    def unpack_output_payload(self, payload: "OmniPayload") -> DiffusionOutput:
+        """Unpack a decoder output payload into DiffusionOutput."""
+        raw_payload: dict[str, Any] = dict(payload)
+        meta = raw_payload["meta"]
+        if not isinstance(meta, dict):
+            raise TypeError("Qwen output payload field 'meta' must be a dict.")
+        finished_value = meta["finished"]
+        if torch.is_tensor(finished_value):
+            finished = bool(finished_value.item())
+        else:
+            finished = bool(finished_value)
+        return DiffusionOutput(
+            output=raw_payload.get("qwen_output"),
+            error=raw_payload.get("qwen_error"),
+            error_status_code=raw_payload.get("qwen_error_status_code"),
+            error_type=raw_payload.get("qwen_error_type"),
+            aborted=bool(raw_payload["qwen_aborted"]),
+            abort_message=raw_payload.get("qwen_abort_message"),
+            finished=finished,
+            peak_memory_mb=float(raw_payload["qwen_peak_memory_mb"]),
+        )
 
     def _build_denoise_kwargs(
         self,
@@ -869,43 +1195,12 @@ class QwenImagePipeline(
         output_slice = latents.size(1) if image_latents is not None else None
         return positive_kwargs, negative_kwargs, output_slice
 
-    def _decode_latents(
-        self,
-        latents: torch.Tensor,
-        height: int,
-        width: int,
-        output_type: str = "pil",
-    ) -> DiffusionOutput:
-        """Unpack, normalize, and VAE-decode latents into a DiffusionOutput."""
-        if output_type == "latent":
-            return DiffusionOutput(
-                output=latents,
-                stage_durations=self.stage_durations if hasattr(self, "stage_durations") else None,
-            )
-
-        latents = self._unpack_latents(latents, height, width, self.vae_scale_factor)
-        latents = latents.to(self.vae.dtype)
-        latents_mean = (
-            torch.tensor(self.vae.config.latents_mean)
-            .view(1, self.vae.config.z_dim, 1, 1, 1)
-            .to(latents.device, latents.dtype)
-        )
-        latents_std = 1.0 / torch.tensor(self.vae.config.latents_std).view(1, self.vae.config.z_dim, 1, 1, 1).to(
-            latents.device, latents.dtype
-        )
-        latents = latents / latents_std + latents_mean
-        image = self.vae.decode(latents, return_dict=False)[0][:, :, 0]
-        return DiffusionOutput(
-            output=image,
-            stage_durations=self.stage_durations if hasattr(self, "stage_durations") else None,
-        )
-
     def denoise_step(
         self,
         input_batch: "InputBatch",
         **kwargs: Any,
     ) -> torch.Tensor | None:
-        """One denoise step: read from *input_batch*, delegate to CFGParallelMixin.
+        """Predict noise for one DiT step from the runner-assembled batch.
 
         Reuses ``predict_noise_maybe_with_cfg`` so that CFG-parallel,
         sequential-CFG, and no-CFG paths are handled identically to
@@ -951,11 +1246,10 @@ class QwenImagePipeline(
         self,
         state: "DiffusionRequestState",
         noise_pred: torch.Tensor,
-        **kwargs: Any,
-    ) -> None:
+    ) -> "DiffusionRequestState":
         """One scheduler step: update ``state.latents`` and advance ``step_index``."""
         if self.interrupt:
-            return
+            return state
 
         t = state.current_timestep
         state.latents = self.scheduler_step_maybe_with_cfg(
@@ -967,20 +1261,84 @@ class QwenImagePipeline(
         )
 
         state.step_index += 1
+        return state
 
-    def post_decode(
+    def diffuse(
         self,
         state: "DiffusionRequestState",
-        **kwargs: Any,
+    ) -> "DiffusionRequestState":
+        from vllm_omni.diffusion.worker.input_batch import InputBatch
+        from vllm_omni.diffusion.worker.utils import DiffusionRequestState
+
+        if not isinstance(state, DiffusionRequestState):
+            raise TypeError("QwenImagePipeline.diffuse() expects a DiffusionRequestState.")
+        while not state.denoise_completed:
+            if self.interrupt:
+                break
+            input_batch = InputBatch.make_batch([state])
+            noise_pred = self.denoise_step(input_batch)
+            if noise_pred is None:
+                if self.interrupt:
+                    break
+                raise RuntimeError("denoise_step returned None without pipeline interrupt.")
+            self.step_scheduler(state, noise_pred)
+        return state
+
+    def _decode_latents(
+        self,
+        latents: torch.Tensor,
+        height: int,
+        width: int,
+        output_type: str = "pil",
     ) -> DiffusionOutput:
+        """Unpack, normalize, and VAE-decode latents into a DiffusionOutput."""
+        if output_type == "latent":
+            return DiffusionOutput(
+                output=latents,
+                stage_durations=self.stage_durations if hasattr(self, "stage_durations") else None,
+            )
+
+        latents = self._unpack_latents(latents, height, width, self.vae_scale_factor)
+        latents = latents.to(self.vae.dtype)
+        latents_mean = (
+            torch.tensor(self.vae.config.latents_mean)
+            .view(1, self.vae.config.z_dim, 1, 1, 1)
+            .to(latents.device, latents.dtype)
+        )
+        latents_std = 1.0 / torch.tensor(self.vae.config.latents_std).view(1, self.vae.config.z_dim, 1, 1, 1).to(
+            latents.device, latents.dtype
+        )
+        latents = latents / latents_std + latents_mean
+        image = self.vae.decode(latents, return_dict=False)[0][:, :, 0]
+        return DiffusionOutput(
+            output=image,
+            stage_durations=self.stage_durations if hasattr(self, "stage_durations") else None,
+        )
+
+    def decode(
+        self,
+        state: "DiffusionRequestState",
+    ) -> "DiffusionRequestState":
         """Decode final latents from *state*."""
         self._current_timestep = None
 
-        height = state.sampling.height or self.default_sample_size * self.vae_scale_factor
-        width = state.sampling.width or self.default_sample_size * self.vae_scale_factor
-        output_type = kwargs.get("output_type") or state.sampling.output_type or "pil"
+        height = int(state.sampling.height)
+        width = int(state.sampling.width)
+        output_type = getattr(state.sampling, "output_type", None) or "pil"
 
-        return self._decode_latents(state.latents, height, width, output_type)
+        state.extra["decoded_output"] = self._decode_latents(state.latents, height, width, output_type)
+        return state
+
+    def postprocess(
+        self,
+        state: "DiffusionRequestState",
+    ) -> DiffusionOutput:
+        output = state.extra.get("decoded_output")
+        if output is None:
+            raise ValueError(f"Request {state.request_id} has not been decoded.")
+        if not isinstance(output, DiffusionOutput):
+            raise TypeError(f"Decoded output for request {state.request_id} must be a DiffusionOutput.")
+        return output
 
     def forward(self, req: DiffusionRequestBatch) -> list[DiffusionOutput]:
         sampling_params_list = req.sampling_params_list
@@ -1048,7 +1406,8 @@ class QwenImagePipeline(
             callback_on_step_end_tensor_inputs=callback_on_step_end_tensor_inputs,
         )
 
-        latents = self.diffuse(
+        latents = QwenImageCFGParallelMixin.diffuse(
+            self,
             ctx["prompt_embeds"],
             ctx["prompt_embeds_mask"],
             ctx["negative_prompt_embeds"],

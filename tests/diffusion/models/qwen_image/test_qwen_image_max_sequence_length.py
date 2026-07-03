@@ -129,36 +129,22 @@ def test_encode_prompt_rejects_prompt_longer_than_explicit_max_sequence_length(
         pipeline.encode_prompt(prompt="prompt", max_sequence_length=16)
 
 
-def test_prepare_encode_defaults_to_tokenizer_max_length():
+def test_encode_atom_defaults_to_tokenizer_max_length():
     pipeline = object.__new__(QwenImagePipeline)
     nn.Module.__init__(pipeline)
     pipeline.tokenizer_max_length = 1024
-    pipeline.vae_scale_factor = 8
-    pipeline.default_sample_size = 128
-    pipeline.scheduler = _FakeScheduler()
     pipeline._extract_prompts = lambda prompts: (["prompt"], None)
+    pipeline.check_cfg_parallel_validity = lambda true_cfg_scale, has_neg_prompt: True
 
     captured = {}
 
-    def _fake_prepare_generation_context(**kwargs):
+    def _fake_encode_prompt(**kwargs):
         captured["max_sequence_length"] = kwargs["max_sequence_length"]
         embeds = torch.ones((1, 1, 1))
         mask = torch.ones((1, 1), dtype=torch.long)
-        return {
-            "prompt_embeds": embeds,
-            "prompt_embeds_mask": mask,
-            "negative_prompt_embeds": None,
-            "negative_prompt_embeds_mask": None,
-            "latents": embeds,
-            "timesteps": torch.tensor([1]),
-            "do_true_cfg": False,
-            "guidance": None,
-            "img_shapes": [[(1, 1, 1)]],
-            "txt_seq_lens": [1],
-            "negative_txt_seq_lens": None,
-        }
+        return embeds, mask
 
-    pipeline._prepare_generation_context = _fake_prepare_generation_context
+    pipeline.encode_prompt = _fake_encode_prompt
     state = SimpleNamespace(
         prompt="prompt",
         sampling=SimpleNamespace(
@@ -174,7 +160,7 @@ def test_prepare_encode_defaults_to_tokenizer_max_length():
         ),
     )
 
-    pipeline.prepare_encode(state)
+    pipeline.encode(state)
 
     assert captured["max_sequence_length"] == 1024
 

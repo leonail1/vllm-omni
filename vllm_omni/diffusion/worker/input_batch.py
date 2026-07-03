@@ -13,6 +13,7 @@ from __future__ import annotations
 
 from collections.abc import Sequence
 from dataclasses import dataclass, field
+from typing import Any
 
 import numpy as np
 import torch
@@ -613,6 +614,7 @@ class InputBatch:
     img_shapes: list | None = None
     txt_seq_lens: list[int] | None = None
     negative_txt_seq_lens: list[int] | None = None
+    model_inputs: dict[str, Any] = field(default_factory=dict)
     states: Sequence[DiffusionRequestState] = field(default_factory=tuple)
 
     def __post_init__(self) -> None:

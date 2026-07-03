@@ -55,10 +55,9 @@ class DiffusionRequestState:
     """Per-request mutable state across all pipeline stages.
 
     Owned by Runner and passed through all step-execution stages:
-    ``prepare_encode()`` initializes/updates fields, ``denoise_step()`` and
-    ``step_scheduler()`` mutate per-step fields, and ``post_decode()``
-    consumes final latents. This state object is also the cache unit for
-    future continuous batching.
+    ``encode_stage()`` initializes request state, ``denoise_stage()`` mutates
+    per-step fields, and ``decode_stage()`` consumes final/chunk latents. This
+    state object is also the cache unit for future continuous batching.
 
     This dataclass keeps only the minimal cross-model state required by the
     step-execution contract. Pipeline-specific state should be stored in
@@ -78,16 +77,16 @@ class DiffusionRequestState:
     prompt: OmniPromptType | None = None
     kv_sender_info: dict | None = None
 
-    # ── Encoded prompts (set once by prepare_encode) ──
+    # ── Encoded prompts (set once by encode_stage) ──
     prompt_embeds: torch.Tensor | None = None
     prompt_embeds_mask: torch.Tensor | None = None
     negative_prompt_embeds: torch.Tensor | None = None
     negative_prompt_embeds_mask: torch.Tensor | None = None
 
-    # ── Latent state (mutated every step by step_scheduler) ──
+    # ── Latent state (mutated every step by denoise_stage) ──
     latents: torch.Tensor | None = None
 
-    # ── Timestep schedule (set once by prepare_encode) ──
+    # ── Timestep schedule (set once by encode_stage/prepare) ──
     timesteps: torch.Tensor | list[torch.Tensor] | None = None
     step_index: int = 0
 
@@ -97,14 +96,14 @@ class DiffusionRequestState:
     total_chunks: int = 1
     chunk_num_steps: int | None = None
 
-    # ── Per-request scheduler instance (set once by prepare_encode) ──
+    # ── Per-request scheduler instance (set once by encode_stage/prepare) ──
     scheduler: Any | None = None
 
-    # ── CFG config (set once by prepare_encode) ──
+    # ── CFG config (set once by encode_stage/prepare) ──
     do_true_cfg: bool = False
     guidance: torch.Tensor | None = None
 
-    # ── Spatial / sequence metadata (set once by prepare_encode) ──
+    # ── Spatial / sequence metadata (set once by encode_stage/prepare) ──
     img_shapes: list | None = None
     txt_seq_lens: list[int] | None = None
     negative_txt_seq_lens: list[int] | None = None

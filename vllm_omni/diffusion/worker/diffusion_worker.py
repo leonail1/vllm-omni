@@ -48,6 +48,7 @@ from vllm_omni.diffusion.registry import get_diffusion_ir_op_priority_func
 from vllm_omni.diffusion.request import OmniDiffusionRequest
 from vllm_omni.diffusion.sched.interface import DiffusionSchedulerOutput
 from vllm_omni.diffusion.worker.diffusion_model_runner import DiffusionModelRunner
+from vllm_omni.diffusion.worker.diffusion_model_runner_v2 import DiffusionModelRunnerV2
 from vllm_omni.diffusion.worker.utils import BaseRunnerOutput, BatchRunnerOutput
 from vllm_omni.engine.stage_init_utils import set_death_signal
 from vllm_omni.lora.request import LoRARequest
@@ -56,6 +57,20 @@ from vllm_omni.profiler import OmniTorchProfilerWrapper, create_omni_profiler
 from vllm_omni.worker.gpu_memory_utils import get_process_gpu_memory
 
 logger = init_logger(__name__)
+
+_DEFAULT_DIFFUSION_MODEL_RUNNER_CLS = "vllm_omni.diffusion.worker.diffusion_model_runner.DiffusionModelRunner"
+_STEPWISE_RUNNER_V2_MODEL_CLASSES = {
+    "QwenImagePipeline",
+    "QwenImageDMD2Pipeline",
+}
+
+
+def _should_use_stepwise_runner_v2(od_config: OmniDiffusionConfig, model_runner_cls_path: str) -> bool:
+    return (
+        getattr(od_config, "step_execution", False) is True
+        and model_runner_cls_path == _DEFAULT_DIFFUSION_MODEL_RUNNER_CLS
+        and getattr(od_config, "model_class_name", None) in _STEPWISE_RUNNER_V2_MODEL_CLASSES
+    )
 
 
 @dataclass
@@ -71,6 +86,12 @@ class _DiffusionVllmModelConfig:
     disable_cascade_attn: bool = False
     enable_return_routed_experts: bool = False
     is_moe: bool = False
+    stage_id: int = 0
+    worker_type: str = "diffusion"
+    stage_connector_config: Any | None = None
+    async_chunk: bool = False
+    model_arch: str | None = None
+    model_stage: str | None = None
 
     def is_quantized(self) -> bool:
         return self.quantization is not None
@@ -91,6 +112,15 @@ def _make_diffusion_vllm_model_config(od_config: OmniDiffusionConfig) -> _Diffus
     quantization = quant_config.get_name() if quant_config is not None and hasattr(quant_config, "get_name") else None
     hf_config = getattr(od_config, "tf_model_config", None)
     hf_text_config = get_hf_text_config(hf_config) if hasattr(hf_config, "get_text_config") else hf_config
+    od_model_config = getattr(od_config, "model_config", None)
+    if isinstance(od_model_config, dict):
+        stage_connector_config = od_model_config.get("stage_connector_config")
+        model_stage = od_model_config.get("model_stage")
+    else:
+        stage_connector_config = getattr(od_model_config, "stage_connector_config", None)
+        model_stage = getattr(od_model_config, "model_stage", None)
+    if stage_connector_config is None:
+        stage_connector_config = getattr(od_config, "stage_connector_config", None)
     return _DiffusionVllmModelConfig(
         model=od_config.model,
         dtype=od_config.dtype,
@@ -100,6 +130,10 @@ def _make_diffusion_vllm_model_config(od_config: OmniDiffusionConfig) -> _Diffus
         hf_text_config=hf_text_config,
         enforce_eager=getattr(od_config, "enforce_eager", False),
         is_moe=bool(getattr(od_config, "is_moe", False)),
+        stage_id=int(getattr(od_config, "stage_id", 0)),
+        stage_connector_config=stage_connector_config,
+        model_arch=getattr(od_config, "model_class_name", None),
+        model_stage=model_stage,
     )
 
 
@@ -240,6 +274,8 @@ class DiffusionWorker:
         else:
             model_runner_cls_path = current_omni_platform.get_diffusion_model_runner_cls()
         model_runner_cls = resolve_obj_by_qualname(model_runner_cls_path)
+        if _should_use_stepwise_runner_v2(self.od_config, model_runner_cls_path):
+            model_runner_cls = DiffusionModelRunnerV2
         self.model_runner = model_runner_cls(
             vllm_config=self.vllm_config,
             od_config=self.od_config,
