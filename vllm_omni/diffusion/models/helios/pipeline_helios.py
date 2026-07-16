@@ -8,7 +8,7 @@ import json
 import logging
 import math
 import os
-from collections.abc import Iterable, Sequence
+from collections.abc import Iterable
 from typing import TYPE_CHECKING, Any, ClassVar
 
 import numpy as np
@@ -28,16 +28,17 @@ from vllm_omni.diffusion.models.helios.helios_transformer import HeliosTransform
 from vllm_omni.diffusion.models.helios.scheduling_helios import HeliosScheduler
 from vllm_omni.diffusion.models.interface import SupportsComponentDiscovery
 from vllm_omni.diffusion.models.progress_bar import ProgressBarMixin
+from vllm_omni.diffusion.models.step_mixin import DiffusionV2CFGStepMixin
 from vllm_omni.diffusion.profiler.diffusion_pipeline_profiler import DiffusionPipelineProfilerMixin
 from vllm_omni.diffusion.request import OmniDiffusionRequest
 from vllm_omni.diffusion.worker.request_batch import DiffusionRequestBatch
+from vllm_omni.diffusion.worker.utils import DiffusionRequestState
 from vllm_omni.platforms import current_omni_platform
 
 if TYPE_CHECKING:
     from vllm.model_executor.layers.quantization.base_config import QuantizationConfig
 
     from vllm_omni.diffusion.worker.input_batch import InputBatch
-    from vllm_omni.diffusion.worker.utils import DiffusionRequestState
 
 logger = logging.getLogger(__name__)
 
@@ -155,7 +156,12 @@ def get_helios_pre_process_func(
 
 
 class HeliosPipeline(
-    nn.Module, CFGParallelMixin, ProgressBarMixin, DiffusionPipelineProfilerMixin, SupportsComponentDiscovery
+    nn.Module,
+    DiffusionV2CFGStepMixin,
+    CFGParallelMixin,
+    ProgressBarMixin,
+    DiffusionPipelineProfilerMixin,
+    SupportsComponentDiscovery,
 ):
     """Helios text-to-video / image-to-video / video-to-video pipeline for vllm-omni.
 
@@ -270,6 +276,10 @@ class HeliosPipeline(
     def current_timestep(self):
         return self._current_timestep
 
+    @property
+    def interrupt(self) -> bool:
+        return getattr(self, "_interrupt", False)
+
     def _stage1_sigmas(self, num_steps: int) -> np.ndarray:
         # DMD drops the last timestep in set_timesteps(). Only compensate for
         # the one-step dummy-run edge case; otherwise preserve the historical
@@ -277,13 +287,17 @@ class HeliosPipeline(
         sigma_count = num_steps + 2 if self.is_distilled and num_steps == 1 else num_steps + 1
         return np.linspace(0.999, 0.0, sigma_count)[:-1]
 
-    def prepare_encode(
-        self,
-        state: DiffusionRequestState,
-        **kwargs: Any,
-    ) -> DiffusionRequestState:
-        """Initialize Helios request state for chunk-wise step execution."""
-        del kwargs
+    def check_inputs(self, state: DiffusionRequestState) -> DiffusionRequestState:
+        extra = getattr(state.sampling, "extra_args", {}) or {}
+        if extra.get("image") is not None and extra.get("video") is not None:
+            raise ValueError("image and video cannot be provided simultaneously")
+        prompt = state.prompt if isinstance(state.prompt, str) else (state.prompt or {}).get("prompt")
+        if prompt is None:
+            raise ValueError("Prompt is required for Helios generation.")
+        return state
+
+    def encode(self, state: DiffusionRequestState) -> DiffusionRequestState:
+        """Encode inputs and initialize chunk-independent request state."""
         # Wrap the single request in a DiffusionRequestBatch so the batch
         # compatibility properties (`prompts`, etc.) used below are available;
         # OmniDiffusionRequest itself only exposes a singular `prompt`.
@@ -310,19 +324,11 @@ class HeliosPipeline(
 
         image = extra.get("image")
         video = extra.get("video")
-        if image is not None and video is not None:
-            raise ValueError("image and video cannot be provided simultaneously")
-        if len(req.prompts) > 1:
-            raise ValueError("Helios step execution supports a single prompt, not a batched request.")
-
         prompt = None
         negative_prompt = None
         if len(req.prompts) == 1:
             prompt = req.prompts[0] if isinstance(req.prompts[0], str) else req.prompts[0].get("prompt")
             negative_prompt = None if isinstance(req.prompts[0], str) else req.prompts[0].get("negative_prompt")
-        if prompt is None:
-            raise ValueError("Prompt is required for Helios generation.")
-
         guidance_scale = float(extra.get("guidance_scale", 5.0))
         if state.sampling.guidance_scale_provided:
             guidance_scale = state.sampling.guidance_scale
@@ -527,8 +533,20 @@ class HeliosPipeline(
                 "zero_steps": int(extra.get("zero_steps", 1)),
             }
         )
+        return state
+
+    def prepare(self, state: DiffusionRequestState) -> DiffusionRequestState:
         self._prepare_next_chunk(state)
         return state
+
+    def prepare_encode(
+        self,
+        state: DiffusionRequestState,
+        **kwargs: Any,
+    ) -> DiffusionRequestState:
+        """Compatibility entry point for the current step runner."""
+        del kwargs
+        return self.prepare(self.encode(self.check_inputs(self.init_state(state))))
 
     def _prepare_next_chunk(self, state: DiffusionRequestState) -> None:
         extra = state.extra
@@ -625,7 +643,7 @@ class HeliosPipeline(
         amplify_first_chunk = extra["is_amplify_first_chunk"] and extra["is_first_chunk"]
         state.chunk_num_steps = sum(
             self._stage2_effective_num_steps(int(num_steps), amplify_first_chunk)
-            for num_steps in extra["pyramid_num_inference_steps_list"]
+            for num_steps in extra["pyramid_num_inference_steps_list"][: extra["pyramid_num_stages"]]
         )
         self._set_stage2_timesteps(state)
 
@@ -655,10 +673,10 @@ class HeliosPipeline(
     def denoise_step(
         self,
         input_batch: InputBatch,
-        states: Sequence[DiffusionRequestState],
         **kwargs: Any,
     ) -> torch.Tensor | None:
         del kwargs
+        states = list(input_batch.states)
         if len(states) != 1:
             raise ValueError("Helios step execution supports a single request, not a batched request.")
         state = states[0]
@@ -776,7 +794,7 @@ class HeliosPipeline(
         state: DiffusionRequestState,
         noise_pred: torch.Tensor,
         **kwargs: Any,
-    ) -> None:
+    ) -> DiffusionRequestState:
         del kwargs
         if state.extra["is_enable_stage2"]:
             self._step_scheduler_stage2(state, noise_pred)
@@ -799,6 +817,7 @@ class HeliosPipeline(
                 state.latents = self.scheduler_step_maybe_with_cfg(noise_pred, t, state.latents, state.do_true_cfg)
             state.step_in_chunk += 1
             state.step_index = state.step_in_chunk
+        return state
 
     def _step_scheduler_stage2(self, state: DiffusionRequestState, noise_pred: torch.Tensor) -> None:
         extra = state.extra
@@ -827,6 +846,9 @@ class HeliosPipeline(
 
         extra["stage_index"] += 1
         extra["stage_step_index"] = 0
+        # The legacy request-mode path rebuilt the next stage schedule before
+        # upsampling. Preserve that ordering for dynamic shifting equivalence.
+        self._set_stage2_timesteps(state)
         extra["stage2_height"] *= 2
         extra["stage2_width"] *= 2
         batch_size, num_channel, num_frames_cur = state.latents.shape[:3]
@@ -862,14 +884,8 @@ class HeliosPipeline(
         state.latents = alpha * state.latents + beta * noise
         if self.is_distilled and extra["stage2_start_point_list"] is not None:
             extra["stage2_start_point_list"].append(state.latents)
-        self._set_stage2_timesteps(state)
 
-    def post_decode(
-        self,
-        state: DiffusionRequestState,
-        **kwargs: Any,
-    ) -> DiffusionOutput:
-        del kwargs
+    def decode(self, state: DiffusionRequestState) -> DiffusionRequestState:
         extra = state.extra
         is_first_chunk = extra["is_first_chunk"]
         is_second_chunk = extra["is_second_chunk"]
@@ -892,10 +908,13 @@ class HeliosPipeline(
         else:
             extra["history_video"] = torch.cat([extra["history_video"], current_video], dim=2)
 
-        output = current_latents if extra["output_type"] == "latent" else current_video
         completed_chunk_index = state.chunk_index
         state.chunk_index += 1
         finished = state.request_denoise_completed
+        if getattr(self.od_config, "streaming_output", False):
+            output = current_latents if extra["output_type"] == "latent" else current_video
+        else:
+            output = real_history_latents if extra["output_type"] == "latent" else extra["history_video"]
         if not finished:
             self._prepare_next_chunk(state)
         else:
@@ -903,13 +922,26 @@ class HeliosPipeline(
             if current_omni_platform.is_available():
                 current_omni_platform.empty_cache()
 
-        return DiffusionOutput(
+        state.extra["decoded_output"] = DiffusionOutput(
             output=output,
             stage_durations=self.stage_durations if hasattr(self, "stage_durations") else {},
             chunk_index=completed_chunk_index,
             total_chunks=state.total_chunks,
             finished=finished,
         )
+        return state
+
+    def postprocess(self, state: DiffusionRequestState) -> DiffusionOutput:
+        return state.extra["decoded_output"]
+
+    def post_decode(
+        self,
+        state: DiffusionRequestState,
+        **kwargs: Any,
+    ) -> DiffusionOutput:
+        """Compatibility entry point for the current step runner."""
+        del kwargs
+        return self.postprocess(self.decode(state))
 
     def forward(
         self,

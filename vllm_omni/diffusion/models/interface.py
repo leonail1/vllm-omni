@@ -43,6 +43,75 @@ class SupportAudioOutput(Protocol):
 
 
 @runtime_checkable
+class DiffusionAtoms(Protocol):
+    """Request lifecycle atoms implemented by a diffusion pipeline."""
+
+    supports_step_execution: ClassVar[bool] = True
+
+    def init_state(self, state: DiffusionRequestState) -> DiffusionRequestState:
+        """Initialize pipeline-private request state."""
+        ...
+
+    def check_inputs(self, state: DiffusionRequestState) -> DiffusionRequestState:
+        """Validate request inputs before model work begins."""
+        ...
+
+    def encode(self, state: DiffusionRequestState) -> DiffusionRequestState:
+        """Encode request inputs."""
+        ...
+
+    def prepare(self, state: DiffusionRequestState) -> DiffusionRequestState:
+        """Prepare latents, timesteps, and denoising inputs."""
+        ...
+
+    def diffuse(self, state: DiffusionRequestState) -> DiffusionRequestState:
+        """Run the request-mode diffusion loop."""
+        ...
+
+    def decode(self, state: DiffusionRequestState) -> DiffusionRequestState:
+        """Decode the final latents."""
+        ...
+
+    def postprocess(self, state: DiffusionRequestState) -> DiffusionOutput:
+        """Build the public diffusion output."""
+        ...
+
+
+@runtime_checkable
+class DiffusionStepHooks(Protocol):
+    """Step-batching hooks implemented by a diffusion pipeline."""
+
+    def build_step_batch(
+        self,
+        states: list[DiffusionRequestState],
+        *,
+        cached_batch: InputBatch | None = None,
+    ) -> InputBatch:
+        """Build the model batch for one scheduler tick."""
+        ...
+
+    def build_step_attention_metadata(
+        self,
+        input_batch: InputBatch,
+    ) -> object | None:
+        """Build optional attention metadata for the step batch."""
+        ...
+
+    def denoise_step(self, input_batch: InputBatch, **kwargs: Any) -> torch.Tensor | None:
+        """Run one denoise forward on a runner-assembled batch."""
+        ...
+
+    def step_scheduler(
+        self,
+        state: DiffusionRequestState,
+        noise_pred: torch.Tensor,
+        **kwargs: Any,
+    ) -> DiffusionRequestState:
+        """Apply one scheduler step to request-local state."""
+        ...
+
+
+@runtime_checkable
 class SupportsStepExecution(Protocol):
     """State-driven step-level execution protocol for diffusion pipelines.
 
@@ -62,7 +131,12 @@ class SupportsStepExecution(Protocol):
         """Run one denoise forward on the runner-assembled batch."""
         ...
 
-    def step_scheduler(self, state: DiffusionRequestState, noise_pred: torch.Tensor, **kwargs: Any) -> None:
+    def step_scheduler(
+        self,
+        state: DiffusionRequestState,
+        noise_pred: torch.Tensor,
+        **kwargs: Any,
+    ) -> DiffusionRequestState:
         """Run one scheduler step."""
         ...
 

@@ -25,11 +25,13 @@ from vllm_omni.diffusion.distributed.utils import get_local_device
 from vllm_omni.diffusion.forward_context import set_forward_context_denoise_step_idx
 from vllm_omni.diffusion.model_loader.diffusers_loader import DiffusersPipelineLoader
 from vllm_omni.diffusion.models.interface import SupportImageInput, SupportsComponentDiscovery
+from vllm_omni.diffusion.models.step_mixin import DiffusionV2CFGStepMixin
 from vllm_omni.diffusion.profiler.diffusion_pipeline_profiler import (
     DiffusionPipelineProfilerMixin,
 )
 from vllm_omni.diffusion.request import OmniDiffusionRequest
 from vllm_omni.diffusion.worker.request_batch import DiffusionRequestBatch
+from vllm_omni.diffusion.worker.utils import DiffusionRequestState
 from vllm_omni.inputs.data import OmniTextPrompt
 from vllm_omni.model_executor.models.hunyuan_image3.siglip2 import Siglip2VisionTransformer
 
@@ -54,7 +56,6 @@ from .system_prompt import get_system_prompt
 
 if TYPE_CHECKING:
     from vllm_omni.diffusion.worker.input_batch import InputBatch
-    from vllm_omni.diffusion.worker.utils import DiffusionRequestState
 
 logger = logging.getLogger(__name__)
 
@@ -67,6 +68,8 @@ _STEP_GENERATOR = "hunyuan_generator"
 _STEP_GUIDANCE_SCALE = "hunyuan_guidance_scale"
 _STEP_CFG_FACTOR = "hunyuan_cfg_factor"
 _STEP_OUTPUT_SIZE = "hunyuan_output_size"
+_STEP_OUTPUT_TYPE = "hunyuan_output_type"
+_STEP_NUM_INFERENCE_STEPS = "hunyuan_num_inference_steps"
 _STEP_COT_TEXT_LIST = "hunyuan_cot_text_list"
 _STEP_AR_KV = "hunyuan_ar_kv"
 _STEP_PROMPT_KV = "hunyuan_prompt_kv"
@@ -336,6 +339,7 @@ def get_hunyuan_image_3_pre_process_func(od_config: OmniDiffusionConfig):
 class HunyuanImage3Pipeline(
     HunyuanImage3PreTrainedModel,
     GenerationMixin,
+    DiffusionV2CFGStepMixin,
     SupportImageInput,
     SupportsComponentDiscovery,
     DiffusionPipelineProfilerMixin,
@@ -486,6 +490,10 @@ class HunyuanImage3Pipeline(
             self._pipeline = HunyuanImage3Text2ImagePipeline(model=self, scheduler=self.scheduler, vae=self.vae)
         return self._pipeline
 
+    @property
+    def interrupt(self) -> bool:
+        return getattr(self, "_interrupt", False)
+
     def _validate_step_request(self, state: "DiffusionRequestState") -> None:
         prompt = state.prompt
         sampling = state.sampling
@@ -591,7 +599,7 @@ class HunyuanImage3Pipeline(
             [state.prompt] if state.prompt is not None else [],
             getattr(sampling, "extra_args", {}) or {},
             request_id=state.request_id,
-            allow_cond_image=False,
+            allow_cond_image=True,
         )
 
     def _snapshot_injected_ar_kv(self) -> list[list[tuple[torch.Tensor, torch.Tensor]] | None] | None:
@@ -1151,7 +1159,7 @@ class HunyuanImage3Pipeline(
         return cond_vae_images, cond_t, batch_cond_vit_images
 
     @staticmethod
-    def check_inputs(prompt=None, message_list=None):
+    def _check_prompt_inputs(prompt=None, message_list=None):
         if prompt is None and message_list is None:
             raise ValueError("Either `prompt` or `message_list` should be provided.")
         if prompt is not None and message_list is not None:
@@ -1208,7 +1216,7 @@ class HunyuanImage3Pipeline(
         **kwargs,
     ):
         # 1. Sanity check
-        self.check_inputs(prompt, message_list)
+        self._check_prompt_inputs(prompt, message_list)
         device = default(device, self.device)
 
         # 2. Format inputs
@@ -1563,46 +1571,6 @@ class HunyuanImage3Pipeline(
 
         return updated_model_kwargs
 
-    def _generate(
-        self,
-        generator: list[torch.Generator] | None = None,
-        **kwargs,
-    ):
-        mode = kwargs.get("mode", "gen_text")
-        # verbose > 1 not support
-        if mode == "gen_text":
-            raise NotImplementedError("Not support gen text for hunyuan image")
-
-        elif mode == "gen_image":
-            batch_gen_image_info: list[ImageInfo] = kwargs.get("batch_gen_image_info")
-            if batch_gen_image_info is None:
-                raise ValueError("`batch_gen_image_info` should be provided when `mode` is `gen_image`.")
-
-            image_info: ImageInfo = batch_gen_image_info[0]
-            num_image_tokens = (
-                image_info.image_token_length
-                + (1 if image_info.add_timestep_token else 0)
-                + (1 if image_info.add_guidance_token else 0)
-            )
-            kwargs["num_image_tokens"] = num_image_tokens
-            # 50 and 5.0 hard code
-            results = self.pipeline(
-                batch_size=len(batch_gen_image_info),
-                image_size=[
-                    batch_gen_image_info[0].image_height,
-                    batch_gen_image_info[0].image_width,
-                ],
-                num_inference_steps=kwargs.get("num_inference_steps", 50),
-                guidance_scale=kwargs.get("guidance_scale", 5.0),
-                generator=generator,
-                model_kwargs=kwargs,
-            )
-            samples = results[0]
-            return samples
-
-        else:
-            raise ValueError(f"Unknown mode {mode}, only `gen_text` and `gen_image` are supported.")
-
     @staticmethod
     def _check_inputs(cond, target, check_list):
         if cond:
@@ -1800,27 +1768,6 @@ class HunyuanImage3Pipeline(
             k, v = kv["key"], kv["value"]
             cache_mgr._injected_ar_kv = [(k[:positive_reuse_len], v[:positive_reuse_len])]
 
-    def _extract_ar_kv_from_request(self, req) -> dict[str, Any]:
-        kv = getattr(getattr(req, "sampling_params", None), "past_key_values", None)
-        if kv is None:
-            return {}
-        key_cache = getattr(kv, "key_cache", None)
-        value_cache = getattr(kv, "value_cache", None)
-        if not key_cache or not value_cache:
-            return {}
-        ar_kv_data = {
-            i: {"key": k, "value": v}
-            for i, (k, v) in enumerate(zip(key_cache, value_cache))
-            if k is not None and v is not None
-        }
-        if not ar_kv_data:
-            return {}
-        logger.info(
-            f"[AR KV Reuse] Extracted {len(ar_kv_data)} layers of AR KV, "
-            f"each with length: {next(iter(ar_kv_data.values()))['key'].shape}"
-        )
-        return {"ar_kv_data": ar_kv_data}
-
     def _extract_ar_kv_from_sampling(self, sampling: Any) -> dict[str, Any]:
         kv = getattr(sampling, "past_key_values", None)
         if kv is None:
@@ -1836,12 +1783,12 @@ class HunyuanImage3Pipeline(
         }
         return {"ar_kv_data": ar_kv_data} if ar_kv_data else {}
 
-    def prepare_encode(
-        self,
-        state: "DiffusionRequestState",
-        **kwargs: Any,
-    ) -> "DiffusionRequestState":
-        del kwargs
+    def check_inputs(self, state: DiffusionRequestState) -> DiffusionRequestState:
+        self._validate_step_request(state)
+        self._extract_step_prompt_inputs(state)
+        return state
+
+    def encode(self, state: DiffusionRequestState) -> DiffusionRequestState:
         self._validate_step_request(state)
         pipe = self.pipeline
         sampling = state.sampling
@@ -1894,6 +1841,31 @@ class HunyuanImage3Pipeline(
             + (1 if image_info.add_guidance_token else 0)
         )
         model_kwargs["num_image_tokens"] = num_image_tokens
+
+        state.extra.update(
+            {
+                _STEP_MODEL_KWARGS: model_kwargs,
+                _STEP_INPUT_IDS: input_ids,
+                _STEP_GENERATOR: model_kwargs["generator"],
+                _STEP_GUIDANCE_SCALE: guidance_scale,
+                _STEP_CFG_FACTOR: 1 + int(guidance_scale > 1.0),
+                _STEP_OUTPUT_SIZE: (target_height, target_width),
+                _STEP_OUTPUT_TYPE: sampling.output_type or "pil",
+                _STEP_NUM_INFERENCE_STEPS: num_inference_steps,
+                _STEP_COT_TEXT_LIST: cot_text_list,
+            }
+        )
+        return state
+
+    def prepare(self, state: DiffusionRequestState) -> DiffusionRequestState:
+        pipe = self.pipeline
+        model_kwargs = state.extra[_STEP_MODEL_KWARGS]
+        input_ids = state.extra[_STEP_INPUT_IDS]
+        target_height, target_width = state.extra[_STEP_OUTPUT_SIZE]
+        num_inference_steps = state.extra[_STEP_NUM_INFERENCE_STEPS]
+        guidance_scale = state.extra[_STEP_GUIDANCE_SCALE]
+        output_type = state.extra[_STEP_OUTPUT_TYPE]
+        cot_text_list = state.extra[_STEP_COT_TEXT_LIST]
 
         timesteps, _ = retrieve_timesteps(
             self.scheduler,
@@ -1950,10 +1922,20 @@ class HunyuanImage3Pipeline(
             _STEP_GUIDANCE_SCALE: guidance_scale,
             _STEP_CFG_FACTOR: 1 + int(guidance_scale > 1.0),
             _STEP_OUTPUT_SIZE: (target_height, target_width),
+            _STEP_OUTPUT_TYPE: output_type,
             _STEP_COT_TEXT_LIST: cot_text_list,
             _STEP_AR_KV: self._snapshot_injected_ar_kv(),
         }
         return state
+
+    def prepare_encode(
+        self,
+        state: "DiffusionRequestState",
+        **kwargs: Any,
+    ) -> DiffusionRequestState:
+        """Compatibility entry point for the current step runner."""
+        del kwargs
+        return self.prepare(self.encode(self.check_inputs(self.init_state(state))))
 
     def _step_group_key(self, state: "DiffusionRequestState") -> tuple[Any, ...]:
         if _STEP_CFG_FACTOR not in state.extra:
@@ -2182,10 +2164,10 @@ class HunyuanImage3Pipeline(
         state: "DiffusionRequestState",
         noise_pred: torch.Tensor,
         **kwargs: Any,
-    ) -> None:
+    ) -> "DiffusionRequestState":
         del kwargs
         if getattr(self, "interrupt", False):
-            return
+            return state
         generator = state.extra.get(_STEP_GENERATOR)
         step_kwargs = self.pipeline.prepare_extra_func_kwargs(state.scheduler.step, {"generator": generator})
         latent_dtype = state.latents.dtype
@@ -2197,20 +2179,18 @@ class HunyuanImage3Pipeline(
             return_dict=False,
         )[0].to(dtype=latent_dtype)
         state.step_index += 1
+        return state
 
-    def post_decode(
-        self,
-        state: "DiffusionRequestState",
-        **kwargs: Any,
-    ) -> DiffusionOutput:
-        output_type = kwargs.get("output_type", "pil")
+    def decode(self, state: "DiffusionRequestState") -> "DiffusionRequestState":
+        output_type = state.extra[_STEP_OUTPUT_TYPE]
         generator = state.extra.get(_STEP_GENERATOR)
         latents = state.latents
         if output_type == "latent":
-            return DiffusionOutput(
+            state.extra["decoded_output"] = DiffusionOutput(
                 output=latents,
                 stage_durations=getattr(self, "stage_durations", None),
             )
+            return state
 
         if hasattr(self.vae.config, "scaling_factor") and self.vae.config.scaling_factor:
             latents = latents / self.vae.config.scaling_factor
@@ -2234,83 +2214,42 @@ class HunyuanImage3Pipeline(
         metadata = {}
         if any(text is not None for text in cot_text_list):
             metadata["text"] = {"ar_generated_text": cot_text_list[0]}
-        return DiffusionOutput(
+        state.extra["decoded_output"] = DiffusionOutput(
             output={
                 "payload": {"image": image[0]},
                 "metadata": metadata,
             },
             stage_durations=getattr(self, "stage_durations", None),
         )
+        return state
 
-    def forward(
+    def postprocess(self, state: "DiffusionRequestState") -> DiffusionOutput:
+        return state.extra["decoded_output"]
+
+    def post_decode(
         self,
-        req: DiffusionRequestBatch,
-        prompt: str | list[str] = "",
-        image_size="auto",
-        height: int = 1024,
-        width: int = 1024,
-        num_inference_steps: int = 50,
-        guidance_scale: float = 5.0,
-        generator: torch.Generator | list[torch.Generator] | None = None,
-        **kwargs,
+        state: "DiffusionRequestState",
+        **kwargs: Any,
     ) -> DiffusionOutput:
-        extra_args = getattr(getattr(req, "sampling_params", None), "extra_args", {}) or {}
-        (
-            prompt_from_req,
-            cot_text_list,
-            system_prompt,
-            batch_cond_image_info,
-            tokenizer_bot_task,
-        ) = self._extract_prompt_inputs(
-            req.prompts,
-            extra_args,
+        """Compatibility entry point for the current step runner."""
+        if kwargs.get("output_type") is not None:
+            state.extra[_STEP_OUTPUT_TYPE] = kwargs["output_type"]
+        return self.postprocess(self.decode(state))
+
+    def forward(self, req: DiffusionRequestBatch) -> DiffusionOutput:
+        if len(req.prompts) > 1:
+            logger.warning(
+                "This model only supports a single prompt, not a batched request. Taking only the first prompt for now."
+            )
+        state = DiffusionRequestState(
             request_id=req.request_id,
-            allow_cond_image=True,
+            sampling=req.sampling_params,
+            prompt=req.prompts[0],
         )
-        prompt = prompt_from_req or prompt
-        cot_text = (
-            [self._normalize_cot_text(t) for t in cot_text_list] if any(t is not None for t in cot_text_list) else None
-        )
-
-        generator = req.sampling_params.generator or generator
-        height = req.sampling_params.height or height
-        width = req.sampling_params.width or width
-        num_inference_steps = req.sampling_params.num_inference_steps or num_inference_steps
-        if req.sampling_params.guidance_scale_provided:
-            guidance_scale = req.sampling_params.guidance_scale
-        if guidance_scale <= 1.0:
-            logger.info("HunyuanImage3.0 runs without classifier-free guidance when guidance_scale <= 1.0.")
-        image_size = (height, width)
-
-        # ---- AR KV Reuse: extract injected KV from request ----
-        ar_kv_kwargs = self._extract_ar_kv_from_request(req)
-
-        model_inputs = self.prepare_model_inputs(
-            prompt=prompt,
-            cot_text=cot_text,
-            system_prompt=system_prompt,
-            mode="gen_image",
-            generator=generator,
-            image_size=image_size,
-            num_inference_steps=num_inference_steps,
-            guidance_scale=guidance_scale,
-            batch_cond_image_info=batch_cond_image_info,
-            bot_task=tokenizer_bot_task,
-            **ar_kv_kwargs,
-        )
-
-        model_inputs.update(ar_kv_kwargs)
-
-        outputs = self._generate(**model_inputs, **kwargs)
-        image = outputs[0]
-        metadata = {}
-        if any(t is not None for t in cot_text_list):
-            metadata["text"] = {"ar_generated_text": cot_text_list[0] if len(cot_text_list) == 1 else cot_text_list}
-        stage_durations = self.stage_durations if hasattr(self, "stage_durations") else None
-        return DiffusionOutput(
-            output={
-                "payload": {"image": image},
-                "metadata": metadata,
-            },
-            stage_durations=stage_durations,
-        )
+        state = self.init_state(state)
+        state = self.check_inputs(state)
+        state = self.encode(state)
+        state = self.prepare(state)
+        state = self.diffuse(state)
+        state = self.decode(state)
+        return self.postprocess(state)
