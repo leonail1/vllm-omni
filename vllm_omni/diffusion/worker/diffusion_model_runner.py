@@ -663,7 +663,8 @@ class DiffusionModelRunner(OmniConnectorModelRunnerMixin):
         use_distributed_offload = getattr(self.od_config, "enable_distributed_layerwise_offload", False)
         grad_context = torch.no_grad() if (use_hsdp or use_distributed_offload) else torch.inference_mode()
         request_context = getattr(self.offload_backend, "request_context", None)
-        offload_context = request_context() if callable(request_context) else nullcontext()
+        request_ids = [req.request_id for req in reqs]
+        offload_context = request_context(request_ids=request_ids) if callable(request_context) else nullcontext()
         with grad_context, offload_context:
             for req in reqs:
                 self._prepare_request_for_forward(

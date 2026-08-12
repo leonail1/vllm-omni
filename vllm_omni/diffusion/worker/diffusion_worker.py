@@ -52,6 +52,10 @@ from vllm_omni.diffusion.distributed.parallel_state import (
 from vllm_omni.diffusion.forward_context import set_forward_context
 from vllm_omni.diffusion.ipc import DIFFUSION_RPC_RESULT_ENVELOPE, pack_diffusion_output_shm
 from vllm_omni.diffusion.lora.manager import DiffusionLoRAManager, LoRABackend
+from vllm_omni.diffusion.offloader.chunked_transport import (
+    DLO_POISON_ERROR_MARKER,
+    process_group_poison_reason,
+)
 from vllm_omni.diffusion.registry import get_diffusion_ir_op_priority_func
 from vllm_omni.diffusion.request import OmniDiffusionRequest
 from vllm_omni.diffusion.sched.interface import (
@@ -1267,6 +1271,15 @@ class WorkerProc:
         """Main busy loop for Multiprocessing Workers."""
         logger.info(f"Worker {self.gpu_id} ready to receive requests via shared memory")
 
+        def _rpc_error_text(exc: Exception) -> str:
+            # Design section 27.2: a poisoned FS process group must fail
+            # closed.  Embed the marker so the executor converts this error
+            # into a fatal engine failure instead of a per-request 500.
+            poison = process_group_poison_reason()
+            if poison is not None:
+                return f"{DLO_POISON_ERROR_MARKER}: {exc} (poison: {poison})"
+            return str(exc)
+
         while self._running:
             msg = None
             try:
@@ -1303,7 +1316,6 @@ class WorkerProc:
                         self._return_result(result, rpc_id=rpc_id)
                 except Exception as e:
                     logger.error(f"Error processing RPC: {e}", exc_info=True)
-                    error = str(e)
                     _cleanup_after_execution_error(e)
                     # Apply the same reply gate as the success path so
                     # non-output ranks don't enqueue stale error replies
@@ -1319,7 +1331,7 @@ class WorkerProc:
                                 AsyncDiffusionOutput(
                                     kind=AsyncOutputKind.RPC_RESULT,
                                     rpc_id=rpc_id,
-                                    error=error,
+                                    error=_rpc_error_text(e),
                                 )
                             )
                         elif output_rank is None and exec_all_ranks:
@@ -1347,11 +1359,16 @@ class WorkerProc:
                                 except Exception:
                                     dp_rank = self.gpu_id
                                 self._return_result(
-                                    {"status": "error", "error": error, "dp_rank": dp_rank, "wave_id": wave_id}
+                                    {
+                                        "status": "error",
+                                        "error": _rpc_error_text(e),
+                                        "dp_rank": dp_rank,
+                                        "wave_id": wave_id,
+                                    }
                                 )
                         elif output_rank is None or output_rank == self.gpu_id:
                             # Normal RPC: only the expected rank replies
-                            self._return_result({"status": "error", "error": error, "wave_id": wave_id})
+                            self._return_result({"status": "error", "error": _rpc_error_text(e), "wave_id": wave_id})
 
             elif isinstance(msg, dict) and msg.get("type") == "shutdown":
                 logger.info("Worker %s: Received shutdown message", self.gpu_id)

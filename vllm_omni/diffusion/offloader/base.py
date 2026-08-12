@@ -60,6 +60,14 @@ class OffloadConfig:
     dlo_pin_failure_policy: str = "fail"  # "fail" | "whole_block_fallback"
     dlo_transport_backend: str = "auto"
     dlo_transport_source_layout: str = "fs_sharded_host"
+    # Stage-3 compute-aware attention/MoE part pipeline.  Requires every
+    # streamed block class to declare ``_block_weight_use_plan``; models
+    # without a plan fall back to whole-block transport (Stage 1/2 path).
+    dlo_part_pipeline: bool = False
+    # Cache acceleration backend ("none" | "cache_dit" | ...).  With the
+    # part pipeline, only cache_dit is allowed: its dynamic block skip is
+    # guarded by the section-24 policy-2 schedule digest sync.
+    cache_backend: str = "none"
     # Resolved FS group (set by _init_weight_shard_group, not user-configurable)
     weight_shard_size: int = 1
     weight_shard_rank: int = 0
@@ -208,6 +216,23 @@ class OffloadConfig:
                 f"dlo_transport_source_layout must be one of {choices}, got {dlo_transport_source_layout!r}"
             ) from exc
 
+        dlo_part_pipeline = bool(getattr(od_config, "dlo_part_pipeline", False))
+        cache_backend = getattr(od_config, "cache_backend", "none") or "none"
+        if dlo_part_pipeline and cache_backend not in ("none", "cache_dit"):
+            # Design section 24: cache-dit's dynamic block skip is guarded by
+            # the policy-2 schedule digest sync; every other cache backend
+            # follows policy 1 — dynamic block skip is disabled while the
+            # part pipeline is active, because a skipped module never
+            # triggers the hooks that drive its part prefetch/retire.
+            raise ValueError(
+                "dlo_part_pipeline is incompatible with cache acceleration "
+                f"(cache_backend={cache_backend!r}): only cache_dit is supported "
+                "with the Stage-3 part pipeline (design section 24, policy 2 "
+                "schedule digest sync); other cache backends keep policy 1 and "
+                "disable dynamic block skip. Disable the cache backend or the "
+                "part pipeline."
+            )
+
         return cls(
             strategy=strategy,
             pin_cpu_memory=pin_cpu_memory,
@@ -220,6 +245,8 @@ class OffloadConfig:
             dlo_pin_failure_policy=dlo_pin_failure_policy,
             dlo_transport_backend=dlo_transport_backend,
             dlo_transport_source_layout=dlo_transport_source_layout,
+            dlo_part_pipeline=dlo_part_pipeline,
+            cache_backend=cache_backend,
             weight_shard_size=weight_shard_size,
         )
 

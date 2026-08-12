@@ -1272,6 +1272,13 @@ class DiffusionEngine:
     def abort(self, request_id: str | Iterable[str]) -> None:
         request_ids = [request_id] if isinstance(request_id, str) else list(request_id)
 
+        # Design section 27.3: let DLO workers interrupt the in-flight forward
+        # at the next uniform boundary instead of running it to completion.
+        from vllm_omni.diffusion.offloader.cancellation import write_abort_flag
+
+        for req_id in request_ids:
+            write_abort_flag(req_id)
+
         with self._cv:
             if self._closed:
                 return

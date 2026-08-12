@@ -9,6 +9,8 @@ offload backends.
 
 from __future__ import annotations
 
+from typing import Any
+
 import torch
 from torch.distributed.tensor import DTensor
 
@@ -31,12 +33,26 @@ def set_tensor_storage(target: torch.Tensor, value: torch.Tensor) -> None:
         target.data = value
 
 
+# Placeholders are immutable zero-element/meta tensors; caching them keeps the
+# retire path free of repeated allocation calls (design section 26.3: no
+# Tensor allocation on the hot path).
+_PLACEHOLDER_CACHE: dict[tuple[Any, ...], torch.Tensor] = {}
+
+
 def make_offload_placeholder(tensor: torch.Tensor) -> torch.Tensor:
-    """Create a zero-element placeholder to free GPU memory."""
+    """Return a zero-element placeholder to free GPU memory (cached)."""
     if is_dtensor(tensor):
-        local_shape = tuple(tensor.to_local().shape)
-        return torch.empty(local_shape, device="meta", dtype=tensor.dtype)
-    return torch.empty((0,), device=tensor.device, dtype=tensor.dtype)
+        key: tuple[Any, ...] = ("meta", tensor.dtype, tuple(tensor.to_local().shape))
+    else:
+        key = (str(tensor.device), tensor.dtype)
+    placeholder = _PLACEHOLDER_CACHE.get(key)
+    if placeholder is None:
+        if is_dtensor(tensor):
+            placeholder = torch.empty(key[2], device="meta", dtype=tensor.dtype)
+        else:
+            placeholder = torch.empty((0,), device=tensor.device, dtype=tensor.dtype)
+        _PLACEHOLDER_CACHE[key] = placeholder
+    return placeholder
 
 
 def is_materialized_tensor(t: torch.Tensor) -> bool:

@@ -6,6 +6,7 @@ import multiprocessing as mp
 import multiprocessing.connection
 import os
 import queue
+import tempfile
 import threading
 import time
 import weakref
@@ -213,6 +214,29 @@ class MultiprocDiffusionExecutor(DiffusionExecutor):
                 "please check the stack trace above for the root cause"
             )
 
+    def _fail_closed_on_poisoned_group(self, detail: str) -> None:
+        """Shut down the worker group after a poisoned FS process group.
+
+        Design section 27.2: a mid-collective failure leaves the group
+        untrustworthy, so the executor fail-closes exactly like a DP wave
+        timeout — later RPCs raise EngineDeadError and the engine's fatal
+        chain stops new requests from reaching this replica.
+        """
+        logger.error("DLO process group poisoned; shutting down the worker group: %s", detail[:500])
+        self._is_failed = True
+        self.shutdown()
+        for callback in self._failure_callbacks:
+            try:
+                callback()
+            except Exception:
+                logger.exception("failure_callback raised")
+
+    def _maybe_fail_closed_on_error_text(self, error_text: Any) -> None:
+        from vllm_omni.diffusion.offloader.chunked_transport import is_dlo_poison_error
+
+        if is_dlo_poison_error(error_text):
+            self._fail_closed_on_poisoned_group(str(error_text))
+
     @staticmethod
     def _unwrap_rpc_result_envelope(response: Any) -> Any:
         if not (isinstance(response, dict) and response.get("type") == DIFFUSION_RPC_RESULT_ENVELOPE):
@@ -306,6 +330,17 @@ class MultiprocDiffusionExecutor(DiffusionExecutor):
         # Extract worker_extension_cls and custom_pipeline_args from od_config
         worker_extension_cls = od_config.worker_extension_cls
         custom_pipeline_args = getattr(od_config, "custom_pipeline_args", None)
+
+        # Design section 27.3: per-engine directory of client-abort flag
+        # files.  Set before spawning workers so spawn children inherit it;
+        # the engine proc writes flags, DLO hooks in the workers read them.
+        if getattr(od_config, "enable_distributed_layerwise_offload", False):
+            from vllm_omni.diffusion.offloader.cancellation import DLO_ABORT_DIR_ENV
+
+            abort_dir = os.path.join(tempfile.gettempdir(), f"vllm_omni_dlo_abort_{os.getpid()}")
+            os.makedirs(abort_dir, exist_ok=True)
+            os.environ[DLO_ABORT_DIR_ENV] = abort_dir
+            self._dlo_abort_dir = abort_dir
 
         # Launch all worker processes
         scheduler_pipe_readers = []
@@ -530,6 +565,7 @@ class MultiprocDiffusionExecutor(DiffusionExecutor):
             except Exception as exc:
                 if isinstance(exc, TimeoutError):
                     self._fail_closed_on_dp_wave_timeout(exc)
+                self._maybe_fail_closed_on_error_text(str(exc))
                 for new_req in new_reqs:
                     runner_outputs.append(
                         RunnerOutput(
@@ -575,6 +611,7 @@ class MultiprocDiffusionExecutor(DiffusionExecutor):
                 else:
                     raise RuntimeError(f"Unexpected response type: {type(result)!r}")
             except Exception as exc:
+                self._maybe_fail_closed_on_error_text(str(exc))
                 runner_outputs.append(
                     RunnerOutput(
                         request_id=new_req.request_id,
@@ -789,6 +826,7 @@ class MultiprocDiffusionExecutor(DiffusionExecutor):
                         else:
                             tagged.append((len(tagged), response))
                 if collected_errors:
+                    self._maybe_fail_closed_on_error_text(collected_errors[0])
                     raise RuntimeError(f"Worker error: {collected_errors[0]}")
                 tagged.sort(key=lambda x: x[0])
                 responses = [r for _, r in tagged]
@@ -881,12 +919,15 @@ class MultiprocDiffusionExecutor(DiffusionExecutor):
                         unpack_diffusion_output_shm(msg.output)
                     except Exception:
                         logger.exception("SHM unpack failed for batch %s", batch_id)
+                    if msg.error:
+                        self._maybe_fail_closed_on_error_text(msg.error)
                     self._deliver_batch_split(per_req_map, msg.output, msg.error)
                 else:
                     # Single-request result: unpack SHM first, then resolve or cache atomically.
                     output_result: DiffusionOutput | None = None
                     exc: Exception | None = None
                     if msg.error:
+                        self._maybe_fail_closed_on_error_text(msg.error)
                         exc = RuntimeError(msg.error)
                     else:
                         try:
@@ -979,6 +1020,15 @@ class MultiprocDiffusionExecutor(DiffusionExecutor):
     def shutdown(self) -> None:
         self._closed = True
         self._pump_stop.set()
+        abort_dir = getattr(self, "_dlo_abort_dir", None)
+        if abort_dir:
+            self._dlo_abort_dir = None
+            try:
+                import shutil
+
+                shutil.rmtree(abort_dir, ignore_errors=True)
+            except Exception:
+                logger.debug("Failed to remove DLO abort dir %s", abort_dir)
         try:
             self._finalizer()
         finally:

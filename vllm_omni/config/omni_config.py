@@ -701,6 +701,7 @@ class _DiffusionConfigProjection:
     dlo_pin_failure_policy: str = "fail"
     dlo_transport_backend: str = "auto"
     dlo_transport_source_layout: str = "fs_sharded_host"
+    dlo_part_pipeline: bool = False
     pin_cpu_memory: bool = True
     diffusion_compile_granularity: Literal["regional", "full"] = "regional"
     diffusion_compile_dynamic: bool = Field(default=True, strict=True)

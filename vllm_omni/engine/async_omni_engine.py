@@ -1051,6 +1051,7 @@ class AsyncOmniEngine:
             "dlo_pin_failure_policy": kwargs.get("dlo_pin_failure_policy", "fail"),
             "dlo_transport_backend": kwargs.get("dlo_transport_backend", "auto"),
             "dlo_transport_source_layout": kwargs.get("dlo_transport_source_layout", "fs_sharded_host"),
+            "dlo_part_pipeline": kwargs.get("dlo_part_pipeline", False),
             "enforce_eager": False if kwargs.get("enforce_eager") is None else kwargs.get("enforce_eager"),
             "diffusion_compile_granularity": (
                 "regional"

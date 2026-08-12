@@ -20,6 +20,7 @@ from vllm_omni.diffusion.cache.cachedit.config import (
     CacheDiTAdapterConfig,
     CacheDiTConfig,
 )
+from vllm_omni.diffusion.cache.cachedit.skip_sync import install_skip_decision_observer
 from vllm_omni.diffusion.data import DiffusionCacheConfig
 
 if TYPE_CHECKING:
@@ -274,6 +275,12 @@ class CacheDiTBackend(CacheBackend):
                 self._cache_targets.append(cache_target)
             if not self._refresh_funcs:
                 raise ValueError(f"Pipeline {pipeline_name} has no declared DiT modules for Cache-DiT")
+
+        # Design section 24, policy 2: observe every dynamic skip decision so
+        # a registered DLO part-pipeline coordinator can prove FS-group
+        # agreement before the first decision-dependent weight collective.
+        # A no-op when no coordinator is registered.
+        install_skip_decision_observer()
 
         self.enabled = True
         logger.info("Cache-dit enabled successfully on %s", pipeline_name)

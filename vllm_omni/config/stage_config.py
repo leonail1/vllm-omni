@@ -389,6 +389,7 @@ class StageDeployConfig:
     dlo_pin_failure_policy: str | None = None
     dlo_transport_backend: str | None = None
     dlo_transport_source_layout: str | None = None
+    dlo_part_pipeline: bool | None = None
     # Diffusion-specific debug and observability knobs.
     enable_diffusion_pipeline_profiler: bool | None = None
 

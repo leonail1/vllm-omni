@@ -12,6 +12,8 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
+import threading
 from collections import OrderedDict
 from collections.abc import Callable, Iterable, Sequence
 from dataclasses import dataclass, field
@@ -68,10 +70,39 @@ class PinFailurePolicy(str, Enum):
 
 
 class SlotPhase(str, Enum):
-    REUSABLE = "reusable"
-    SUBMITTED = "submitted"
+    """Output-slot lifecycle phases (design section 25).
+
+    Main path:
+
+        EMPTY -> PREFETCH_ENQUEUED -> READY -> BOUND -> IN_USE -> RETIRED -> REUSABLE
+
+    Failure paths:
+
+        pre-collective failure   -> CANCELLED              (section 27.1)
+        post-collective failure  -> POISONED_PROCESS_GROUP (section 27.2)
+    """
+
+    EMPTY = "empty"
+    PREFETCH_ENQUEUED = "prefetch_enqueued"
     READY = "ready"
+    BOUND = "bound"
     IN_USE = "in_use"
+    RETIRED = "retired"
+    REUSABLE = "reusable"
+    CANCELLED = "cancelled"
+    POISONED_PROCESS_GROUP = "poisoned_process_group"
+
+
+# Phases in which a slot is occupied by a live transfer: the ticket is
+# current and the slot cannot take a different collective key.
+_ACTIVE_SLOT_PHASES = frozenset(
+    {
+        SlotPhase.PREFETCH_ENQUEUED,
+        SlotPhase.READY,
+        SlotPhase.BOUND,
+        SlotPhase.IN_USE,
+    }
+)
 
 
 @dataclass(frozen=True)
@@ -87,6 +118,69 @@ class TensorMeta:
     # weights) round-trip through the flat transport buffer without changing
     # their physical layout.  None means a legacy contiguous manifest entry.
     stride: tuple[int, ...] | None = None
+
+
+# Stage-3 part-pipeline contracts (design sections 20-23).
+#
+# A model declares the compute-order weight use of each streamed block with a
+# ``BlockWeightUsePlan`` template on the block class
+# (``_block_weight_use_plan``).  The engine binds the runtime block id when it
+# builds per-part manifests; the template deliberately carries no block id
+# because the declaring model class cannot know it.
+#
+# The first version supports exactly two parts per block whose lifetimes do
+# not overlap: an attention part used between ``block_start`` and
+# ``mid_block``, and an MoE/FFN part used between ``mid_block`` and
+# ``block_end``.  A parameter read in both phases must be declared resident
+# (kept on device, outside the chunk transport) — it must NOT be packed into
+# both parts, which would double Host/HBM/collective bytes.
+PART_ID_ATTENTION = "attention"
+PART_ID_MOE = "moe"
+
+BOUNDARY_BLOCK_START = "block_start"
+BOUNDARY_MID_BLOCK = "mid_block"
+BOUNDARY_BLOCK_END = "block_end"
+
+
+@dataclass(frozen=True)
+class WeightPartSpec:
+    """One compute-phase weight partition of a streamed block.
+
+    Attributes:
+        part_id: Stable identifier used in manifests, tickets and collective
+            keys (e.g. ``attention`` / ``moe``).
+        module_paths: Block-relative module paths whose parameters/buffers
+            belong to this part (e.g. ``("input_layernorm", "cross_attention")``).
+        first_use_boundary: Forward boundary where the part is first read.
+        last_use_boundary: Forward boundary after which the part is never read
+            again in this block's forward.
+        allowed_dtypes: Dtypes this part may carry through the chunk
+            transport; anything else is rejected at planning time.
+    """
+
+    part_id: str
+    module_paths: tuple[str, ...]
+    first_use_boundary: str
+    last_use_boundary: str
+    allowed_dtypes: tuple[torch.dtype, ...] = ()
+
+
+@dataclass(frozen=True)
+class BlockWeightUsePlan:
+    """Model-declared compute-aware weight use plan for one block type.
+
+    Declared as ``_block_weight_use_plan`` on the block module class.  The
+    engine resolves it against each concrete block instance at planning time
+    and binds the runtime block id into the resulting part manifests.
+    """
+
+    parts: tuple[WeightPartSpec, ...]
+
+    def part(self, part_id: str) -> WeightPartSpec:
+        for spec in self.parts:
+            if spec.part_id == part_id:
+                return spec
+        raise KeyError(f"weight use plan has no part {part_id!r}")
 
 
 @dataclass(frozen=True)
@@ -187,6 +281,74 @@ PinnedAllocator = Callable[[int, torch.dtype], torch.Tensor]
 
 def is_chunk_transport_supported(tensor: torch.Tensor) -> bool:
     return tensor.ndim > 0 and (tensor.is_floating_point() or tensor.is_complex())
+
+
+# ---------------------------------------------------------------------- #
+#  Metrics gate                                                           #
+# ---------------------------------------------------------------------- #
+#
+# Transport activity counters exist only for the metrics RPC.  They are
+# maintained only when VLLM_OMNI_DLO_METRICS is set at process start; with
+# the default (off) the hot path pays one cached boolean branch per
+# transfer instead of counter updates nobody reads.
+
+_DLO_METRICS_ENV = "VLLM_OMNI_DLO_METRICS"
+_metrics_enabled: bool | None = None
+
+
+def metrics_enabled() -> bool:
+    """Whether transport activity counters are maintained (read once, cached)."""
+    global _metrics_enabled
+    if _metrics_enabled is None:
+        _metrics_enabled = os.environ.get(_DLO_METRICS_ENV, "").lower() in ("1", "true", "yes", "on")
+    return _metrics_enabled
+
+
+def _set_metrics_enabled_for_tests(value: bool | None) -> None:
+    """Override the metrics gate; None re-reads the environment on next use."""
+    global _metrics_enabled
+    _metrics_enabled = value
+
+
+# ---------------------------------------------------------------------- #
+#  Process-group poison registry (design section 27.2)                   #
+# ---------------------------------------------------------------------- #
+#
+# A mid-collective failure makes the whole FS process group untrustworthy.
+# The slot state machine blocks further operations locally; this registry
+# additionally exposes the poison to the hosting worker process so the RPC
+# layer can fail closed (fatal engine failure) instead of letting every
+# later request trip over the poisoned state one by one.
+
+_POISON_LOCK = threading.Lock()
+_POISON_REASON: str | None = None
+
+# Marker embedded in worker RPC error strings when the root cause is a
+# poisoned process group; the executor fail-closes on it.
+DLO_POISON_ERROR_MARKER = "DLO_PROCESS_GROUP_POISONED"
+
+
+def is_dlo_poison_error(error_text: Any) -> bool:
+    """Whether an RPC error string reports a poisoned FS process group."""
+    return isinstance(error_text, str) and DLO_POISON_ERROR_MARKER in error_text
+
+
+def record_process_group_poison(reason: str) -> None:
+    global _POISON_REASON
+    with _POISON_LOCK:
+        if _POISON_REASON is None:
+            _POISON_REASON = reason
+
+
+def process_group_poison_reason() -> str | None:
+    with _POISON_LOCK:
+        return _POISON_REASON
+
+
+def _clear_process_group_poison_for_tests() -> None:
+    global _POISON_REASON
+    with _POISON_LOCK:
+        _POISON_REASON = None
 
 
 def _full_chunk_numel(
@@ -507,6 +669,7 @@ class TransferTicket:
     chunk_count: int
     ready_event: Any | None = field(default=None, compare=False)
     last_collective_key: tuple[Any, ...] | None = None
+    backend_id: str | None = None
 
     @property
     def owner_key(self) -> tuple[int, int, int, str]:
@@ -517,27 +680,73 @@ class TransferTicket:
             self.part_id,
         )
 
+    @property
+    def validation_key(self) -> tuple[Any, ...]:
+        """The section-25 transition checklist captured at ``begin`` time.
+
+        Carries generation, block/part, backend, output slot and the expected
+        collective key (section 24); every later transition recomputes this
+        from the presented ticket and compares it against the slot's record.
+        """
+        return (
+            self.request_generation,
+            self.forward_generation,
+            self.block_id,
+            self.part_id,
+            self.output_slot,
+            self.backend_id,
+            self.last_collective_key,
+        )
+
 
 @dataclass
 class OutputSlotState:
-    phase: SlotPhase = SlotPhase.REUSABLE
+    phase: SlotPhase = SlotPhase.EMPTY
     ticket: TransferTicket | None = None
+    expected_key: tuple[Any, ...] | None = None
     last_use_event: Any | None = None
     fallback_reason: str | None = None
+    error: str | None = None
 
 
 class ChunkTransportState:
-    """Own generation and conflict checks for persistent output slots."""
+    """Own generation, key and conflict checks for persistent output slots.
+
+    Implements the design section 25 slot state machine:
+
+        EMPTY -> PREFETCH_ENQUEUED -> READY -> BOUND -> IN_USE -> RETIRED -> REUSABLE
+
+    with the two failure exits CANCELLED (pre-collective, section 27.1) and
+    POISONED_PROCESS_GROUP (post-collective, section 27.2).  Every transition
+    revalidates the section-25 checklist against the key recorded at
+    ``begin``: generation, block/part, backend, output slot, prior last-use
+    and the expected collective key.
+    """
 
     def __init__(self, block_id: int, slot_count: int = 2) -> None:
         self.block_id = block_id
         self._forward_generation = 0
         self._slots = [OutputSlotState() for _ in range(slot_count)]
         self._closed = False
+        self._poisoned: str | None = None
 
     @property
     def slots(self) -> tuple[OutputSlotState, ...]:
         return tuple(self._slots)
+
+    @property
+    def poisoned(self) -> str | None:
+        """Why the process group was poisoned, or None while operational."""
+        return self._poisoned
+
+    def _require_operational(self) -> None:
+        if self._closed:
+            raise RuntimeError("chunk transport state is closed")
+        if self._poisoned is not None:
+            raise RuntimeError(
+                f"process group is poisoned ({self._poisoned}); the affected "
+                "worker/process group must be rebuilt, not reused (design section 27.2)"
+            )
 
     def begin(
         self,
@@ -547,12 +756,25 @@ class ChunkTransportState:
         request_generation: int = 0,
         part_id: str = "block",
         ready_event: Any | None = None,
+        backend_id: str | None = None,
         last_collective_key: tuple[Any, ...] | None = None,
     ) -> TransferTicket:
-        if self._closed:
-            raise RuntimeError("chunk transport state is closed")
+        """Enqueue a new transfer into *output_slot*: -> PREFETCH_ENQUEUED.
+
+        A retired slot must first prove its consumer's last-use before being
+        reused.  Re-submitting the identical collective key onto a live slot
+        returns the existing ticket; a different key fails fast (section 25).
+        """
+        self._require_operational()
         slot = self._slots[output_slot]
-        if slot.phase is not SlotPhase.REUSABLE:
+
+        if slot.phase is SlotPhase.RETIRED:
+            # Prior last-use check (sections 4.5/25): record_last_use only
+            # lands here after a last-use (or overwrite) event was recorded,
+            # so the producer may safely reuse the slot.
+            slot.phase = SlotPhase.REUSABLE
+
+        if slot.phase in _ACTIVE_SLOT_PHASES:
             current = slot.ticket
             if (
                 current is not None
@@ -560,11 +782,14 @@ class ChunkTransportState:
                 and current.block_id == self.block_id
                 and current.part_id == part_id
                 and current.chunk_count == chunk_count
+                and current.backend_id == backend_id
                 and current.last_collective_key == last_collective_key
             ):
+                # Idempotent re-prefetch with the same collective key.
                 return current
             raise RuntimeError(
-                f"output slot {output_slot} is owned by {current.owner_key if current else slot.phase.value}"
+                f"output slot {output_slot} is owned by {current.owner_key if current else slot.phase.value}: "
+                "a different collective key cannot take a live slot (design section 25)"
             )
 
         self._forward_generation += 1
@@ -577,50 +802,148 @@ class ChunkTransportState:
             chunk_count=chunk_count,
             ready_event=ready_event,
             last_collective_key=last_collective_key,
+            backend_id=backend_id,
         )
-        slot.phase = SlotPhase.SUBMITTED
+        slot.phase = SlotPhase.PREFETCH_ENQUEUED
         slot.ticket = ticket
+        slot.expected_key = ticket.validation_key
+        slot.error = None
         return ticket
 
     def mark_ready(self, ticket: TransferTicket) -> None:
+        """Producer finished publishing: PREFETCH_ENQUEUED -> READY."""
         slot = self._require_current(ticket)
-        if slot.phase is not SlotPhase.SUBMITTED:
+        if slot.phase is not SlotPhase.PREFETCH_ENQUEUED:
             raise RuntimeError(f"cannot mark {slot.phase.value} slot ready")
         slot.phase = SlotPhase.READY
 
-    def mark_in_use(self, ticket: TransferTicket) -> None:
+    def mark_bound(self, ticket: TransferTicket) -> None:
+        """Consumer Parameters were re-pointed at the slot: READY -> BOUND.
+
+        Idempotent while the slot stays BOUND: re-pointing the same
+        Parameters at the same storage is a no-op.
+        """
         slot = self._require_current(ticket)
-        if slot.phase not in (SlotPhase.READY, SlotPhase.IN_USE):
+        if slot.phase is SlotPhase.BOUND:
+            return
+        if slot.phase is not SlotPhase.READY:
+            raise RuntimeError(f"cannot bind {slot.phase.value} slot")
+        slot.phase = SlotPhase.BOUND
+
+    def mark_in_use(self, ticket: TransferTicket) -> None:
+        """Compute is about to read the slot: BOUND -> IN_USE.
+
+        A bind must have happened first: attaching a consumer straight from
+        READY would read storage the Parameters do not point at yet.
+        Re-attaching an IN_USE slot is allowed (same consumer contract).
+        """
+        slot = self._require_current(ticket)
+        if slot.phase not in (SlotPhase.BOUND, SlotPhase.IN_USE):
             raise RuntimeError(f"cannot attach consumer to {slot.phase.value} slot")
         slot.phase = SlotPhase.IN_USE
 
-    def release(self, ticket: TransferTicket, last_use_event: Any | None) -> None:
+    def record_last_use(self, ticket: TransferTicket, last_use_event: Any | None) -> None:
+        """Consumer's last read is captured: READY/BOUND/IN_USE -> RETIRED.
+
+        A ticket that reached IN_USE was really consumed and must carry a real
+        last-use event (consumer-last-use, section 4.5).  A READY/BOUND ticket
+        that was never consumed (e.g. a tail prefetch retired at
+        producer-ready, or a contaminated slot overwritten before use) may
+        retire with the overwrite/ready event or None.
+        """
         slot = self._require_current(ticket)
-        if slot.phase not in (SlotPhase.READY, SlotPhase.IN_USE):
-            raise RuntimeError(f"cannot release {slot.phase.value} slot")
+        if slot.phase not in (SlotPhase.READY, SlotPhase.BOUND, SlotPhase.IN_USE):
+            raise RuntimeError(f"cannot retire {slot.phase.value} slot")
+        if slot.phase is SlotPhase.IN_USE and last_use_event is None:
+            raise RuntimeError(
+                f"cannot retire in_use slot {ticket.output_slot} without a last-use event: "
+                "the next producer could overwrite weights still being read (design section 4.5)"
+            )
         slot.last_use_event = last_use_event
-        slot.ticket = None
+        slot.phase = SlotPhase.RETIRED
+
+    def confirm_reusable(self, ticket: TransferTicket) -> None:
+        """Retirement is complete and the slot may be reused: RETIRED -> REUSABLE."""
+        slot = self._require_current(ticket)
+        if slot.phase is not SlotPhase.RETIRED:
+            raise RuntimeError(f"cannot confirm reusable on {slot.phase.value} slot")
         slot.phase = SlotPhase.REUSABLE
 
+    def cancel(self, ticket: TransferTicket, reason: str) -> None:
+        """Abort before the first collective was submitted: PREFETCH_ENQUEUED -> CANCELLED.
+
+        Only failures listed in design section 27.1 may take this exit; once
+        any collective was submitted the process group can no longer be
+        trusted and ``poison`` must be used instead.
+        """
+        slot = self._require_current(ticket)
+        if slot.phase is not SlotPhase.PREFETCH_ENQUEUED:
+            raise RuntimeError(
+                f"cannot cancel {slot.phase.value} slot: collectives may already be submitted; "
+                "use poison() instead (design section 27.2)"
+            )
+        slot.error = reason
+        slot.phase = SlotPhase.CANCELLED
+
+    def poison(self, reason: str) -> None:
+        """A collective failed mid-flight: -> POISONED_PROCESS_GROUP.
+
+        Marks every live slot poisoned and blocks all further state
+        operations; the process group must be rebuilt (design section 27.2).
+        The poison is also recorded process-wide so the worker can convert
+        the next RPC failure into a fatal engine failure (fail-closed).
+        """
+        self._poisoned = reason
+        record_process_group_poison(reason)
+        for slot in self._slots:
+            if slot.phase in _ACTIVE_SLOT_PHASES:
+                slot.error = reason
+                slot.phase = SlotPhase.POISONED_PROCESS_GROUP
+
     def is_current(self, ticket: TransferTicket) -> bool:
-        return self._slots[ticket.output_slot].ticket == ticket
+        slot = self._slots[ticket.output_slot]
+        return slot.ticket == ticket and slot.phase in _ACTIVE_SLOT_PHASES
+
+    def current_phase(self, ticket: TransferTicket) -> SlotPhase | None:
+        """Phase of *ticket*'s slot if the ticket still owns it, else None."""
+        slot = self._slots[ticket.output_slot]
+        if slot.ticket != ticket:
+            return None
+        return slot.phase
 
     def reset(self) -> None:
-        if any(slot.phase in (SlotPhase.SUBMITTED, SlotPhase.IN_USE) for slot in self._slots):
+        if self._poisoned is not None:
+            raise RuntimeError(
+                f"cannot reset a poisoned chunk transport ({self._poisoned}); "
+                "rebuild the process group instead (design section 27.2)"
+            )
+        if any(slot.phase in _ACTIVE_SLOT_PHASES for slot in self._slots):
             raise RuntimeError("cannot reset chunk transport with in-flight slots")
         self._slots = [OutputSlotState() for _ in self._slots]
         self._forward_generation = 0
         self._closed = False
 
     def close(self) -> None:
-        if any(slot.phase in (SlotPhase.SUBMITTED, SlotPhase.IN_USE) for slot in self._slots):
+        if self._poisoned is not None:
+            raise RuntimeError(
+                f"cannot close a poisoned chunk transport ({self._poisoned}); "
+                "rebuild the process group instead (design section 27.2)"
+            )
+        if any(slot.phase in _ACTIVE_SLOT_PHASES for slot in self._slots):
             raise RuntimeError("cannot close chunk transport with in-flight slots")
         self._closed = True
 
     def _require_current(self, ticket: TransferTicket) -> OutputSlotState:
+        self._require_operational()
         slot = self._slots[ticket.output_slot]
         if slot.ticket != ticket:
             raise RuntimeError(f"stale transfer ticket for output slot {ticket.output_slot}")
+        if slot.expected_key != ticket.validation_key:
+            raise RuntimeError(
+                f"collective key mismatch on output slot {ticket.output_slot}: "
+                f"slot expects {slot.expected_key}, ticket carries {ticket.validation_key} "
+                "(design sections 24-25)"
+            )
         return slot
 
 
@@ -630,6 +953,8 @@ class TransportCounters:
     submitted_chunks: int = 0
     consumer_attaches: int = 0
     releases: int = 0
+    cancels: int = 0
+    poisons: int = 0
     resets: int = 0
 
 
@@ -646,6 +971,9 @@ class ChunkedWeightTransport:
         self.manifest: PartManifest | None = None
         self.host_shards: dict[torch.dtype, torch.Tensor] = {}
         self.counters = TransportCounters()
+        # Cached at construction: counter updates cost one predictable
+        # branch per transfer when the metrics gate is off.
+        self._metrics_on = metrics_enabled()
 
     def prepare(
         self,
@@ -670,6 +998,7 @@ class ChunkedWeightTransport:
         request_generation: int,
         ready_event: Any,
         part_id: str = "block",
+        backend_id: str | None = None,
         last_collective_key: tuple[Any, ...] | None = None,
     ) -> TransferTicket:
         if self.manifest is None:
@@ -681,15 +1010,19 @@ class ChunkedWeightTransport:
             request_generation=request_generation,
             part_id=part_id,
             ready_event=ready_event,
+            backend_id=backend_id,
             last_collective_key=last_collective_key,
         )
-        if ticket is not previous:
+        if ticket is not previous and self._metrics_on:
             self.counters.submissions += 1
             self.counters.submitted_chunks += ticket.chunk_count
         return ticket
 
     def mark_ready(self, ticket: TransferTicket) -> None:
         self.state.mark_ready(ticket)
+
+    def mark_bound(self, ticket: TransferTicket) -> None:
+        self.state.mark_bound(ticket)
 
     def attach_ready(
         self,
@@ -698,15 +1031,33 @@ class ChunkedWeightTransport:
     ) -> None:
         self.state.mark_in_use(ticket)
         wait_event(ticket.ready_event)
-        self.counters.consumer_attaches += 1
+        if self._metrics_on:
+            self.counters.consumer_attaches += 1
 
     def record_last_use(self, ticket: TransferTicket, last_use_event: Any) -> None:
-        self.state.release(ticket, last_use_event)
-        self.counters.releases += 1
+        self.state.record_last_use(ticket, last_use_event)
+        if self._metrics_on:
+            self.counters.releases += 1
+
+    def confirm_reusable(self, ticket: TransferTicket) -> None:
+        self.state.confirm_reusable(ticket)
+
+    def cancel_submission(self, ticket: TransferTicket, reason: str) -> None:
+        """Abort a submission before any collective was issued (section 27.1)."""
+        self.state.cancel(ticket, reason)
+        if self._metrics_on:
+            self.counters.cancels += 1
+
+    def poison(self, reason: str) -> None:
+        """Mark the process group untrusted after a mid-collective failure (section 27.2)."""
+        self.state.poison(reason)
+        if self._metrics_on:
+            self.counters.poisons += 1
 
     def reset(self) -> None:
         self.state.reset()
-        self.counters.resets += 1
+        if self._metrics_on:
+            self.counters.resets += 1
 
     def reset_counters(self) -> None:
         """Start a fresh accounting window without changing transport state."""

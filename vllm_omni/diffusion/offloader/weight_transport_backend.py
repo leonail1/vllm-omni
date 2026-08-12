@@ -19,6 +19,7 @@ from .chunked_transport import (
     PartManifest,
     SourceLayout,
     TransportBackendKind,
+    metrics_enabled,
 )
 
 
@@ -256,6 +257,9 @@ class _BaseBackend:
     def __init__(self, capability: TransportCapability) -> None:
         self.capability = capability
         self.counters = BackendCounters()
+        # Cached at construction: counter updates cost one predictable
+        # branch per chunk when the metrics gate is off.
+        self._metrics_on = metrics_enabled()
         self._generation = -1
         self._closed = False
 
@@ -266,7 +270,8 @@ class _BaseBackend:
     def begin_part(self, streams: TransportStreams, prior_last_use: Any | None) -> None:
         if self._closed:
             raise RuntimeError("weight transport backend is closed")
-        self.counters.submitted_parts += 1
+        if self._metrics_on:
+            self.counters.submitted_parts += 1
         if prior_last_use is None:
             return
         streams.communication.wait_event(prior_last_use)
@@ -281,6 +286,8 @@ class _BaseBackend:
         p2p_hops: int = 0,
         async_works: int = 0,
     ) -> None:
+        if not self._metrics_on:
+            return
         self.counters.submitted_chunks += 1
         self.counters.host_h2d_bytes += host_bytes
         self.counters.fabric_bytes += fabric_bytes
@@ -462,13 +469,15 @@ class GroupPersistentBackend(ReferenceBackend):
         def collective() -> None:
             graph = self._graphs.get(key)
             if graph is None:
-                self.counters.schedule_builds += 1
+                if self._metrics_on:
+                    self.counters.schedule_builds += 1
                 graph = torch.npu.NPUGraph()
                 with torch.npu.graph(graph, stream=streams.communication):
                     torch.distributed.all_gather_into_tensor(full_output, local_input, group=group)
                 self._graphs[key] = graph
             else:
-                self.counters.schedule_replays += 1
+                if self._metrics_on:
+                    self.counters.schedule_replays += 1
             graph.replay()
 
         return self._submit_fs_chunk(
@@ -574,7 +583,8 @@ class GroupPipelineMemcpyBackend(_BaseBackend):
     def begin_part(self, streams: TransportStreams, prior_last_use: Any | None) -> None:
         if self._closed:
             raise RuntimeError("weight transport backend is closed")
-        self.counters.submitted_parts += 1
+        if self._metrics_on:
+            self.counters.submitted_parts += 1
         if prior_last_use is None:
             return
         if _pipeline_ranks(self.capability).index(self.capability.rank) == 0:

@@ -19,6 +19,11 @@ from .distributed_layerwise_backend import (
 from .layerwise_backend import LayerWiseOffloadBackend
 from .module_residency import PinnedModuleStager
 from .offload_plan import OffloadPlan, get_offload_plan
+from .part_pipeline import (
+    DistributedPartPipelineOffloadHook,
+    apply_part_pipeline_block_hook,
+    remove_part_pipeline_block_hook,
+)
 from .sequential_backend import (
     ModelLevelOffloadBackend,
     apply_sequential_offload,
@@ -44,6 +49,7 @@ __all__ = [
     "LayerWiseOffloadBackend",
     "DistributedLayerwiseOffloadBackend",
     "DistributedLayerwiseOffloadHook",
+    "DistributedPartPipelineOffloadHook",
     "ModelLevelOffloadBackend",
     "PinnedModuleStager",
     "apply_sequential_offload",
@@ -51,6 +57,8 @@ __all__ = [
     "sequential_offload_component",
     "apply_distributed_block_hook",
     "remove_distributed_block_hook",
+    "apply_part_pipeline_block_hook",
+    "remove_part_pipeline_block_hook",
     "get_offload_backend",
     "get_offload_plan",
     "get_blocks_attr_names",

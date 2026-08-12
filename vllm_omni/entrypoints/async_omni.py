@@ -508,6 +508,15 @@ class AsyncOmni(EngineClient, OmniBase):
         async with self._pause_cond:
             await self._pause_cond.wait_for(lambda: not self._paused)
 
+        # Design section 27.2: after a fatal stage failure (e.g. a poisoned
+        # DLO process group), reject new requests immediately instead of
+        # queueing them onto a dead replica.
+        if self.errored:
+            raise OmniEngineDeadError(
+                "Engine is in a non-recoverable error state; rejecting new request "
+                f"{external_request_id} (design section 27.2: fail closed after a fatal stage failure)"
+            )
+
         logger.debug(f"[AsyncOmni] generate() called for request {external_request_id}")
 
         _sleeping_tags = getattr(self, "_sleeping_tags", None)

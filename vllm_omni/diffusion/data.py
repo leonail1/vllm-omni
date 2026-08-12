@@ -768,6 +768,8 @@ class OmniDiffusionConfig:
     # Stage-2 topology-aware weight transport.
     dlo_transport_backend: str = "auto"
     dlo_transport_source_layout: str = "fs_sharded_host"
+    # Stage-3 compute-aware attention/MoE part pipeline (design sections 19-28).
+    dlo_part_pipeline: bool = False
 
     pin_cpu_memory: bool = True  # Use pinned memory for faster transfers when offloading
 
@@ -1078,6 +1080,10 @@ class OmniDiffusionConfig:
                 incompatible_features.append("CPU offload")
             if self.enable_layerwise_offload:
                 incompatible_features.append("layerwise offload")
+            if self.enable_distributed_layerwise_offload:
+                # Design section 26.3: full-model graph capture stays
+                # unsupported while storage rebinding is unverified.
+                incompatible_features.append("distributed layerwise offload")
             if incompatible_features:
                 features = ", ".join(incompatible_features)
                 raise ValueError(

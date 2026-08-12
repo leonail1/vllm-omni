@@ -773,6 +773,16 @@ class OmniServeCommand(CLISubcommand):
             default="fs_sharded_host",
             help="Host source contract for the selected Stage-2 DLO backend.",
         )
+        omni_config_group.add_argument(
+            "--dlo-part-pipeline",
+            action="store_true",
+            default=False,
+            help=(
+                "Enable the Stage-3 compute-aware attention/MoE part pipeline. "
+                "Requires streamed blocks to declare _block_weight_use_plan; "
+                "models without a plan fall back to whole-block transport."
+            ),
+        )
         # Video model parameters (e.g., Wan2.2) - engine-level
         omni_config_group.add_argument(
             "--boundary-ratio",

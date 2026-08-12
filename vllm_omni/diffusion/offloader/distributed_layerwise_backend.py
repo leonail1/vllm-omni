@@ -27,7 +27,7 @@ import concurrent.futures
 import contextlib
 import os
 import socket
-from collections.abc import Iterator
+from collections.abc import Iterator, Sequence
 from contextlib import contextmanager
 from dataclasses import replace
 from itertools import chain
@@ -46,7 +46,17 @@ from vllm_omni.platforms import current_omni_platform
 
 from .base import OffloadBackend, OffloadConfig
 from .block_discovery import ChunkOwnedBlock, ChunkOwnership, get_blocks_from_dit
+from .cancellation import (
+    DLO_ABORT_DIR_ENV,
+    abort_channel_configured,
+    check_cancellation,
+    clear_current_request_ids,
+    configure_abort_channel,
+    set_current_request_ids,
+)
 from .chunked_transport import (
+    PART_ID_ATTENTION,
+    PART_ID_MOE,
     ChunkedWeightTransport,
     PartManifest,
     PinBudget,
@@ -57,12 +67,29 @@ from .chunked_transport import (
     WeightLayout,
     build_part_manifest,
     is_chunk_transport_supported,
+    metrics_enabled,
     pack_local_shard,
+    process_group_poison_reason,
 )
 from .module_collector import ModuleDiscovery
 from .offload_plan import (
     OffloadPlan,
     get_offload_plan,
+)
+from .part_pipeline import (
+    DistributedPartPipelineOffloadHook,
+    apply_part_pipeline_block_hook,
+    remove_part_pipeline_block_hook,
+    resolve_block_weight_use_plan,
+    split_specs_by_part,
+    validate_block_weight_use_plan,
+)
+from .skip_schedule import (
+    BlockPartSchedule,
+    SkipScheduleCoordinator,
+    register_skip_schedule_coordinator,
+    skip_decision_observer_installed,
+    unregister_skip_schedule_coordinator,
 )
 from .tensor_utils import (
     dtype_size as _dtype_size,
@@ -91,7 +118,8 @@ logger = init_logger(__name__)
 # ones stay resident for lower latency.
 _ON_DEMAND_THRESHOLD_MB = 1024
 
-# Trace markers consumed by benchmarks/diffusion/extract_dlo_timeline.py.
+# Trace markers consumed by the offline timeline analysis scripts under
+# results/stage3-part-pipeline/code/ (e.g. stage3_trace_overlap.py).
 # H2D/AllGather ranges execute on the submit worker; ``submit`` is emitted on
 # the profiled main thread so every asynchronous submission remains visible
 # even when PyTorch's thread-local record_function state does not propagate.
@@ -102,6 +130,15 @@ def _trace_marker(kind: str, block_id: int, chunk_id: int | None = None) -> str:
     if chunk_id is None:
         return f"dlo.{kind}.block_{block_id}"
     return f"dlo.{kind}.block_{block_id}.chunk_{chunk_id}"
+
+
+# Shared no-op trace objects: with the trace switch off the hot path must
+# not allocate a fresh nullcontext or closure per chunk.
+_DISABLED_TRACE_RANGE = contextlib.nullcontext()
+
+
+def _null_trace_factory(kind: str) -> Any:
+    return _DISABLED_TRACE_RANGE
 
 
 def _prefetch_barrier() -> None:
@@ -313,6 +350,7 @@ class DistributedLayerwiseOffloadHook(ModelHook):
         # Pending async AllGather work (prevent GC before completion).
         self._pending_work: Any | None = None
         self._cached_repoint: list | None = None
+        self._repoint_views: list[list | None] = [None, None]
 
     # ------------------------------------------------------------------ #
     #  DTensor helpers (shared with LayerwiseOffloadHook)                 #
@@ -376,6 +414,10 @@ class DistributedLayerwiseOffloadHook(ModelHook):
                         )
                     )
             self._cached_repoint.append(repoint)
+        # Lazily-built per-slot views (built once on first apply): slot
+        # buffers are persistent, so the hot path creates no Tensors
+        # (design section 26.3).
+        self._repoint_views: list[list | None] = [None, None]
 
         return module
 
@@ -614,11 +656,11 @@ class DistributedLayerwiseOffloadHook(ModelHook):
         """Return a profiler range whose name the DLO timeline analyzer parses.
 
         No-op unless ``VLLM_OMNI_DLO_TRACE`` is set.  The marker text must stay
-        in the ``dlo.<kind>.block_<id>[.chunk_<id>]`` shape consumed by
-        ``benchmarks/diffusion/extract_dlo_timeline.py``.
+        in the ``dlo.<kind>.block_<id>[.chunk_<id>]`` shape consumed by the
+        offline analysis scripts in ``results/stage3-part-pipeline/code/``.
         """
         if not self.trace_enabled:
-            return contextlib.nullcontext()
+            return _DISABLED_TRACE_RANGE
         marker_block = self.block_id if block_id is None else block_id
         return torch.profiler.record_function(_trace_marker(kind, marker_block, chunk_id))
 
@@ -735,6 +777,7 @@ class DistributedLayerwiseOffloadHook(ModelHook):
                 request_generation=self._request_generation,
                 ready_event=evt,
                 part_id=self.manifest.part_id,
+                backend_id=self.data_transport_backend.kind.value,
                 last_collective_key=(
                     self._request_generation,
                     self.block_id,
@@ -778,16 +821,22 @@ class DistributedLayerwiseOffloadHook(ModelHook):
             if non_blocking:
                 for dtype, cpu_source in self.cpu_shards.items():
                     if cpu_source.numel() and not cpu_source.is_pinned():
-                        raise RuntimeError(
+                        # Pre-collective validation failure: the slot is still in
+                        # PREFETCH_ENQUEUED, so cancel instead of poisoning the
+                        # process group (design sections 25/27.1).
+                        reason = (
                             f"chunk H2D requires pinned Host source for block {self.block_id} "
-                            f"dtype={dtype}; tensor is not pinned. Async overlap is unsafe "
+                            f"dtype={dtype}; tensor is not pinned."
+                        )
+                        self.transport.cancel_submission(ticket, reason)
+                        self.ready_tickets[slot] = None
+                        raise RuntimeError(
+                            f"{reason} Async overlap is unsafe "
                             "with pageable source — set dlo_pin_failure_policy=whole_block_fallback "
                             "to allow pageable fallback, or ensure pin_cpu_memory=True."
                         )
 
             streams = TransportStreams(copy=self.copy_stream, communication=self.comm_stream)
-            self.data_transport_backend.begin_part(streams, self._output_slot_events[slot])
-            completions: list[ChunkCompletion] = []
             shard_bufs = self.gpu_shard_buffers
 
             chunk_specs = [
@@ -795,48 +844,91 @@ class DistributedLayerwiseOffloadHook(ModelHook):
                 for dtype_manifest in self.manifest.dtypes
                 for chunk in dtype_manifest.chunks
             ]
-            for transfer_index, (dtype, chunk) in enumerate(chunk_specs):
-                input_slot = transfer_index % 2
-                cpu_source = self.cpu_shards[dtype]
-                if self.manifest.source_layout is SourceLayout.FS_SHARDED_HOST:
-                    source = cpu_source[chunk.cpu_offset : chunk.cpu_offset + chunk.local_numel]
-                elif cpu_source.numel():
-                    source = cpu_source[chunk.full_offset : chunk.full_offset + chunk.padded_numel]
-                else:
-                    source = None
+            try:
+                self.data_transport_backend.begin_part(streams, self._output_slot_events[slot])
+                completions: list[ChunkCompletion] = []
+                trace_factory = None if self.trace_enabled else _null_trace_factory
+                for transfer_index, (dtype, chunk) in enumerate(chunk_specs):
+                    input_slot = transfer_index % 2
+                    cpu_source = self.cpu_shards[dtype]
+                    if self.manifest.source_layout is SourceLayout.FS_SHARDED_HOST:
+                        source = cpu_source[chunk.cpu_offset : chunk.cpu_offset + chunk.local_numel]
+                    elif cpu_source.numel():
+                        source = cpu_source[chunk.full_offset : chunk.full_offset + chunk.padded_numel]
+                    else:
+                        source = None
 
-                local_input = None
-                if self.data_transport_backend.requires_local_input:
-                    if len(shard_bufs) != 2 or shard_bufs[0] is None or shard_bufs[1] is None:
-                        raise RuntimeError("selected transport backend requires two local chunk input buffers")
-                    local_input = shard_bufs[input_slot][dtype][: chunk.local_numel]
+                    local_input = None
+                    if self.data_transport_backend.requires_local_input:
+                        if len(shard_bufs) != 2 or shard_bufs[0] is None or shard_bufs[1] is None:
+                            raise RuntimeError("selected transport backend requires two local chunk input buffers")
+                        local_input = shard_bufs[input_slot][dtype][: chunk.local_numel]
 
-                completion = self.data_transport_backend.submit_chunk(
-                    source=source,
-                    local_input=local_input,
-                    full_output=gpu_weights[dtype][chunk.full_offset : chunk.full_offset + chunk.padded_numel],
-                    chunk_meta=chunk,
+                    completion = self.data_transport_backend.submit_chunk(
+                        source=source,
+                        local_input=local_input,
+                        full_output=gpu_weights[dtype][chunk.full_offset : chunk.full_offset + chunk.padded_numel],
+                        chunk_meta=chunk,
+                        streams=streams,
+                        events=ChunkEvents(
+                            h2d_done=self._h2d_done_events[input_slot],
+                            transport_done=self._transport_done_events[input_slot],
+                            input_reusable=self._chunk_slot_events[input_slot],
+                            relay_done=self._relay_done_events[input_slot] if self._relay_done_events else None,
+                        ),
+                        group=self.weight_shard_group,
+                        generation=self._request_generation,
+                        non_blocking=non_blocking,
+                        trace=(
+                            trace_factory
+                            if trace_factory is not None
+                            else lambda kind, chunk_id=chunk.chunk_id: self._trace_range(kind, chunk_id)
+                        ),
+                    )
+                    completions.append(completion)
+                    if self.data_transport_backend.requires_local_input:
+                        self._chunk_slot_events[input_slot] = completion.event
+
+                self.data_transport_backend.finalize_part(
+                    completions,
+                    ready_event=evt,
                     streams=streams,
-                    events=ChunkEvents(
-                        h2d_done=self._h2d_done_events[input_slot],
-                        transport_done=self._transport_done_events[input_slot],
-                        input_reusable=self._chunk_slot_events[input_slot],
-                        relay_done=self._relay_done_events[input_slot] if self._relay_done_events else None,
-                    ),
-                    group=self.weight_shard_group,
-                    generation=self._request_generation,
-                    non_blocking=non_blocking,
-                    trace=lambda kind, chunk_id=chunk.chunk_id: self._trace_range(kind, chunk_id),
                 )
-                completions.append(completion)
-                if self.data_transport_backend.requires_local_input:
-                    self._chunk_slot_events[input_slot] = completion.event
+            except BaseException as exc:
+                # A failure inside the submission region may leave some ranks
+                # mid-collective: the process group can no longer be trusted
+                # (design sections 25/27.2).  Record the generation and the last
+                # collective key for post-mortem diagnosis (section 27.2 item 1).
+                self.transport.poison(
+                    f"block {self.block_id} slot {slot} submission failed "
+                    f"(request_generation={self._request_generation}, "
+                    f"last_collective_key={ticket.last_collective_key}): {exc!r}"
+                )
+                raise
 
-            self.data_transport_backend.finalize_part(
-                completions,
-                ready_event=evt,
-                streams=streams,
-            )
+            if self.trace_enabled:
+                # Per-prefetch structured record (design section 28).
+                full_bytes = sum(
+                    dtype_manifest.padded_numel * _dtype_size(dtype_manifest.dtype)
+                    for dtype_manifest in self.manifest.dtypes
+                )
+                logger.info(
+                    "DLO_PREFETCH gen=%d shard=%d/%d block=%d part=%s backend=%s layout=%s "
+                    "full_bytes=%d local_h2d_bytes=%d chunks=%d slot=%d fallback=%s last_key=%s",
+                    self._request_generation,
+                    self.weight_shard_rank,
+                    self.weight_shard_size,
+                    self.block_id,
+                    self.manifest.part_id,
+                    self.data_transport_backend.kind.value,
+                    self.manifest.source_layout.value,
+                    full_bytes,
+                    self.manifest.pinned_bytes,
+                    self.manifest.chunk_count,
+                    slot,
+                    self.fallback_reason,
+                    ticket.last_collective_key,
+                )
 
         self.ready_events[slot] = evt
         self._prefetch_done = evt
@@ -867,12 +959,25 @@ class DistributedLayerwiseOffloadHook(ModelHook):
         # The original stride is preserved so non-contiguous weights (e.g.
         # online FP8 Cutlass transposed views) round-trip through the flat
         # transport buffer without changing their physical layout.
-        for target, dtype, offset, numel, shape, stride in self._cached_repoint[slot]:
-            flat = gpu_weights[dtype][offset : offset + numel]
-            set_tensor_storage(
-                target,
-                torch.as_strided(flat, size=shape, stride=stride) if stride is not None else flat.view(shape),
-            )
+        views = self._repoint_views[slot]
+        if views is None:
+            views = [
+                (
+                    target,
+                    torch.as_strided(gpu_weights[dtype][offset : offset + numel], size=shape, stride=stride)
+                    if stride is not None
+                    else gpu_weights[dtype][offset : offset + numel].view(shape),
+                )
+                for target, dtype, offset, numel, shape, stride in self._cached_repoint[slot]
+            ]
+            self._repoint_views[slot] = views
+        for target, view in views:
+            set_tensor_storage(target, view)
+        # READY -> BOUND: the consumer's Parameters now view the slot's
+        # storage (design section 25).  No-op when already bound.
+        ticket = self.ready_tickets[slot]
+        if ticket is not None and self.transport_state.is_current(ticket):
+            self.transport.mark_bound(ticket)
 
     @torch.compiler.disable
     def prefetch_layer(self, slot: int, non_blocking: bool = True) -> None:
@@ -968,10 +1073,13 @@ class DistributedLayerwiseOffloadHook(ModelHook):
                 "transfer took the slot; refusing to wait on an event that no longer "
                 "proves this block's weights are ready"
             )
-        owner.transport.attach_ready(
-            ticket,
-            lambda event: current_omni_platform.current_stream().wait_event(event),
-        )
+        # Trace the consumer end of the happens-before chain (design section
+        # 28): attach == the block is ready and compute is about to read it.
+        with self._trace_range("attach"):
+            owner.transport.attach_ready(
+                ticket,
+                lambda event: current_omni_platform.current_stream().wait_event(event),
+            )
         return self.gpu_buffers[slot]
 
     # ------------------------------------------------------------------ #
@@ -997,7 +1105,10 @@ class DistributedLayerwiseOffloadHook(ModelHook):
         if prev is not None:
             ticket = prev.ready_tickets[slot]
             if ticket is not None and prev.transport_state.is_current(ticket):
-                prev.transport.record_last_use(ticket, evt)
+                # Trace the last-use edge of the happens-before chain
+                # (design section 28).
+                with self._trace_range("retire"):
+                    prev.transport.record_last_use(ticket, evt)
                 # Retire the ticket and its ready event as a pair: get_weights
                 # falls back to this hook's ready event and then validates the
                 # ticket, so a leftover event without a ticket would trip the
@@ -1080,6 +1191,9 @@ class DistributedLayerwiseOffloadHook(ModelHook):
         # slot still contains our own data (from the tail hook's async
         # prefetch), skip the sync-prefetch and just wait for the event.
         if self._is_group_first and self._prev_hook is not None:
+            # Design section 27.3: abort a client-cancelled request at this
+            # uniform forward boundary (FS-group vote inside).
+            check_cancellation()
             if self._prefetch_executor is not None:
                 # Another DiT group may have an outstanding tail submit on
                 # the shared single-worker executor.  Drain the global queue
@@ -1100,9 +1214,18 @@ class DistributedLayerwiseOffloadHook(ModelHook):
                     self._prev_hook.ready_tickets[self.current_slot] = None
                 # Another group (or no group) wrote to our slot — re-fetch
                 self._prev_hook.prefetch_layer(self.current_slot, non_blocking=False)
-        elif not self.is_materialized and self._prev_hook is not None:
-            # Previous hook was skipped (e.g. by cache-dit).  Only re-submit
-            # when no valid async prefetch is already in flight for this slot.
+            elif not has_current_ticket:
+                # The slot marker still names our group, but a cache-skip pass
+                # never ran the tail block, so no fresh prefetch for this
+                # block was submitted (the consumed ticket was retired with
+                # its ready event left behind).  The non-contaminated fast
+                # path may not assume a live ticket: repair synchronously.
+                self._prev_hook.prefetch_layer(self.current_slot, non_blocking=False)
+        elif self._prev_hook is not None:
+            # Repair whenever this block has no live producer ticket — the
+            # producer may have been skipped (e.g. by cache-dit), or its
+            # ticket may have been displaced by a slot steal while this
+            # block's Parameters still view the stolen storage.
             ticket = self._prev_hook.ready_tickets[self.current_slot]
             has_current_ticket = ticket is not None and self._prev_hook.transport_state.is_current(ticket)
             if not has_current_ticket:
@@ -1442,6 +1565,13 @@ class DistributedLayerwiseOffloadBackend(OffloadBackend):
         self._block_ids: dict[int, int] = {}
         self._planned_manifests: dict[int, PartManifest] = {}
         self._prepared_host_parts: dict[int, dict[str, Any]] = {}
+        # Stage-3 part pipeline: per-(block, part) manifests and Host parts,
+        # keyed by (id(module), part_id).  Active only when the model
+        # declares a weight use plan for every streamed block.
+        self._part_pipeline_active: bool = False
+        self._part_pipeline_fallback_reason: str | None = None
+        self._planned_part_manifests: dict[tuple[int, str], PartManifest] = {}
+        self._prepared_host_part_map: dict[tuple[int, str], dict[str, Any]] = {}
         self.pin_budget: PinBudget | None = None
         self._forced_fallback_reason: str | None = None
 
@@ -1462,6 +1592,10 @@ class DistributedLayerwiseOffloadBackend(OffloadBackend):
         # Request lifecycle.
         self._request_generation = 0
         self._request_active = False
+
+        # Design section 24, policy 2: FS-group skip-schedule digest sync,
+        # active only when the Stage-3 part pipeline runs with cache-dit.
+        self._skip_coordinators: list[SkipScheduleCoordinator] = []
 
         # Async prefetch: single-worker thread pool for background prefetching.
         # max_workers MUST stay 1 — every FS rank has to submit the identical
@@ -2006,6 +2140,47 @@ class DistributedLayerwiseOffloadBackend(OffloadBackend):
             specs.append((name, local, is_buffer))
         return specs
 
+    def _resolve_part_pipeline(self, ownership: ChunkOwnership) -> bool:
+        """Decide whether the Stage-3 part pipeline drives this engine.
+
+        Active only when requested via ``dlo_part_pipeline`` AND every
+        streamed block class declares a valid ``_block_weight_use_plan``.
+        A model without a plan falls back to whole-block transport (the
+        Stage-1/2 path) with an observable reason — Stage 3 must never break
+        models that only implement the earlier contract.
+        """
+        self._part_pipeline_active = False
+        self._part_pipeline_fallback_reason = None
+        if not getattr(self.config, "dlo_part_pipeline", False):
+            return False
+        if self._using_rank_local:
+            # Part transport is defined only for the sharded backend-driven
+            # path; rank-local hooks stream whole blocks.
+            logger.warning("dlo_part_pipeline requires weight_shard_size > 1; using rank-local whole-block transport")
+            return False
+        missing: list[str] = []
+        for block in ownership.blocks:
+            plan = resolve_block_weight_use_plan(block.module)
+            if plan is None:
+                missing.append(block.path)
+                continue
+            # Invalid plans are a model bug, not a fallback case: fail fast.
+            validate_block_weight_use_plan(plan)
+        if missing:
+            self._part_pipeline_fallback_reason = (
+                "dlo_part_pipeline requested but these streamed blocks declare no "
+                f"_block_weight_use_plan: {missing[:4]}{'...' if len(missing) > 4 else ''}; "
+                "using whole-block transport"
+            )
+            logger.warning("DLO Stage-3 fallback-to-block: %s", self._part_pipeline_fallback_reason)
+            return False
+        self._part_pipeline_active = True
+        logger.info(
+            "DLO Stage-3 part pipeline active: %d blocks x (attention, moe) parts",
+            len(ownership.blocks),
+        )
+        return True
+
     def _plan_chunk_manifests(self, ownership: ChunkOwnership) -> None:
         """Build every final layout and enforce the pin cap before allocation."""
         if self.transport_selection is None:
@@ -2013,10 +2188,39 @@ class DistributedLayerwiseOffloadBackend(OffloadBackend):
         self.pin_budget = PinBudget(limit_bytes=self.config.dlo_pin_budget_bytes)
         policy = self._pin_failure_policy
         self._planned_manifests = {}
+        self._planned_part_manifests = {}
         self._forced_fallback_reason = None
 
         for block in ownership.blocks:
             specs = [spec for spec in self._block_tensor_specs(block.module) if is_chunk_transport_supported(spec[1])]
+            if self._part_pipeline_active:
+                part_specs, _resident_specs = split_specs_by_part(specs, resolve_block_weight_use_plan(block.module))
+                for part_id in (PART_ID_ATTENTION, PART_ID_MOE):
+                    manifest = build_part_manifest(
+                        part_specs[part_id],
+                        block_id=self._block_ids[id(block.module)],
+                        part_id=part_id,
+                        weight_shard_size=self.weight_shard_size,
+                        weight_shard_rank=self.weight_shard_rank,
+                        chunk_size_bytes=self.config.chunk_size_bytes,
+                        alignment_bytes=self._alignment_bytes,
+                        layout=WeightLayout.CHUNK_MAJOR,
+                        source_layout=self.transport_selection.effective_source_layout,
+                    )
+                    budget_key = f"{block.path}:{part_id}"
+                    try:
+                        self.pin_budget.plan(budget_key, manifest.pinned_bytes)
+                    except MemoryError as exc:
+                        if policy is PinFailurePolicy.FAIL:
+                            raise MemoryError(
+                                "pinned Host budget exceeded before allocation: "
+                                f"required={self.pin_budget.required_bytes + manifest.pinned_bytes} "
+                                f"limit={self.config.dlo_pin_budget_bytes}"
+                            ) from exc
+                        self._forced_fallback_reason = "pinned Host budget exceeded before allocation"
+                        self.pin_budget.plan(budget_key, 0)
+                    self._planned_part_manifests[(id(block.module), part_id)] = manifest
+                continue
             manifest = build_part_manifest(
                 specs,
                 block_id=self._block_ids[id(block.module)],
@@ -2049,7 +2253,11 @@ class DistributedLayerwiseOffloadBackend(OffloadBackend):
             # the pageable whole-block storage that will actually be built.
             self.pin_budget = PinBudget(limit_bytes=self.config.dlo_pin_budget_bytes)
             for block in ownership.blocks:
-                self.pin_budget.plan(block.path, 0)
+                if self._part_pipeline_active:
+                    for part_id in (PART_ID_ATTENTION, PART_ID_MOE):
+                        self.pin_budget.plan(f"{block.path}:{part_id}", 0)
+                else:
+                    self.pin_budget.plan(block.path, 0)
 
         logger.info(
             "DLO Host plan: blocks=%d required_pinned=%.3f GiB budget=%s policy=%s fallback=%s",
@@ -2091,94 +2299,120 @@ class DistributedLayerwiseOffloadBackend(OffloadBackend):
             module = block.module
             specs = self._block_tensor_specs(module)
             chunk_specs = [spec for spec in specs if is_chunk_transport_supported(spec[1])]
-            manifest = self._planned_manifests[id(module)]
 
-            fallback_reason = self._forced_fallback_reason
-
-            failed = 0
-            detail = fallback_reason
-            cpu_shards: dict[torch.dtype, torch.Tensor] | None = None
-            if fallback_reason is None:
-                try:
-                    cpu_shards = pack_local_shard(chunk_specs, manifest)
-                except (MemoryError, RuntimeError, OSError) as exc:
-                    # The pinned allocator can also fail with RuntimeError/OS
-                    # errors (lock limit, driver); treat every allocation
-                    # failure uniformly through the FS vote (review: #6374).
-                    failed = 1
-                    detail = f"pinned Host allocation failed for {block.path}: {exc}"
-
-            # A pageable fallback changes the collective sequence, so every FS
-            # rank must take the same decision even if only one rank failed.
-            agreed = self._agree_pin_failure(failed)
-            if agreed:
-                if policy is PinFailurePolicy.FAIL:
-                    if detail is None:
-                        detail = "another FS rank failed"
-                    logger.error("DLO pinned Host allocation failed: %s", detail)
-                    # Do not leave a partially prepared backend behind: drop
-                    # every shard packed so far (freeing pinned Host memory)
-                    # and close the mmap handles (review: #6374).
-                    self._abort_prepared_host_storage()
-                    raise RuntimeError("pinned allocation failed on at least one FS rank")
-                fallback_reason = detail or "another FS rank failed"
-                cpu_shards = None
-
-            if cpu_shards is None:
-                manifest = build_part_manifest(
-                    chunk_specs,
-                    block_id=self._block_ids[id(module)],
-                    part_id="block",
-                    weight_shard_size=self.weight_shard_size,
-                    weight_shard_rank=self.weight_shard_rank,
-                    chunk_size_bytes=self.config.chunk_size_bytes,
-                    alignment_bytes=self._alignment_bytes,
-                    layout=WeightLayout.WHOLE_BLOCK,
-                    source_layout=self.transport_selection.effective_source_layout,
-                )
-                cpu_shards = pack_local_shard(
-                    chunk_specs,
-                    manifest,
-                    allocator=lambda numel, dtype: torch.empty(numel, dtype=dtype, device="cpu"),
-                )
-                fallback_blocks += 1
-            else:
-                pinned_bytes += manifest.pinned_bytes
-
-            self.pin_budget.reserve(block.path)
-            self._planned_manifests[id(module)] = manifest
-
-            metadata: dict[torch.dtype, list[dict[str, Any]]] = {}
-            for dtype_manifest in manifest.dtypes:
-                metadata[dtype_manifest.dtype] = [
-                    {
-                        "name": tensor.name,
-                        "offset": tensor.offset,
-                        "numel": tensor.numel,
-                        "shape": torch.Size(tensor.shape),
-                        "stride": tensor.stride,
-                    }
-                    for tensor in dtype_manifest.tensors
+            # Stage-3: pack one manifest per (block, part); otherwise one
+            # whole-block manifest.  Each work item is
+            # (budget_key, part_id|None, specs, planned_manifest).
+            if self._part_pipeline_active:
+                part_specs, _resident_specs = split_specs_by_part(chunk_specs, resolve_block_weight_use_plan(module))
+                work_items = [
+                    (
+                        f"{block.path}:{part_id}",
+                        part_id,
+                        part_specs[part_id],
+                        self._planned_part_manifests[(id(module), part_id)],
+                    )
+                    for part_id in (PART_ID_ATTENTION, PART_ID_MOE)
                 ]
+            else:
+                work_items = [(block.path, None, chunk_specs, self._planned_manifests[id(module)])]
+
+            chunked_names: set[str] = set()
+            for budget_key, part_id, item_specs, manifest in work_items:
+                fallback_reason = self._forced_fallback_reason
+
+                failed = 0
+                detail = fallback_reason
+                cpu_shards: dict[torch.dtype, torch.Tensor] | None = None
+                if fallback_reason is None:
+                    try:
+                        cpu_shards = pack_local_shard(item_specs, manifest)
+                    except (MemoryError, RuntimeError, OSError) as exc:
+                        # The pinned allocator can also fail with RuntimeError/OS
+                        # errors (lock limit, driver); treat every allocation
+                        # failure uniformly through the FS vote (review: #6374).
+                        failed = 1
+                        detail = f"pinned Host allocation failed for {budget_key}: {exc}"
+
+                # A pageable fallback changes the collective sequence, so every FS
+                # rank must take the same decision even if only one rank failed.
+                agreed = self._agree_pin_failure(failed)
+                if agreed:
+                    if policy is PinFailurePolicy.FAIL:
+                        if detail is None:
+                            detail = "another FS rank failed"
+                        logger.error("DLO pinned Host allocation failed: %s", detail)
+                        # Do not leave a partially prepared backend behind: drop
+                        # every shard packed so far (freeing pinned Host memory)
+                        # and close the mmap handles (review: #6374).
+                        self._abort_prepared_host_storage()
+                        raise RuntimeError("pinned allocation failed on at least one FS rank")
+                    fallback_reason = detail or "another FS rank failed"
+                    cpu_shards = None
+
+                if cpu_shards is None:
+                    manifest = build_part_manifest(
+                        item_specs,
+                        block_id=self._block_ids[id(module)],
+                        part_id=part_id or "block",
+                        weight_shard_size=self.weight_shard_size,
+                        weight_shard_rank=self.weight_shard_rank,
+                        chunk_size_bytes=self.config.chunk_size_bytes,
+                        alignment_bytes=self._alignment_bytes,
+                        layout=WeightLayout.WHOLE_BLOCK,
+                        source_layout=self.transport_selection.effective_source_layout,
+                    )
+                    cpu_shards = pack_local_shard(
+                        item_specs,
+                        manifest,
+                        allocator=lambda numel, dtype: torch.empty(numel, dtype=dtype, device="cpu"),
+                    )
+                    fallback_blocks += 1
+                else:
+                    pinned_bytes += manifest.pinned_bytes
+
+                self.pin_budget.reserve(budget_key)
+
+                metadata: dict[torch.dtype, list[dict[str, Any]]] = {}
+                for dtype_manifest in manifest.dtypes:
+                    metadata[dtype_manifest.dtype] = [
+                        {
+                            "name": tensor.name,
+                            "offset": tensor.offset,
+                            "numel": tensor.numel,
+                            "shape": torch.Size(tensor.shape),
+                            "stride": tensor.stride,
+                        }
+                        for tensor in dtype_manifest.tensors
+                    ]
+                chunked_names.update(
+                    tensor.name for dtype_manifest in manifest.dtypes for tensor in dtype_manifest.tensors
+                )
+
+                prepared = {
+                    "cpu_shards": cpu_shards,
+                    "metadata": metadata,
+                    "manifest": manifest,
+                    "fallback_reason": fallback_reason,
+                }
+                if part_id is None:
+                    self._planned_manifests[id(module)] = manifest
+                    self._prepared_host_parts[id(module)] = prepared
+                else:
+                    self._planned_part_manifests[(id(module), part_id)] = manifest
+                    self._prepared_host_part_map[(id(module), part_id)] = prepared
 
             # Host storage now owns the weights: drop the original storage so
             # the mmap views and CPU copies can be released.
-            chunked_names = {tensor.name for dtype_manifest in manifest.dtypes for tensor in dtype_manifest.tensors}
             sources = {name: tensor for name, tensor, _ in specs}
             for name in chunked_names:
                 set_tensor_storage(sources[name], make_offload_placeholder(sources[name]))
             # Tensors the chunk transport cannot carry (0-dim, integer dtypes)
-            # stay resident on device.
+            # — and, in part mode, resident cross-phase tensors the plan does
+            # not assign to any part — stay resident on device.
             for name, tensor, _is_buffer in specs:
                 if name not in chunked_names and is_materialized_tensor(tensor):
                     set_tensor_storage(tensor, tensor.detach().to(self.device))
-
-            self._prepared_host_parts[id(module)] = {
-                "cpu_shards": cpu_shards,
-                "metadata": metadata,
-                "manifest": manifest,
-                "fallback_reason": fallback_reason,
-            }
 
         logger.info(
             "DLO Host storage ready: pinned=%.3f GiB fallback_blocks=%d/%d",
@@ -2195,7 +2429,9 @@ class DistributedLayerwiseOffloadBackend(OffloadBackend):
         initialized state (review: #6374).
         """
         self._prepared_host_parts.clear()
+        self._prepared_host_part_map.clear()
         self._planned_manifests = {}
+        self._planned_part_manifests = {}
         self.pin_budget = None
         self._release_mmap_handles()
 
@@ -2218,25 +2454,33 @@ class DistributedLayerwiseOffloadBackend(OffloadBackend):
 
         signature = []
         for block in ownership.blocks:
-            manifest = self._prepared_host_parts[id(block.module)]["manifest"]
-            signature.append(
-                (
-                    manifest.block_id,
-                    block.path,
-                    manifest.digest,
-                    manifest.layout.value,
-                    tuple(
-                        (
-                            str(dtype_manifest.dtype),
-                            len(dtype_manifest.chunks),
-                            dtype_manifest.total_numel,
-                            dtype_manifest.padded_numel,
-                            dtype_manifest.local_numel,
-                        )
-                        for dtype_manifest in manifest.dtypes
-                    ),
+            if self._part_pipeline_active:
+                manifests = [
+                    self._prepared_host_part_map[(id(block.module), part_id)]["manifest"]
+                    for part_id in (PART_ID_ATTENTION, PART_ID_MOE)
+                ]
+            else:
+                manifests = [self._prepared_host_parts[id(block.module)]["manifest"]]
+            for manifest in manifests:
+                signature.append(
+                    (
+                        manifest.block_id,
+                        manifest.part_id,
+                        block.path,
+                        manifest.digest,
+                        manifest.layout.value,
+                        tuple(
+                            (
+                                str(dtype_manifest.dtype),
+                                len(dtype_manifest.chunks),
+                                dtype_manifest.total_numel,
+                                dtype_manifest.padded_numel,
+                                dtype_manifest.local_numel,
+                            )
+                            for dtype_manifest in manifest.dtypes
+                        ),
+                    )
                 )
-            )
 
         gathered: list[Any] = [None] * self.weight_shard_size
         torch.distributed.all_gather_object(gathered, signature, group=group)
@@ -2252,11 +2496,118 @@ class DistributedLayerwiseOffloadBackend(OffloadBackend):
     #  Request lifecycle                                                  #
     # ------------------------------------------------------------------ #
 
-    def begin_request(self) -> None:
+    # ------------------------------------------------------------------ #
+    #  Skip-schedule digest sync (design section 24, policy 2)           #
+    # ------------------------------------------------------------------ #
+
+    def _setup_skip_schedule_sync(self) -> None:
+        """Register per-group FS-group skip-schedule coordinators, if required.
+
+        Active whenever cache-dit runs with the chunked DLO transport (Stage
+        1/2 whole-block or Stage 3 part pipeline): every dynamic skip
+        decision then triggers a schedule digest compare before the first
+        decision-dependent weight collective.  One coordinator is registered
+        per streamed block group, keyed by the group's blocks-container name
+        so cache-dit decisions route to the right group.
+        """
+        if getattr(self.config, "cache_backend", "none") != "cache_dit":
+            return
+
+        self._skip_coordinators: list[SkipScheduleCoordinator] = []
+        for hook_group, (_blocks, group_path) in zip(self._all_hook_groups, self._pending_block_groups):
+            domain = group_path.rsplit(".", 1)[-1]
+
+            def _make_on_skip(group: list) -> Any:
+                def _reconcile() -> None:
+                    # A skipped step strands the pre-decision attention
+                    # prefetch for block 1; retire it on every hook that
+                    # holds a live unconsumed ticket (design section 24,
+                    # policy-2 reconciliation).  Whole-block hooks need no
+                    # reconciliation: their leftover prefetch stays valid in
+                    # its slot and is either reused idempotently or displaced
+                    # by the repair prefetch, which the consumer-side ticket
+                    # checks in pre_forward handle.
+                    for hook in group:
+                        if isinstance(hook, DistributedPartPipelineOffloadHook):
+                            hook.retire_unconsumed_prefetches()
+
+                return _reconcile
+
+            blocks: list[BlockPartSchedule] = []
+            for hook in hook_group:
+                if isinstance(hook, DistributedPartPipelineOffloadHook):
+                    parts = tuple(
+                        (
+                            part_id,
+                            tuple(
+                                (str(dtype_manifest.dtype), len(dtype_manifest.chunks))
+                                for dtype_manifest in hook.manifests[part_id].dtypes
+                            ),
+                        )
+                        for part_id in (PART_ID_ATTENTION, PART_ID_MOE)
+                    )
+                else:
+                    # Whole-block transport: one "block" part per block.
+                    parts = (
+                        (
+                            hook.manifest.part_id,
+                            tuple(
+                                (str(dtype_manifest.dtype), len(dtype_manifest.chunks))
+                                for dtype_manifest in hook.manifest.dtypes
+                            ),
+                        ),
+                    )
+                blocks.append(BlockPartSchedule(block_id=hook.block_id, parts=parts))
+
+            backend_id = (
+                self.data_transport_backend.kind.value if self.data_transport_backend is not None else "unknown"
+            )
+            coordinator = SkipScheduleCoordinator(
+                domain=domain,
+                blocks=blocks,
+                backend_id=backend_id,
+                cpu_group=self.weight_shard_cpu_group,
+                group_size=self.weight_shard_size,
+                on_skip=_make_on_skip(hook_group),
+            )
+            register_skip_schedule_coordinator(domain, coordinator)
+            self._skip_coordinators.append(coordinator)
+        logger.info(
+            "Registered cache-dit skip-schedule digest sync for %d block group(s) (design section 24, policy 2)",
+            len(self._skip_coordinators),
+        )
+
+    def _teardown_skip_schedule_sync(self) -> None:
+        for coordinator in self._skip_coordinators:
+            unregister_skip_schedule_coordinator(coordinator)
+        self._skip_coordinators = []
+
+    def begin_request(self, request_ids: Sequence[str] = ()) -> None:
         """Open one request's transport generation across every hook."""
         if self._request_active:
             raise RuntimeError("DLO request re-entry is not supported")
         self._request_active = True
+        # Design section 27.3: bind cancellation checks to this request's ids
+        # so a client abort interrupts the forward at a uniform boundary.
+        set_current_request_ids(request_ids)
+        logger.debug(
+            "DLO request begin: ids=%s configured=%s",
+            list(request_ids),
+            abort_channel_configured(),
+        )
+        if self._skip_coordinators:
+            # The observer is installed by CacheDiTBackend.enable, which runs
+            # after the offloader's enable; the first request is the earliest
+            # point where both must be in place.
+            if not skip_decision_observer_installed():
+                raise RuntimeError(
+                    "dlo_part_pipeline + cache_dit requires the cache-dit skip-decision "
+                    "observer, but it was never installed: without it, dynamic block "
+                    "skip would run without the section-24 policy-2 schedule digest "
+                    "sync. Check that the cache_dit backend was enabled on this pipeline."
+                )
+            for coordinator in self._skip_coordinators:
+                coordinator.set_request_generation(self._request_generation)
         for group in self._all_hook_groups:
             for hook in group:
                 hook.set_request_generation(self._request_generation)
@@ -2265,6 +2616,7 @@ class DistributedLayerwiseOffloadBackend(OffloadBackend):
         """Drain in-flight transfers and retire this request's generation."""
         if not self._request_active:
             raise RuntimeError("DLO request lifecycle ended without a matching begin")
+        clear_current_request_ids()
         self._drain_transport()
         if self.data_transport_backend is not None:
             self.data_transport_backend.reset_generation(self._request_generation)
@@ -2272,8 +2624,8 @@ class DistributedLayerwiseOffloadBackend(OffloadBackend):
         self._request_active = False
 
     @contextmanager
-    def request_context(self) -> Iterator[None]:
-        self.begin_request()
+    def request_context(self, request_ids: Sequence[str] = ()) -> Iterator[None]:
+        self.begin_request(request_ids)
         try:
             yield
         finally:
@@ -2301,13 +2653,20 @@ class DistributedLayerwiseOffloadBackend(OffloadBackend):
 
     def get_transport_metrics(self) -> dict[str, Any]:
         """Report the exact Host/device staging cost of the chunked transport."""
-        manifests = [part["manifest"] for part in self._prepared_host_parts.values()]
-        fallback_parts = sum(
-            1 for part in self._prepared_host_parts.values() if part.get("fallback_reason") is not None
-        )
+        if self._part_pipeline_active:
+            manifests = [part["manifest"] for part in self._prepared_host_part_map.values()]
+            fallback_parts = sum(
+                1 for part in self._prepared_host_part_map.values() if part.get("fallback_reason") is not None
+            )
+        else:
+            manifests = [part["manifest"] for part in self._prepared_host_parts.values()]
+            fallback_parts = sum(
+                1 for part in self._prepared_host_parts.values() if part.get("fallback_reason") is not None
+            )
 
         logical_weight_bytes = 0
         max_padded: dict[torch.dtype, int] = {}
+        max_part_padded: dict[str, dict[torch.dtype, int]] = {}
         max_local_chunk: dict[torch.dtype, int] = {}
         for manifest in manifests:
             for dtype_manifest in manifest.dtypes:
@@ -2315,9 +2674,18 @@ class DistributedLayerwiseOffloadBackend(OffloadBackend):
                 logical_weight_bytes += dtype_manifest.total_numel * element_size
                 dtype = dtype_manifest.dtype
                 max_padded[dtype] = max(max_padded.get(dtype, 0), dtype_manifest.padded_numel)
+                part_max = max_part_padded.setdefault(manifest.part_id, {})
+                part_max[dtype] = max(part_max.get(dtype, 0), dtype_manifest.padded_numel)
                 max_local_chunk[dtype] = max(max_local_chunk.get(dtype, 0), dtype_manifest.local_chunk_numel)
 
-        full_output_staging_bytes = 2 * sum(numel * _dtype_size(dtype) for dtype, numel in max_padded.items())
+        if self._part_pipeline_active:
+            # Stage-3 (design section 22): one attention slot + one moe slot,
+            # full-output staging ~= Amax + Emax rather than 2 * Bmax.
+            full_output_staging_bytes = sum(
+                numel * _dtype_size(dtype) for part_max in max_part_padded.values() for dtype, numel in part_max.items()
+            )
+        else:
+            full_output_staging_bytes = 2 * sum(numel * _dtype_size(dtype) for dtype, numel in max_padded.items())
         local_input_staging_bytes = 0
         if self.data_transport_backend is not None and self.data_transport_backend.requires_local_input:
             local_input_staging_bytes = 2 * sum(numel * _dtype_size(dtype) for dtype, numel in max_local_chunk.items())
@@ -2326,19 +2694,28 @@ class DistributedLayerwiseOffloadBackend(OffloadBackend):
         submitted_chunks = 0
         consumer_attaches = 0
         releases = 0
+        cancels = 0
+        poisons = 0
         for group in self._all_hook_groups:
             for hook in group:
-                if hook.transport is None:
+                if isinstance(hook, DistributedPartPipelineOffloadHook):
+                    transports: Any = tuple(hook.part_transports.values())
+                elif hook.transport is None:
                     # Rank-local hooks stream whole blocks without the
                     # chunked transport state machine.
                     continue
-                counters = hook.transport.counters
-                submissions += counters.submissions
-                submitted_chunks += counters.submitted_chunks
-                consumer_attaches += counters.consumer_attaches
-                releases += counters.releases
+                else:
+                    transports = (hook.transport,)
+                for transport in transports:
+                    counters = transport.counters
+                    submissions += counters.submissions
+                    submitted_chunks += counters.submitted_chunks
+                    consumer_attaches += counters.consumer_attaches
+                    releases += counters.releases
+                    cancels += counters.cancels
+                    poisons += counters.poisons
 
-        parts = len(self._prepared_host_parts)
+        parts = len(self._prepared_host_part_map) if self._part_pipeline_active else len(self._prepared_host_parts)
         selection = self.transport_selection
         capability = self.transport_capability
         backend_counters = self.data_transport_backend.counters if self.data_transport_backend is not None else None
@@ -2355,6 +2732,8 @@ class DistributedLayerwiseOffloadBackend(OffloadBackend):
             # allocation through this backend. Keep it separate from the two
             # explicitly owned staging pools instead of double-counting them.
             "collective_workspace_bytes": None,
+            "part_pipeline_active": self._part_pipeline_active,
+            "part_pipeline_fallback_reason": self._part_pipeline_fallback_reason,
             "fallback_parts": fallback_parts,
             "fallback_ratio": (fallback_parts / parts) if parts else 0.0,
             "transport_backend_requested": selection.requested_backend.value if selection is not None else None,
@@ -2382,17 +2761,36 @@ class DistributedLayerwiseOffloadBackend(OffloadBackend):
             "backend_async_works": backend_counters.async_works if backend_counters is not None else 0,
             "backend_chunks": dict(backend_counters.backend_chunks) if backend_counters is not None else {},
             "request_generation": self._request_generation,
+            # When False, all activity counters below stay at zero: the
+            # metrics gate (VLLM_OMNI_DLO_METRICS) was off for this process.
+            "counters_enabled": metrics_enabled(),
             "submissions": submissions,
             "submitted_chunks": submitted_chunks,
             "consumer_attaches": consumer_attaches,
             "releases": releases,
+            "cancels": cancels,
+            "poisons": poisons,
+            # Design sections 24/27.2 observability: per-domain skip-decision
+            # counters and the process-group poison flag.
+            "skip_schedule": {
+                coordinator.domain: {
+                    "decisions": coordinator.counters.decisions,
+                    "skipped": coordinator.counters.skipped,
+                    "digest_compares": coordinator.counters.digest_compares,
+                }
+                for coordinator in self._skip_coordinators
+            },
+            "process_group_poisoned": process_group_poison_reason(),
         }
 
     def reset_transport_counters(self) -> None:
         """Reset request activity counters at a benchmark boundary."""
         for group in self._all_hook_groups:
             for hook in group:
-                if hook.transport is not None:
+                if isinstance(hook, DistributedPartPipelineOffloadHook):
+                    for transport in hook.part_transports.values():
+                        transport.reset_counters()
+                elif hook.transport is not None:
                     hook.transport.reset_counters()
         if self.data_transport_backend is not None:
             self.data_transport_backend.reset_counters()
@@ -2571,11 +2969,18 @@ class DistributedLayerwiseOffloadBackend(OffloadBackend):
         """
         for group_idx, (blocks, _group_path) in enumerate(self._pending_block_groups):
             num_blocks = len(blocks)
-            block_hooks: list[DistributedLayerwiseOffloadHook] = [
-                self._create_block_hook(blocks[-1], blocks[0], shared_buffers)
-            ]
-            for i, block in enumerate(blocks[:-1]):
-                block_hooks.append(self._create_block_hook(block, blocks[(i + 1) % num_blocks], shared_buffers))
+            if self._part_pipeline_active:
+                block_hooks: list[DistributedLayerwiseOffloadHook] = [
+                    self._create_part_block_hook(blocks[-1], blocks[0], shared_buffers)
+                ]
+                for i, block in enumerate(blocks[:-1]):
+                    block_hooks.append(
+                        self._create_part_block_hook(block, blocks[(i + 1) % num_blocks], shared_buffers)
+                    )
+            else:
+                block_hooks = [self._create_block_hook(blocks[-1], blocks[0], shared_buffers)]
+                for i, block in enumerate(blocks[:-1]):
+                    block_hooks.append(self._create_block_hook(block, blocks[(i + 1) % num_blocks], shared_buffers))
 
             # Wire backward references for cache-dit fallback
             for i in range(len(block_hooks)):
@@ -2585,6 +2990,8 @@ class DistributedLayerwiseOffloadBackend(OffloadBackend):
             # This ensures last_hook.current_slot != block0_hook.current_slot,
             # so the circular prefetch (last_hook -> block0) writes to a
             # different slot than block0 reads from.  Correct for ALL N.
+            # (Stage-3 part hooks use fixed per-part slots and ignore
+            # current_slot.)
             for i, hook in enumerate(block_hooks):
                 hook.current_slot = i % 2
                 hook._group_id = group_idx
@@ -2600,6 +3007,74 @@ class DistributedLayerwiseOffloadBackend(OffloadBackend):
             self._all_hook_groups.append(block_hooks)
             self._blocks.append(blocks)
 
+    def _create_part_block_hook(
+        self,
+        module: nn.Module,
+        next_block: nn.Module,
+        shared_buffers: list[dict[torch.dtype, torch.Tensor] | None],
+    ) -> DistributedPartPipelineOffloadHook:
+        """Register one Stage-3 hook that transports *next_block*'s parts."""
+        if self.data_transport_backend is None:
+            raise RuntimeError("Stage-2 data transport backend is not configured")
+        prepared_parts = {
+            part_id: self._prepared_host_part_map[(id(next_block), part_id)]
+            for part_id in (PART_ID_ATTENTION, PART_ID_MOE)
+        }
+        hook = apply_part_pipeline_block_hook(
+            module,
+            next_block,
+            self.device,
+            self.weight_shard_group,
+            self.weight_shard_size,
+            self.weight_shard_rank,
+            copy_stream=self.copy_stream,
+            comm_stream=self.comm_stream,
+            shared_buffers=shared_buffers,
+            shared_chunk_slot_events=self._shared_chunk_slot_events,
+            shared_output_slot_events=self._shared_output_slot_events,
+            shared_slot_owners=self._shared_slot_owners,
+            prepared_host_parts=prepared_parts,
+            h2d_done_events=self._shared_h2d_done_events,
+            transport_done_events=self._shared_transport_done_events,
+            relay_done_events=self._shared_relay_done_events,
+            output_ready_events=self._shared_output_ready_events,
+            last_use_events=self._shared_last_use_events,
+            prefetch_executor=self._prefetch_executor,
+            data_transport_backend=self.data_transport_backend,
+        )
+        # The 'compute' trace marker names the module being computed, not the
+        # block whose weights this hook transports.
+        hook.compute_block_id = self._block_ids[id(module)]
+        hook.set_request_generation(self._request_generation)
+        return hook
+
+    def _allocate_part_shared_buffers(self) -> list[dict[torch.dtype, torch.Tensor] | None]:
+        """Allocate one attention slot and one moe slot (Stage-3, design §22).
+
+        Slot 0 is sized to the largest attention part, slot 1 to the largest
+        moe part, so full-output staging is ``Amax + Emax`` instead of the
+        whole-block ``2 * Bmax``.
+        """
+        slots: list[dict[torch.dtype, torch.Tensor] | None] = [None, None]
+        for slot, part_id in enumerate((PART_ID_ATTENTION, PART_ID_MOE)):
+            max_sizes: dict[torch.dtype, int] = {}
+            for (module_id, manifest_part), manifest in self._planned_part_manifests.items():
+                if manifest_part != part_id:
+                    continue
+                for dtype_manifest in manifest.dtypes:
+                    dtype = dtype_manifest.dtype
+                    max_sizes[dtype] = max(max_sizes.get(dtype, 0), dtype_manifest.padded_numel)
+            gpu_weights: dict[torch.dtype, torch.Tensor] = {}
+            for dtype, total_numel in max_sizes.items():
+                gpu_weights[dtype] = torch.empty(total_numel, dtype=dtype, device=self.device)
+            slots[slot] = gpu_weights
+            logger.info(
+                "Allocated shared %s part slot (max part size: %s)",
+                part_id,
+                {str(k): f"{v * _dtype_size(k) / 1024 / 1024:.1f}MB" for k, v in max_sizes.items()},
+            )
+        return slots
+
     def _bootstrap_first_group(self) -> None:
         """Synchronously materialize block 0 before the first forward."""
         if not self._all_hook_groups:
@@ -2609,6 +3084,13 @@ class DistributedLayerwiseOffloadBackend(OffloadBackend):
             raise RuntimeError("DLO hook ring requires at least two blocks")
         first_producer = group[0]  # tail block -> block 0
         first_consumer = group[1]  # block 0 -> block 1
+        if self._part_pipeline_active:
+            # Only attention_0 must be ready at block start; moe_0 is
+            # submitted by the consumer's pre_forward and overlaps the
+            # attention compute (design section 21).
+            first_producer.prefetch_part_layer(PART_ID_ATTENTION, non_blocking=False)
+            first_consumer.get_part_weights(PART_ID_ATTENTION)
+            return
         first_slot = first_consumer.current_slot
         first_producer.prefetch_layer(slot=first_slot, non_blocking=False)
         first_consumer.get_weights(first_slot)
@@ -2980,8 +3462,12 @@ class DistributedLayerwiseOffloadBackend(OffloadBackend):
             # Host plan must enforce the pin cap and pack every block's Host
             # shard before any hook exists; in the rank-local path hooks
             # collect their own host storage, but the shared device buffers
-            # are sized after every block's metadata is known.
-            self._pending_block_groups.append((list(blocks), dit_name))
+            # are sized after every block's metadata is known.  The group path
+            # carries the blocks-container attribute name: cache-dit's
+            # decision prefix ("<blocks_name>_Fn_*") routes against it for the
+            # section-24 policy-2 skip-schedule digest sync.
+            group_path = f"{dit_name}.{blocks_attr_names[0]}" if blocks_attr_names else dit_name
+            self._pending_block_groups.append((list(blocks), group_path))
 
         if self._resident_blocks:
             self._resident_layer_group = PinnedResidentLayerGroup(
@@ -3009,6 +3495,9 @@ class DistributedLayerwiseOffloadBackend(OffloadBackend):
         # 1. Ownership + stable block ids (small consecutive ints so the trace
         #    analyzer sees contiguous block ranges).
         ownership = self._resolve_chunk_ownership(pipeline)
+
+        # 1b. Stage-3: decide whole-block vs attention/MoE part transport.
+        self._resolve_part_pipeline(ownership)
 
         # Shared slot-group tracker: _shared_slot_group[slot] = group_id
         # that last wrote to that slot.  Group-first hooks use this to
@@ -3058,8 +3547,14 @@ class DistributedLayerwiseOffloadBackend(OffloadBackend):
 
             # 4. Unified allocation sized from the *prepared* manifests (which may
             #    have been rebuilt as WHOLE_BLOCK by the fallback path).
-            prepared_manifests = [part["manifest"] for part in self._prepared_host_parts.values()]
-            unified_buffers = self._allocate_shared_buffers(prepared_manifests)
+            #    Stage-3 part mode allocates one attention slot and one moe
+            #    slot instead of two whole-block slots.
+            if self._part_pipeline_active:
+                prepared_manifests = [part["manifest"] for part in self._prepared_host_part_map.values()]
+                unified_buffers = self._allocate_part_shared_buffers()
+            else:
+                prepared_manifests = [part["manifest"] for part in self._prepared_host_parts.values()]
+                unified_buffers = self._allocate_shared_buffers(prepared_manifests)
             unified_chunk_buffers = None
             if self.data_transport_backend is not None and self.data_transport_backend.requires_local_input:
                 unified_chunk_buffers = self._allocate_shared_chunk_buffers(prepared_manifests)
@@ -3067,7 +3562,8 @@ class DistributedLayerwiseOffloadBackend(OffloadBackend):
 
             # 5. Create the hooks in a circular sliding window:
             #    last block prefetches first block, block i prefetches block (i+1).
-            #    All hooks share 2 global device buffers.
+            #    All hooks share the global device buffers (2 block slots, or one
+            #    attention + one moe part slot in Stage-3 mode).
             self._create_hook_groups(unified_buffers, shared_slot_group, unified_chunk_buffers)
 
         # Prefetch first block of the FIRST module group only.
@@ -3079,6 +3575,20 @@ class DistributedLayerwiseOffloadBackend(OffloadBackend):
         # check — by which point the first group's forward has completed
         # and its buffer slots are free.
         self._bootstrap_first_group()
+
+        # Design section 24, policy 2: with cache-dit active, register the
+        # skip-schedule coordinator that proves FS-group agreement at every
+        # dynamic skip decision.
+        self._setup_skip_schedule_sync()
+
+        # Design section 27.3: enable generation-bound cancellation checks
+        # at forward boundaries (flag file written by the engine proc on
+        # client abort; voted on the FS CPU group for uniformity).
+        configure_abort_channel(
+            os.environ.get(DLO_ABORT_DIR_ENV),
+            self.weight_shard_cpu_group,
+            self.weight_shard_size,
+        )
 
         total_blocks = sum(len(b) for b in self._blocks)
         logger.info(
@@ -3141,6 +3651,8 @@ class DistributedLayerwiseOffloadBackend(OffloadBackend):
         if not self.enabled and not hasattr(self, "_mmap_file_cache"):
             return
 
+        self._teardown_skip_schedule_sync()
+
         if self._using_rank_local_mmap:
             # Staging-slot H2D copies may still be in flight; join them before
             # the mmap sources they read from are released.
@@ -3164,7 +3676,10 @@ class DistributedLayerwiseOffloadBackend(OffloadBackend):
         for group in self._all_hook_groups:
             for hook in group:
                 try:
-                    if hook.transport is not None:
+                    if isinstance(hook, DistributedPartPipelineOffloadHook):
+                        for transport in hook.part_transports.values():
+                            transport.close()
+                    elif hook.transport is not None:
                         hook.transport.close()
                 except BaseException as exc:  # noqa: BLE001
                     if first_error is None:
@@ -3178,7 +3693,10 @@ class DistributedLayerwiseOffloadBackend(OffloadBackend):
 
         for blocks in self._blocks:
             for block in blocks:
-                remove_distributed_block_hook(block)
+                if self._part_pipeline_active:
+                    remove_part_pipeline_block_hook(block)
+                else:
+                    remove_distributed_block_hook(block)
 
         for h in getattr(self, "_on_demand_handles", []):
             h.remove()

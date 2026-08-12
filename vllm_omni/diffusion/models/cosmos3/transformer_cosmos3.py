@@ -38,6 +38,15 @@ from vllm_omni.diffusion.data import OmniDiffusionConfig
 from vllm_omni.diffusion.distributed.sp_plan import SequenceParallelInput, SequenceParallelOutput
 from vllm_omni.diffusion.forward_context import get_forward_context, is_forward_context_available
 from vllm_omni.diffusion.layers.norm import RMSNorm as _VllmRMSNorm
+from vllm_omni.diffusion.offloader.chunked_transport import (
+    BOUNDARY_BLOCK_END,
+    BOUNDARY_BLOCK_START,
+    BOUNDARY_MID_BLOCK,
+    PART_ID_ATTENTION,
+    PART_ID_MOE,
+    BlockWeightUsePlan,
+    WeightPartSpec,
+)
 from vllm_omni.platforms import current_omni_platform
 
 if TYPE_CHECKING:
@@ -860,24 +869,67 @@ class Cosmos3UndDecoderLayer(nn.Module):
             prefix=f"{prefix}.mlp",
         )
 
-    def forward(
+    # Stage-3 DLO part pipeline: attention weights are used from block start
+    # to the mid-block boundary, MoE/FFN weights from the boundary to block
+    # end.  No parameter crosses the boundary, so nothing stays resident.
+    _block_weight_use_plan = BlockWeightUsePlan(
+        parts=(
+            WeightPartSpec(
+                part_id=PART_ID_ATTENTION,
+                module_paths=("input_layernorm", "self_attn"),
+                first_use_boundary=BOUNDARY_BLOCK_START,
+                last_use_boundary=BOUNDARY_MID_BLOCK,
+                allowed_dtypes=(torch.float16, torch.bfloat16, torch.float32),
+            ),
+            WeightPartSpec(
+                part_id=PART_ID_MOE,
+                module_paths=("post_attention_layernorm", "mlp"),
+                first_use_boundary=BOUNDARY_MID_BLOCK,
+                last_use_boundary=BOUNDARY_BLOCK_END,
+                allowed_dtypes=(torch.float16, torch.bfloat16, torch.float32),
+            ),
+        )
+    )
+
+    def forward_attention(
         self,
         hidden_states: torch.Tensor,
         freqs: tuple[torch.Tensor, torch.Tensor],
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        """Returns (hidden_states, K, V) where K/V are for GEN cross-attention."""
+        """Attention phase: returns (hidden_after_attention, K, V)."""
         residual = hidden_states
         hidden_states = self.input_layernorm(hidden_states)
 
         cos, sin = freqs
         attn_out, k, v = self.self_attn(hidden_states, cos, sin)
         hidden_states = residual + attn_out
-
-        residual = hidden_states
-        hidden_states = self.post_attention_layernorm(hidden_states)
-        hidden_states = residual + self.mlp(hidden_states)
-
         return hidden_states, k, v
+
+    def forward_moe(
+        self,
+        attention_out: tuple[torch.Tensor, torch.Tensor, torch.Tensor],
+        hidden_states: torch.Tensor,
+        freqs: tuple[torch.Tensor, torch.Tensor],
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """MoE/FFN phase: consumes forward_attention's output."""
+        del freqs
+        hidden_states, k, v = attention_out
+        residual = hidden_states
+        normed = self.post_attention_layernorm(hidden_states)
+        hidden_states = residual + self.mlp(normed)
+        return hidden_states, k, v
+
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        freqs: tuple[torch.Tensor, torch.Tensor],
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Returns (hidden_states, K, V) where K/V are for GEN cross-attention."""
+        return self.forward_moe(
+            self.forward_attention(hidden_states, freqs),
+            hidden_states,
+            freqs,
+        )
 
 
 class Cosmos3GenDecoderLayer(nn.Module):
@@ -919,7 +971,28 @@ class Cosmos3GenDecoderLayer(nn.Module):
             prefix=f"{prefix}.mlp",
         )
 
-    def forward(
+    # Stage-3 DLO part pipeline: cross-attention (plus its input norm) forms
+    # the attention part; post-attention norm + gated MLP form the moe part.
+    _block_weight_use_plan = BlockWeightUsePlan(
+        parts=(
+            WeightPartSpec(
+                part_id=PART_ID_ATTENTION,
+                module_paths=("input_layernorm", "cross_attention"),
+                first_use_boundary=BOUNDARY_BLOCK_START,
+                last_use_boundary=BOUNDARY_MID_BLOCK,
+                allowed_dtypes=(torch.float16, torch.bfloat16, torch.float32),
+            ),
+            WeightPartSpec(
+                part_id=PART_ID_MOE,
+                module_paths=("post_attention_layernorm", "mlp"),
+                first_use_boundary=BOUNDARY_MID_BLOCK,
+                last_use_boundary=BOUNDARY_BLOCK_END,
+                allowed_dtypes=(torch.float16, torch.bfloat16, torch.float32),
+            ),
+        )
+    )
+
+    def forward_attention(
         self,
         hidden_states: torch.Tensor,
         *,
@@ -932,6 +1005,7 @@ class Cosmos3GenDecoderLayer(nn.Module):
         control_token_sizes: tuple[int, ...] | None = None,
         control_weights: tuple[float, ...] | None = None,
     ) -> torch.Tensor:
+        """Attention phase: input norm + cross-attention + residual."""
         if cached_kv is not None:
             if self.layer_idx is None:
                 raise ValueError("Cosmos3 GEN layer requires layer_idx when cached_kv is provided.")
@@ -953,13 +1027,51 @@ class Cosmos3GenDecoderLayer(nn.Module):
             control_token_sizes=control_token_sizes,
             control_weights=control_weights,
         )
-        hidden_states = residual + hidden_states
+        return residual + hidden_states
 
+    def forward_moe(
+        self,
+        attention_out: torch.Tensor,
+        hidden_states: torch.Tensor,
+        **kwargs: Any,
+    ) -> torch.Tensor:
+        """MoE/FFN phase: post-attention norm + gated MLP + residual."""
+        del hidden_states, kwargs
+        hidden_states = attention_out
         residual = hidden_states
-        hidden_states = self.post_attention_layernorm(hidden_states)
-        hidden_states = residual + self.mlp(hidden_states)
+        normed = self.post_attention_layernorm(hidden_states)
+        return residual + self.mlp(normed)
 
-        return hidden_states
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        *,
+        k_und: torch.Tensor | None = None,
+        v_und: torch.Tensor | None = None,
+        freqs_cos: torch.Tensor | None = None,
+        freqs_sin: torch.Tensor | None = None,
+        cached_kv: list[tuple[torch.Tensor, torch.Tensor]] | None = None,
+        freqs_gen: tuple[torch.Tensor, torch.Tensor] | None = None,
+    ) -> torch.Tensor:
+        attention_out = self.forward_attention(
+            hidden_states,
+            k_und=k_und,
+            v_und=v_und,
+            freqs_cos=freqs_cos,
+            freqs_sin=freqs_sin,
+            cached_kv=cached_kv,
+            freqs_gen=freqs_gen,
+        )
+        return self.forward_moe(
+            attention_out,
+            hidden_states,
+            k_und=k_und,
+            v_und=v_und,
+            freqs_cos=freqs_cos,
+            freqs_sin=freqs_sin,
+            cached_kv=cached_kv,
+            freqs_gen=freqs_gen,
+        )
 
 
 # ---------------------------------------------------------------------------

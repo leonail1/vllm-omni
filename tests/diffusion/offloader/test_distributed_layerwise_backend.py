@@ -1170,6 +1170,14 @@ class TestCrossGroupSharedBuffer:
         hook_a = _make_prepared_hook(block_b)
         hook_a.initialize_hook(block_a)
 
+        def close_trace():
+            # pre_forward opens a profiler range when VLLM_OMNI_DLO_TRACE is
+            # set; this test drives pre_forward directly without post_forward,
+            # so close the range explicitly to keep the two decoupled.
+            if hook_a._compute_trace is not None:
+                hook_a._compute_trace.__exit__(None, None, None)
+                hook_a._compute_trace = None
+
         # Prefetch to make block_a "materialized" (non-empty params)
         hook_a.prefetch_layer(hook_a.current_slot, non_blocking=False)
         assert hook_a.is_materialized
@@ -1189,6 +1197,7 @@ class TestCrossGroupSharedBuffer:
         hook_a._is_group_first = False
         sync_called[0] = False
         hook_a.pre_forward(block_a)
+        close_trace()
         assert not sync_called[0], "Materialized block should not sync-prefetch without _is_group_first"
 
         # Case 2: _is_group_first=True, materialized, slot contaminated
@@ -1197,6 +1206,7 @@ class TestCrossGroupSharedBuffer:
         hook_a._prev_hook = hook_a
         sync_called[0] = False
         hook_a.pre_forward(block_a)
+        close_trace()
         assert sync_called[0], "_is_group_first must force sync-prefetch when slot is contaminated"
 
         # Case 3: _is_group_first=True, slot NOT contaminated (same group owns slot)
@@ -1204,6 +1214,7 @@ class TestCrossGroupSharedBuffer:
         hook_a._shared_slot_group = [hook_a._group_id, -1]
         sync_called[0] = False
         hook_a.pre_forward(block_a)
+        close_trace()
         assert not sync_called[0], "Should skip sync-prefetch when slot_group matches (non-contaminated)"
 
 
@@ -2020,6 +2031,54 @@ class TestConfigValidation:
         with pytest.raises(ValueError, match="requires --dlo-no-use-allgather"):
             OffloadConfig.from_od_config(FakeODConfig())
 
+    def test_part_pipeline_allows_cache_dit(self):
+        """Design section 24, policy 2: cache_dit + part pipeline is allowed."""
+        from vllm_omni.diffusion.offloader.base import OffloadConfig
+
+        class FakeODConfig:
+            enable_cpu_offload = False
+            enable_layerwise_offload = False
+            enable_distributed_layerwise_offload = True
+            dlo_use_allgather = True
+            pin_cpu_memory = True
+            parallel_config = None
+            model = "/fake/path"
+            dlo_part_pipeline = True
+            cache_backend = "cache_dit"
+
+        config = OffloadConfig.from_od_config(FakeODConfig())
+        assert config.dlo_part_pipeline is True
+        assert config.cache_backend == "cache_dit"
+
+    @pytest.mark.parametrize("backend", ["tea_cache", "mag_cache", "step_cache"])
+    def test_part_pipeline_rejects_other_cache_backends(self, backend):
+        """Design section 24, policy 1: non-cache-dit backends stay mutexed."""
+        from vllm_omni.diffusion.offloader.base import OffloadConfig
+
+        class FakeODConfig:
+            enable_cpu_offload = False
+            enable_layerwise_offload = False
+            enable_distributed_layerwise_offload = True
+            dlo_use_allgather = True
+            pin_cpu_memory = True
+            parallel_config = None
+            model = "/fake/path"
+            dlo_part_pipeline = True
+            cache_backend = backend
+
+        with pytest.raises(ValueError, match="only cache_dit is supported"):
+            OffloadConfig.from_od_config(FakeODConfig())
+
+    def test_full_compile_rejects_distributed_layerwise_offload(self):
+        """Design section 26.3: full-model graph capture stays unsupported."""
+        from vllm_omni.diffusion.data import OmniDiffusionConfig
+
+        with pytest.raises(ValueError, match="incompatible with distributed layerwise offload"):
+            OmniDiffusionConfig(
+                diffusion_compile_granularity="full",
+                enable_distributed_layerwise_offload=True,
+            )
+
     def test_num_inference_steps_none_rejected(self):
         """DP multi-concurrency should reject None num_inference_steps."""
         from types import SimpleNamespace
@@ -2255,3 +2314,164 @@ class TestDynamicSlotTracking:
         # pre_forward should override to slot 1
         hook_b.pre_forward(block_b)
         assert hook_b.current_slot == 1, "pre_forward should read _prev_hook._prefetched_slot=1, not keep initial 0"
+
+
+class TestRepeatedEnableDisable:
+    """Stage-4 hardening: repeated enable/disable must leave no residual state."""
+
+    def test_repeated_hook_lifecycle_and_transport_close(self, dist_group, patched_offload_runtime):
+        for cycle in range(3):
+            # Fresh modules each cycle: disable() leaves consumed params as
+            # placeholders, and a real re-enable reloads weights rather than
+            # re-packing from placeholder storage.
+            block = TinyBlock(_make_values(1.0 + cycle))
+            next_block = TinyBlock(_make_values(10.0 + cycle))
+            hook = _make_prepared_hook(next_block)
+            hook.initialize_hook(block)
+            slot = hook.current_slot
+            hook.prefetch_layer(slot, non_blocking=False)
+            hook.get_weights(slot)
+            hook.offload_layer()
+            hook.drain_request()
+            hook.transport.close()
+            # A closed transport rejects further submissions; the next cycle
+            # gets a freshly constructed hook/transport.
+            with pytest.raises(RuntimeError, match="closed"):
+                hook.transport.begin_submission(output_slot=slot, request_generation=0, ready_event=object())
+
+        # After the final disable the consumed block's params are placeholders.
+        assert not hook.is_materialized
+
+    def test_repeated_transport_reset_reopens_cleanly(self):
+        from vllm_omni.diffusion.offloader.chunked_transport import (
+            ChunkedWeightTransport,
+            ChunkMeta,
+            DTypeManifest,
+            PartManifest,
+            SourceLayout,
+            WeightLayout,
+        )
+
+        chunks = tuple(
+            ChunkMeta(chunk_id=i, cpu_offset=i * 4, full_offset=i * 4, valid_numel=4, padded_numel=4, local_numel=4)
+            for i in range(2)
+        )
+        manifest = PartManifest(
+            block_id=0,
+            part_id="attention",
+            weight_shard_size=1,
+            weight_shard_rank=0,
+            chunk_size_bytes=16,
+            alignment_bytes=4,
+            layout=WeightLayout.CHUNK_MAJOR,
+            source_layout=SourceLayout.FS_SHARDED_HOST,
+            dtypes=(
+                DTypeManifest(
+                    dtype=torch.float32,
+                    tensors=(),
+                    chunks=chunks,
+                    total_numel=8,
+                    padded_numel=8,
+                    local_numel=8,
+                    local_chunk_numel=4,
+                    alignment_numel=1,
+                ),
+            ),
+            digest="digest0123456789abcdef",
+        )
+
+        for cycle in range(3):
+            transport = ChunkedWeightTransport(block_id=0, slot_count=2)
+            transport.prepare(manifest, {torch.float32: torch.zeros(8)})
+            ticket = transport.begin_submission(output_slot=0, request_generation=cycle, ready_event=object())
+            transport.mark_ready(ticket)
+            transport.record_last_use(ticket, object())
+            transport.reset()
+            transport.close()
+            assert transport.host_shards == {}
+
+
+class TestPartSplitParity:
+    """Design section 30.5: fallback-to-block must be numerically identical.
+
+    Packing the same tensors as one whole block vs as attention/moe parts must
+    reconstruct bit-identical flat weights; otherwise the fallback path would
+    silently change numerics.
+    """
+
+    def test_part_split_reconstruction_matches_whole_block(self):
+        from vllm_omni.diffusion.offloader.chunked_transport import (
+            BOUNDARY_BLOCK_END,
+            BOUNDARY_BLOCK_START,
+            BOUNDARY_MID_BLOCK,
+            PART_ID_ATTENTION,
+            PART_ID_MOE,
+            BlockWeightUsePlan,
+            WeightPartSpec,
+            reconstruct_full_flat,
+        )
+        from vllm_omni.diffusion.offloader.part_pipeline import split_specs_by_part
+
+        specs = [
+            ("input_layernorm.weight", torch.arange(8, dtype=torch.float32), False),
+            ("cross_attention.to_q.weight", torch.arange(100, 132, dtype=torch.float32), False),
+            ("mlp.gate_proj.weight", torch.arange(200, 216, dtype=torch.float32), False),
+            ("mlp.down_proj.weight", torch.arange(300, 304, dtype=torch.float32), False),
+        ]
+        plan = BlockWeightUsePlan(
+            parts=(
+                WeightPartSpec(
+                    part_id=PART_ID_ATTENTION,
+                    module_paths=("input_layernorm", "cross_attention"),
+                    first_use_boundary=BOUNDARY_BLOCK_START,
+                    last_use_boundary=BOUNDARY_MID_BLOCK,
+                ),
+                WeightPartSpec(
+                    part_id=PART_ID_MOE,
+                    module_paths=("mlp",),
+                    first_use_boundary=BOUNDARY_MID_BLOCK,
+                    last_use_boundary=BOUNDARY_BLOCK_END,
+                ),
+            )
+        )
+        part_specs, resident_specs = split_specs_by_part(specs, plan)
+        assert resident_specs == []
+
+        # Whole-block path: one manifest over every tensor.
+        whole_manifest = build_part_manifest(
+            specs,
+            block_id=0,
+            part_id="block",
+            weight_shard_size=1,
+            weight_shard_rank=0,
+            chunk_size_bytes=64,
+            alignment_bytes=4,
+        )
+        whole_packed = pack_local_shard(specs, whole_manifest, allocator=lambda n, dt: torch.empty(n, dtype=dt))
+
+        # Part path: one manifest per part.
+        part_fulls = {}
+        for part_id, part_spec_list in part_specs.items():
+            manifest = build_part_manifest(
+                part_spec_list,
+                block_id=0,
+                part_id=part_id,
+                weight_shard_size=1,
+                weight_shard_rank=0,
+                chunk_size_bytes=64,
+                alignment_bytes=4,
+            )
+            packed = pack_local_shard(part_spec_list, manifest, allocator=lambda n, dt: torch.empty(n, dtype=dt))
+            part_fulls[part_id] = reconstruct_full_flat(
+                [packed[torch.float32]], manifest.dtypes[0], layout=manifest.layout
+            )
+
+        whole_full = reconstruct_full_flat(
+            [whole_packed[torch.float32]], whole_manifest.dtypes[0], layout=whole_manifest.layout
+        )
+
+        # Every part reconstruction is a contiguous slice of the whole-block
+        # reconstruction (split preserves the declaration order).
+        attn_n = part_fulls[PART_ID_ATTENTION].numel()
+        assert torch.equal(whole_full[:attn_n], part_fulls[PART_ID_ATTENTION])
+        assert torch.equal(whole_full[attn_n:], part_fulls[PART_ID_MOE])
