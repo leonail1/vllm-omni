@@ -751,6 +751,28 @@ class OmniServeCommand(CLISubcommand):
             "load time; 'whole_block_fallback' degrades the engine to pageable "
             "whole-block transport.",
         )
+        omni_config_group.add_argument(
+            "--dlo-transport-backend",
+            choices=(
+                "auto",
+                "pair_copy",
+                "group_persistent",
+                "group_scatter_ag",
+                "group_pipeline_memcpy",
+            ),
+            default="auto",
+            help="Stage-2 DLO data-plane backend (default: auto).",
+        )
+        omni_config_group.add_argument(
+            "--dlo-transport-source-layout",
+            choices=(
+                "fs_sharded_host",
+                "pair_leader_full_host",
+                "group_owner_full_host",
+            ),
+            default="fs_sharded_host",
+            help="Host source contract for the selected Stage-2 DLO backend.",
+        )
         # Video model parameters (e.g., Wan2.2) - engine-level
         omni_config_group.add_argument(
             "--boundary-ratio",

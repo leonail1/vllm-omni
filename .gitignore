@@ -252,6 +252,7 @@ datasets/
 outputs/
 !vllm_omni/outputs/
 results/
+设计文档.md
 generated/
 output_*/
 /tests/e2e/accuracy/artifacts/

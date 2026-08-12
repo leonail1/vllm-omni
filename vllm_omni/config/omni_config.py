@@ -699,6 +699,8 @@ class _DiffusionConfigProjection:
     dlo_chunk_size_mb: int = 64
     dlo_pin_budget_gb: float | None = None
     dlo_pin_failure_policy: str = "fail"
+    dlo_transport_backend: str = "auto"
+    dlo_transport_source_layout: str = "fs_sharded_host"
     pin_cpu_memory: bool = True
     diffusion_compile_granularity: Literal["regional", "full"] = "regional"
     diffusion_compile_dynamic: bool = Field(default=True, strict=True)

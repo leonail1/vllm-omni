@@ -47,6 +47,21 @@ class WeightLayout(str, Enum):
     WHOLE_BLOCK = "whole_block"
 
 
+class SourceLayout(str, Enum):
+    FS_SHARDED_HOST = "fs_sharded_host"
+    PAIR_LEADER_FULL_HOST = "pair_leader_full_host"
+    GROUP_OWNER_FULL_HOST = "group_owner_full_host"
+
+
+class TransportBackendKind(str, Enum):
+    AUTO = "auto"
+    REFERENCE = "reference"
+    PAIR_COPY = "pair_copy"
+    GROUP_PERSISTENT = "group_persistent"
+    GROUP_SCATTER_AG = "group_scatter_ag"
+    GROUP_PIPELINE_MEMCPY = "group_pipeline_memcpy"
+
+
 class PinFailurePolicy(str, Enum):
     FAIL = "fail"
     WHOLE_BLOCK_FALLBACK = "whole_block_fallback"
@@ -109,16 +124,29 @@ class PartManifest:
     chunk_size_bytes: int
     alignment_bytes: int
     layout: WeightLayout
+    source_layout: SourceLayout
     dtypes: tuple[DTypeManifest, ...]
     digest: str
 
     @property
     def pinned_bytes(self) -> int:
-        return sum(dtype_manifest.pinned_bytes for dtype_manifest in self.dtypes)
+        return sum(
+            self.source_numel(dtype_manifest) * dtype_element_size(dtype_manifest.dtype)
+            for dtype_manifest in self.dtypes
+        )
 
     @property
     def chunk_count(self) -> int:
         return sum(len(dtype_manifest.chunks) for dtype_manifest in self.dtypes)
+
+    def source_numel(self, dtype_manifest: DTypeManifest) -> int:
+        if self.source_layout is SourceLayout.FS_SHARDED_HOST:
+            return dtype_manifest.local_numel
+        if self.source_layout is SourceLayout.PAIR_LEADER_FULL_HOST:
+            return dtype_manifest.padded_numel if self.weight_shard_rank % 2 == 0 else 0
+        if self.source_layout is SourceLayout.GROUP_OWNER_FULL_HOST:
+            return dtype_manifest.padded_numel if self.weight_shard_rank == 0 else 0
+        raise AssertionError(f"unhandled source layout: {self.source_layout}")
 
 
 @dataclass
@@ -197,6 +225,7 @@ def build_part_manifest(
     chunk_size_bytes: int,
     alignment_bytes: int = 256,
     layout: WeightLayout = WeightLayout.CHUNK_MAJOR,
+    source_layout: SourceLayout = SourceLayout.FS_SHARDED_HOST,
 ) -> PartManifest:
     if not 0 <= weight_shard_rank < weight_shard_size:
         raise ValueError(f"weight_shard_rank={weight_shard_rank} is outside [0, {weight_shard_size})")
@@ -295,6 +324,7 @@ def build_part_manifest(
         "chunk_size_bytes": chunk_size_bytes,
         "alignment_bytes": alignment_bytes,
         "layout": layout.value,
+        "source_layout": source_layout.value,
         "dtypes": [
             {
                 "dtype": str(dtype_manifest.dtype),
@@ -326,6 +356,7 @@ def build_part_manifest(
         chunk_size_bytes=chunk_size_bytes,
         alignment_bytes=alignment_bytes,
         layout=layout,
+        source_layout=source_layout,
         dtypes=tuple(dtype_manifests),
         digest=digest,
     )
@@ -347,10 +378,27 @@ def pack_local_shard(
     packed: dict[torch.dtype, torch.Tensor] = {}
 
     for dtype_manifest in manifest.dtypes:
-        local = allocator(dtype_manifest.local_numel, dtype_manifest.dtype)
+        source_numel = manifest.source_numel(dtype_manifest)
+        local = allocator(source_numel, dtype_manifest.dtype)
         if local.device.type != "cpu":
             raise ValueError(f"pinned shard allocator returned non-CPU tensor: {local.device}")
         local.zero_()
+
+        if source_numel == 0:
+            packed[dtype_manifest.dtype] = local
+            continue
+
+        if manifest.source_layout is not SourceLayout.FS_SHARDED_HOST:
+            _copy_flat_range(
+                local,
+                dst_offset=0,
+                source_begin=0,
+                source_end=dtype_manifest.total_numel,
+                tensor_metas=dtype_manifest.tensors,
+                sources=sources,
+            )
+            packed[dtype_manifest.dtype] = local
+            continue
 
         if manifest.layout is WeightLayout.WHOLE_BLOCK:
             chunk = dtype_manifest.chunks[0]
@@ -608,7 +656,7 @@ class ChunkedWeightTransport:
             raise ValueError(
                 f"manifest block_id={manifest.block_id} does not match transport block_id={self.state.block_id}"
             )
-        expected = {dtype_manifest.dtype: dtype_manifest.local_numel for dtype_manifest in manifest.dtypes}
+        expected = {dtype_manifest.dtype: manifest.source_numel(dtype_manifest) for dtype_manifest in manifest.dtypes}
         actual = {dtype: shard.numel() for dtype, shard in host_shards.items()}
         if actual != expected:
             raise ValueError(f"Host shard sizes do not match manifest: expected={expected}, actual={actual}")

@@ -26,8 +26,10 @@ from __future__ import annotations
 import concurrent.futures
 import contextlib
 import os
+import socket
 from collections.abc import Iterator
 from contextlib import contextmanager
+from dataclasses import replace
 from itertools import chain
 from typing import Any
 
@@ -49,7 +51,9 @@ from .chunked_transport import (
     PartManifest,
     PinBudget,
     PinFailurePolicy,
+    SourceLayout,
     TransferTicket,
+    TransportBackendKind,
     WeightLayout,
     build_part_manifest,
     is_chunk_transport_supported,
@@ -67,6 +71,16 @@ from .tensor_utils import (
     is_materialized_tensor,
     make_offload_placeholder,
     set_tensor_storage,
+)
+from .weight_transport_backend import (
+    ChunkCompletion,
+    ChunkEvents,
+    TransportCapability,
+    TransportSelection,
+    TransportStreams,
+    WeightTransportBackend,
+    create_transport_backend,
+    select_transport,
 )
 
 logger = init_logger(__name__)
@@ -123,12 +137,14 @@ class DistributedLayerwiseOffloadHook(ModelHook):
         prepared_host_part: dict[str, Any] | None = None,
         h2d_done_events: list[Any] | None = None,
         transport_done_events: list[Any] | None = None,
+        relay_done_events: list[Any] | None = None,
         output_ready_events: list[Any] | None = None,
         last_use_events: list[Any | None] | None = None,
         prefetch_executor: concurrent.futures.Executor | None = None,
         rank_local_mmap: bool = False,
         pin_memory: bool = True,
         tensor_transforms: dict[int, Any] | None = None,
+        data_transport_backend: WeightTransportBackend | None = None,
     ):
         assert isinstance(next_block, nn.Module), "transformer block must be type `torch.nn.Module`"
 
@@ -137,6 +153,8 @@ class DistributedLayerwiseOffloadHook(ModelHook):
         self.weight_shard_group = weight_shard_group
         self.weight_shard_size = weight_shard_size
         self.weight_shard_rank = weight_shard_rank
+
+        self.data_transport_backend = data_transport_backend
 
         self.copy_stream = copy_stream or current_omni_platform.Stream()
         self.comm_stream = comm_stream or current_omni_platform.Stream()
@@ -148,6 +166,10 @@ class DistributedLayerwiseOffloadHook(ModelHook):
         # loader supplied a checkpoint_mmap plan, otherwise a private pinned
         # copy via _shard_and_pin (the standard loader path).
         self.rank_local = prepared_host_part is None
+        if not self.rank_local and data_transport_backend is None:
+            # The sharded path drives every transfer through the Stage-2
+            # transport backend; rank-local hooks never touch it.
+            raise RuntimeError("data_transport_backend is required")
         self.rank_local_mmap = rank_local_mmap
         self.pin_memory = pin_memory
         self.tensor_transforms = tensor_transforms or {}
@@ -219,6 +241,10 @@ class DistributedLayerwiseOffloadHook(ModelHook):
         self._transport_done_events: list[Any] = transport_done_events or [
             current_omni_platform.Event() for _ in range(2)
         ]
+        # Pipeline relays receive a chunk on one hop stream and forward it on
+        # another. Keep the receive dependency distinct from final completion.
+        # Only GROUP_PIPELINE_MEMCPY backend needs these events.
+        self._relay_done_events: list[Any] = relay_done_events or []
         # Recorded on the main thread immediately before async submit.  The
         # worker waits on this event instead of calling wait_stream() against
         # a compute stream that the main thread is concurrently appending to.
@@ -749,64 +775,68 @@ class DistributedLayerwiseOffloadHook(ModelHook):
                         gw[: cpu_shard.numel()].copy_(cpu_shard, non_blocking=non_blocking)
                 evt.record(self.copy_stream)
         else:
-            shard_bufs = self.gpu_shard_buffers
-            assert len(shard_bufs) == 2, "DLO requires exactly two local chunk slots"
-            assert shard_bufs[0] is not None and shard_bufs[1] is not None, "chunk buffers not allocated"
-
             if non_blocking:
-                for _dtype, _cpu_shard in self.cpu_shards.items():
-                    if not _cpu_shard.is_pinned():
+                for dtype, cpu_source in self.cpu_shards.items():
+                    if cpu_source.numel() and not cpu_source.is_pinned():
                         raise RuntimeError(
-                            f"chunk H2D requires pinned Host shard for block {self.block_id} "
-                            f"dtype={_dtype}; tensor is not pinned. Async overlap is unsafe "
+                            f"chunk H2D requires pinned Host source for block {self.block_id} "
+                            f"dtype={dtype}; tensor is not pinned. Async overlap is unsafe "
                             "with pageable source — set dlo_pin_failure_policy=whole_block_fallback "
                             "to allow pageable fallback, or ensure pin_cpu_memory=True."
                         )
+
+            streams = TransportStreams(copy=self.copy_stream, communication=self.comm_stream)
+            self.data_transport_backend.begin_part(streams, self._output_slot_events[slot])
+            completions: list[ChunkCompletion] = []
+            shard_bufs = self.gpu_shard_buffers
 
             chunk_specs = [
                 (dtype_manifest.dtype, chunk)
                 for dtype_manifest in self.manifest.dtypes
                 for chunk in dtype_manifest.chunks
             ]
-
-            last_use = self._output_slot_events[slot]
-            if last_use is not None:
-                self.comm_stream.wait_event(last_use)
-
             for transfer_index, (dtype, chunk) in enumerate(chunk_specs):
                 input_slot = transfer_index % 2
-                reuse_event = self._chunk_slot_events[input_slot]
-                h2d_done = self._h2d_done_events[input_slot]
-                transport_done = self._transport_done_events[input_slot]
-                cpu_shard = self.cpu_shards[dtype]
+                cpu_source = self.cpu_shards[dtype]
+                if self.manifest.source_layout is SourceLayout.FS_SHARDED_HOST:
+                    source = cpu_source[chunk.cpu_offset : chunk.cpu_offset + chunk.local_numel]
+                elif cpu_source.numel():
+                    source = cpu_source[chunk.full_offset : chunk.full_offset + chunk.padded_numel]
+                else:
+                    source = None
 
-                # The prior AllGather must finish reading this input slot
-                # before the next H2D overwrites it.
-                if reuse_event is not None:
-                    self.copy_stream.wait_event(reuse_event)
-                with current_omni_platform.stream(self.copy_stream):
-                    with self._trace_range("h2d", chunk.chunk_id):
-                        local_input = shard_bufs[input_slot][dtype][: chunk.local_numel]
-                        local_input.copy_(
-                            cpu_shard[chunk.cpu_offset : chunk.cpu_offset + chunk.local_numel],
-                            non_blocking=non_blocking,
-                        )
-                    h2d_done.record(self.copy_stream)
+                local_input = None
+                if self.data_transport_backend.requires_local_input:
+                    if len(shard_bufs) != 2 or shard_bufs[0] is None or shard_bufs[1] is None:
+                        raise RuntimeError("selected transport backend requires two local chunk input buffers")
+                    local_input = shard_bufs[input_slot][dtype][: chunk.local_numel]
 
-                self.comm_stream.wait_event(h2d_done)
-                with current_omni_platform.stream(self.comm_stream):
-                    with self._trace_range("all_gather", chunk.chunk_id):
-                        output = gpu_weights[dtype][chunk.full_offset : chunk.full_offset + chunk.padded_numel]
-                        torch.distributed.all_gather_into_tensor(
-                            output,
-                            local_input,
-                            group=self.weight_shard_group,
-                        )
-                    transport_done.record(self.comm_stream)
-                self._chunk_slot_events[input_slot] = transport_done
+                completion = self.data_transport_backend.submit_chunk(
+                    source=source,
+                    local_input=local_input,
+                    full_output=gpu_weights[dtype][chunk.full_offset : chunk.full_offset + chunk.padded_numel],
+                    chunk_meta=chunk,
+                    streams=streams,
+                    events=ChunkEvents(
+                        h2d_done=self._h2d_done_events[input_slot],
+                        transport_done=self._transport_done_events[input_slot],
+                        input_reusable=self._chunk_slot_events[input_slot],
+                        relay_done=self._relay_done_events[input_slot] if self._relay_done_events else None,
+                    ),
+                    group=self.weight_shard_group,
+                    generation=self._request_generation,
+                    non_blocking=non_blocking,
+                    trace=lambda kind, chunk_id=chunk.chunk_id: self._trace_range(kind, chunk_id),
+                )
+                completions.append(completion)
+                if self.data_transport_backend.requires_local_input:
+                    self._chunk_slot_events[input_slot] = completion.event
 
-            with current_omni_platform.stream(self.comm_stream):
-                evt.record(self.comm_stream)
+            self.data_transport_backend.finalize_part(
+                completions,
+                ready_event=evt,
+                streams=streams,
+            )
 
         self.ready_events[slot] = evt
         self._prefetch_done = evt
@@ -1139,12 +1169,14 @@ def apply_distributed_block_hook(
     prepared_host_part: dict[str, Any] | None = None,
     h2d_done_events: list[Any] | None = None,
     transport_done_events: list[Any] | None = None,
+    relay_done_events: list[Any] | None = None,
     output_ready_events: list[Any] | None = None,
     last_use_events: list[Any | None] | None = None,
     prefetch_executor: concurrent.futures.Executor | None = None,
     rank_local_mmap: bool = False,
     pin_memory: bool = True,
     tensor_transforms: dict[int, Any] | None = None,
+    data_transport_backend: WeightTransportBackend | None = None,
 ) -> DistributedLayerwiseOffloadHook:
     """Register a DistributedLayerwiseOffloadHook on *module*."""
     registry = HookRegistry.get_or_create(module)
@@ -1163,12 +1195,14 @@ def apply_distributed_block_hook(
         prepared_host_part=prepared_host_part,
         h2d_done_events=h2d_done_events,
         transport_done_events=transport_done_events,
+        relay_done_events=relay_done_events,
         output_ready_events=output_ready_events,
         last_use_events=last_use_events,
         prefetch_executor=prefetch_executor,
         rank_local_mmap=rank_local_mmap,
         pin_memory=pin_memory,
         tensor_transforms=tensor_transforms,
+        data_transport_backend=data_transport_backend,
     )
     registry.register_hook(DistributedLayerwiseOffloadHook._HOOK_NAME, hook)
     return hook
@@ -1386,6 +1420,10 @@ class DistributedLayerwiseOffloadBackend(OffloadBackend):
         # this), so we do not attempt a fallback.
         self.weight_shard_size: int = max(1, int(getattr(config, "weight_shard_size", 1) or 1))
         self.weight_shard_rank: int = int(getattr(config, "weight_shard_rank", 0) or 0)
+        self.weight_shard_ranks: tuple[int, ...] = tuple(range(self.weight_shard_size))
+        self.transport_capability: TransportCapability | None = None
+        self.transport_selection: TransportSelection | None = None
+        self.data_transport_backend: WeightTransportBackend | None = None
 
         self._blocks: list[list[nn.Module]] = []
         self._all_hook_groups: list[list[DistributedLayerwiseOffloadHook]] = []
@@ -1410,6 +1448,7 @@ class DistributedLayerwiseOffloadBackend(OffloadBackend):
         # Shared (per-engine) event arrays handed to every hook.
         self._shared_h2d_done_events: list[Any] = []
         self._shared_transport_done_events: list[Any] = []
+        self._shared_relay_done_events: list[Any] = []
         self._shared_output_ready_events: list[Any] = []
         self._shared_last_use_events: list[Any | None] = [None, None]
         self._shared_chunk_slot_events: list[Any | None] = [None, None]
@@ -1644,6 +1683,7 @@ class DistributedLayerwiseOffloadBackend(OffloadBackend):
             self.weight_shard_group = None
             self.weight_shard_cpu_group = None
             self.weight_shard_rank = 0
+            self.weight_shard_ranks = (0,)
             self._publish_weight_shard_config()
             return
 
@@ -1720,6 +1760,7 @@ class DistributedLayerwiseOffloadBackend(OffloadBackend):
         row_start = global_rank - global_rank % shard
         self.weight_shard_group, self.weight_shard_cpu_group = row_groups[row_start]
         self.weight_shard_rank = global_rank % shard
+        self.weight_shard_ranks = tuple(range(row_start, row_start + shard))
         self._publish_weight_shard_config()
 
         logger.info(
@@ -1736,6 +1777,170 @@ class DistributedLayerwiseOffloadBackend(OffloadBackend):
         self.config.weight_shard_rank = self.weight_shard_rank
         self.config.weight_shard_group = self.weight_shard_group
         self.config.weight_shard_cpu_group = self.weight_shard_cpu_group
+
+    def _probe_transport_capability(self) -> TransportCapability:
+        """Agree one topology/capability view across the current FS row."""
+        if self.weight_shard_size <= 1:
+            return TransportCapability(
+                world_size=1,
+                rank=0,
+                global_ranks=self.weight_shard_ranks,
+                same_host=True,
+                p2p_supported=False,
+                topology="single_rank",
+            )
+
+        if self.weight_shard_group is not None:
+            try:
+                self.weight_shard_ranks = tuple(torch.distributed.get_process_group_ranks(self.weight_shard_group))
+            except Exception as exc:
+                raise RuntimeError("cannot resolve global ranks for the DLO FS transport group") from exc
+        if len(self.weight_shard_ranks) != self.weight_shard_size:
+            raise RuntimeError(
+                "DLO FS transport rank count does not match weight_shard_size: "
+                f"ranks={self.weight_shard_ranks}, size={self.weight_shard_size}"
+            )
+
+        cpu_group = self.weight_shard_cpu_group
+        if cpu_group is None:
+            raise RuntimeError("Stage-2 transport capability probe requires the FS CPU process group")
+        hostnames: list[Any] = [None] * self.weight_shard_size
+        torch.distributed.all_gather_object(hostnames, socket.gethostname(), group=cpu_group)
+        same_host = len(set(hostnames)) == 1
+
+        local_p2p_row = [False] * self.weight_shard_size
+        if same_host and hasattr(torch.distributed, "batch_isend_irecv"):
+            accelerator = getattr(torch, self.device.type, None)
+            can_access_peer = getattr(accelerator, "can_device_access_peer", None)
+            if callable(can_access_peer):
+                device_count = current_omni_platform.get_device_count()
+                current_device = self.device.index
+                if current_device is None and hasattr(accelerator, "current_device"):
+                    current_device = int(accelerator.current_device())
+                if current_device is not None and device_count >= self.weight_shard_size:
+                    peer_devices = [rank % device_count for rank in self.weight_shard_ranks]
+                    try:
+                        local_p2p_row = [
+                            peer == current_device or bool(can_access_peer(current_device, peer))
+                            for peer in peer_devices
+                        ]
+                    except Exception:
+                        logger.warning("DLO P2P capability probe failed on rank %d", self.weight_shard_rank)
+                        local_p2p_row = [False] * self.weight_shard_size
+
+        gathered_rows: list[Any] = [None] * self.weight_shard_size
+        torch.distributed.all_gather_object(gathered_rows, tuple(local_p2p_row), group=cpu_group)
+        p2p_matrix = tuple(tuple(bool(edge) for edge in row) for row in gathered_rows)
+        p2p_supported = bool(p2p_matrix) and all(all(row) for row in p2p_matrix)
+        native_persistent = bool(
+            self.device.type == "npu"
+            and hasattr(torch, "npu")
+            and hasattr(torch.npu, "NPUGraph")
+            and hasattr(torch.npu, "graph")
+        )
+        topology = "same_host_direct_p2p" if p2p_supported else ("same_host" if same_host else "multi_host")
+        return TransportCapability(
+            world_size=self.weight_shard_size,
+            rank=self.weight_shard_rank,
+            global_ranks=self.weight_shard_ranks,
+            same_host=same_host,
+            p2p_supported=p2p_supported,
+            p2p_matrix=p2p_matrix,
+            pair_ranks=tuple((rank, rank + 1) for rank in range(0, self.weight_shard_size, 2)),
+            pipeline_ranks=tuple(range(self.weight_shard_size)),
+            native_persistent=native_persistent,
+            topology=topology,
+        )
+
+    def _configure_transport_backend(self) -> None:
+        self.transport_capability = self._probe_transport_capability()
+        requested_backend = TransportBackendKind(
+            getattr(self.config, "dlo_transport_backend", TransportBackendKind.AUTO.value)
+        )
+        requested_source = SourceLayout(
+            getattr(
+                self.config,
+                "dlo_transport_source_layout",
+                SourceLayout.FS_SHARDED_HOST.value,
+            )
+        )
+        self.transport_selection = select_transport(
+            requested_backend,
+            requested_source,
+            self.transport_capability,
+        )
+        if self.transport_selection.effective_backend in (
+            TransportBackendKind.PAIR_COPY,
+            TransportBackendKind.GROUP_PIPELINE_MEMCPY,
+        ):
+            # Subgroup creation only attaches communicators; it cannot change
+            # the selection, so there is no need to re-select afterwards.
+            self.transport_capability = self._create_transport_subgroups(
+                self.transport_capability,
+                self.transport_selection.effective_backend,
+            )
+        self.data_transport_backend = create_transport_backend(
+            self.transport_selection,
+            self.transport_capability,
+        )
+        if self.transport_selection.fallback_reason is not None:
+            logger.warning("DLO Stage-2 transport fallback: %s", self.transport_selection.fallback_reason)
+        logger.info(
+            "DLO Stage-2 transport: requested=%s effective=%s source=%s topology=%s",
+            requested_backend.value,
+            self.transport_selection.effective_backend.value,
+            self.transport_selection.effective_source_layout.value,
+            self.transport_capability.topology,
+        )
+
+    def _create_transport_subgroups(
+        self,
+        capability: TransportCapability,
+        backend: TransportBackendKind,
+    ) -> TransportCapability:
+        """Create pair/pipeline communicators for P2P backends."""
+        if not capability.p2p_supported:
+            return capability
+        if not torch.distributed.is_initialized():
+            raise RuntimeError("distributed backend must be initialized to create transport subgroups")
+
+        # For 2-rank groups, reuse the main FS group
+        if capability.world_size == 2:
+            if backend is TransportBackendKind.PAIR_COPY:
+                return replace(capability, pair_group=self.weight_shard_group)
+            if backend is TransportBackendKind.GROUP_PIPELINE_MEMCPY:
+                return replace(capability, pipeline_hop_groups=(self.weight_shard_group,))
+            return capability
+
+        # torch.distributed.new_group is collective over the world group:
+        # every rank creates every pair/hop group in the same order, then
+        # keeps only the groups it belongs to.
+        if backend is TransportBackendKind.PAIR_COPY:
+            pair_ranks = capability.pair_ranks or tuple((r, r + 1) for r in range(0, capability.world_size, 2))
+            my_pair = next((p for p in pair_ranks if capability.rank in p), None)
+            if my_pair is None:
+                raise RuntimeError(f"rank {capability.rank} not assigned to any pair")
+            pair_groups = {
+                pair: torch.distributed.new_group(ranks=[capability.global_ranks[i] for i in pair])
+                for pair in pair_ranks
+            }
+            return replace(capability, pair_group=pair_groups[my_pair])
+
+        if backend is TransportBackendKind.GROUP_PIPELINE_MEMCPY:
+            order = capability.pipeline_ranks or tuple(range(capability.world_size))
+            hops = tuple(zip(order, order[1:]))
+            hop_groups = {
+                hop: torch.distributed.new_group(
+                    ranks=[capability.global_ranks[hop[0]], capability.global_ranks[hop[1]]]
+                )
+                for hop in hops
+            }
+            return replace(
+                capability,
+                pipeline_hop_groups=tuple(hop_groups[hop] if capability.rank in hop else None for hop in hops),
+            )
+
+        return capability
 
     # ------------------------------------------------------------------ #
     #  Host plan and Host storage                                         #
@@ -1803,6 +2008,8 @@ class DistributedLayerwiseOffloadBackend(OffloadBackend):
 
     def _plan_chunk_manifests(self, ownership: ChunkOwnership) -> None:
         """Build every final layout and enforce the pin cap before allocation."""
+        if self.transport_selection is None:
+            raise RuntimeError("transport backend must be selected before Host planning")
         self.pin_budget = PinBudget(limit_bytes=self.config.dlo_pin_budget_bytes)
         policy = self._pin_failure_policy
         self._planned_manifests = {}
@@ -1819,6 +2026,7 @@ class DistributedLayerwiseOffloadBackend(OffloadBackend):
                 chunk_size_bytes=self.config.chunk_size_bytes,
                 alignment_bytes=self._alignment_bytes,
                 layout=WeightLayout.CHUNK_MAJOR,
+                source_layout=self.transport_selection.effective_source_layout,
             )
             try:
                 self.pin_budget.plan(block.path, manifest.pinned_bytes)
@@ -1926,6 +2134,7 @@ class DistributedLayerwiseOffloadBackend(OffloadBackend):
                     chunk_size_bytes=self.config.chunk_size_bytes,
                     alignment_bytes=self._alignment_bytes,
                     layout=WeightLayout.WHOLE_BLOCK,
+                    source_layout=self.transport_selection.effective_source_layout,
                 )
                 cpu_shards = pack_local_shard(
                     chunk_specs,
@@ -2057,6 +2266,8 @@ class DistributedLayerwiseOffloadBackend(OffloadBackend):
         if not self._request_active:
             raise RuntimeError("DLO request lifecycle ended without a matching begin")
         self._drain_transport()
+        if self.data_transport_backend is not None:
+            self.data_transport_backend.reset_generation(self._request_generation)
         self._request_generation += 1
         self._request_active = False
 
@@ -2107,7 +2318,9 @@ class DistributedLayerwiseOffloadBackend(OffloadBackend):
                 max_local_chunk[dtype] = max(max_local_chunk.get(dtype, 0), dtype_manifest.local_chunk_numel)
 
         full_output_staging_bytes = 2 * sum(numel * _dtype_size(dtype) for dtype, numel in max_padded.items())
-        local_input_staging_bytes = 2 * sum(numel * _dtype_size(dtype) for dtype, numel in max_local_chunk.items())
+        local_input_staging_bytes = 0
+        if self.data_transport_backend is not None and self.data_transport_backend.requires_local_input:
+            local_input_staging_bytes = 2 * sum(numel * _dtype_size(dtype) for dtype, numel in max_local_chunk.items())
 
         submissions = 0
         submitted_chunks = 0
@@ -2126,6 +2339,9 @@ class DistributedLayerwiseOffloadBackend(OffloadBackend):
                 releases += counters.releases
 
         parts = len(self._prepared_host_parts)
+        selection = self.transport_selection
+        capability = self.transport_capability
+        backend_counters = self.data_transport_backend.counters if self.data_transport_backend is not None else None
         return {
             "weight_shard_size": self.weight_shard_size,
             "parts": parts,
@@ -2141,6 +2357,30 @@ class DistributedLayerwiseOffloadBackend(OffloadBackend):
             "collective_workspace_bytes": None,
             "fallback_parts": fallback_parts,
             "fallback_ratio": (fallback_parts / parts) if parts else 0.0,
+            "transport_backend_requested": selection.requested_backend.value if selection is not None else None,
+            "transport_backend_effective": selection.effective_backend.value if selection is not None else None,
+            "transport_source_layout_requested": (
+                selection.requested_source_layout.value if selection is not None else None
+            ),
+            "transport_source_layout_effective": (
+                selection.effective_source_layout.value if selection is not None else None
+            ),
+            "transport_backend_fallback_reason": selection.fallback_reason if selection is not None else None,
+            "transport_topology": capability.topology if capability is not None else None,
+            "transport_p2p_supported": capability.p2p_supported if capability is not None else False,
+            "transport_native_persistent": capability.native_persistent if capability is not None else False,
+            "transport_p2p_matrix": capability.p2p_matrix if capability is not None else (),
+            "transport_pair_ranks": capability.pair_ranks if capability is not None else (),
+            "transport_pipeline_ranks": capability.pipeline_ranks if capability is not None else (),
+            "backend_submitted_parts": backend_counters.submitted_parts if backend_counters is not None else 0,
+            "backend_submitted_chunks": backend_counters.submitted_chunks if backend_counters is not None else 0,
+            "backend_host_h2d_bytes": backend_counters.host_h2d_bytes if backend_counters is not None else 0,
+            "backend_fabric_bytes": backend_counters.fabric_bytes if backend_counters is not None else 0,
+            "backend_p2p_hops": backend_counters.p2p_hops if backend_counters is not None else 0,
+            "backend_schedule_builds": backend_counters.schedule_builds if backend_counters is not None else 0,
+            "backend_schedule_replays": backend_counters.schedule_replays if backend_counters is not None else 0,
+            "backend_async_works": backend_counters.async_works if backend_counters is not None else 0,
+            "backend_chunks": dict(backend_counters.backend_chunks) if backend_counters is not None else {},
             "request_generation": self._request_generation,
             "submissions": submissions,
             "submitted_chunks": submitted_chunks,
@@ -2154,6 +2394,8 @@ class DistributedLayerwiseOffloadBackend(OffloadBackend):
             for hook in group:
                 if hook.transport is not None:
                     hook.transport.reset_counters()
+        if self.data_transport_backend is not None:
+            self.data_transport_backend.reset_counters()
 
     # ------------------------------------------------------------------ #
     #  Ownership, hook construction, shared events                        #
@@ -2279,6 +2521,8 @@ class DistributedLayerwiseOffloadBackend(OffloadBackend):
         """Register one hook that transports *next_block* into a shared slot."""
         # Rank-local hooks collect their own host storage in initialize_hook;
         # the chunked AllGather path consumes the backend-prepared Host part.
+        if not self._using_rank_local and self.data_transport_backend is None:
+            raise RuntimeError("Stage-2 data transport backend is not configured")
         prepared = None if self._using_rank_local else self._prepared_host_parts[id(next_block)]
         hook = apply_distributed_block_hook(
             module,
@@ -2296,12 +2540,14 @@ class DistributedLayerwiseOffloadBackend(OffloadBackend):
             prepared_host_part=prepared,
             h2d_done_events=self._shared_h2d_done_events,
             transport_done_events=self._shared_transport_done_events,
+            relay_done_events=self._shared_relay_done_events,
             output_ready_events=self._shared_output_ready_events,
             last_use_events=self._shared_last_use_events,
             prefetch_executor=self._prefetch_executor,
             rank_local_mmap=self._using_rank_local_mmap,
             pin_memory=self.config.pin_cpu_memory,
             tensor_transforms=self._mmap_transforms_by_tensor_id,
+            data_transport_backend=self.data_transport_backend,
         )
         if self._using_rank_local:
             # No manifest in rank-local mode; assign the ownership id directly.
@@ -2377,6 +2623,9 @@ class DistributedLayerwiseOffloadBackend(OffloadBackend):
             self._shared_h2d_done_events = [current_omni_platform.Event() for _ in range(2)]
         if not self._shared_transport_done_events:
             self._shared_transport_done_events = [current_omni_platform.Event() for _ in range(2)]
+        if not self._shared_relay_done_events and self.data_transport_backend is not None:
+            if self.data_transport_backend.kind is TransportBackendKind.GROUP_PIPELINE_MEMCPY:
+                self._shared_relay_done_events = [current_omni_platform.Event() for _ in range(2)]
         if not self._shared_output_ready_events:
             self._shared_output_ready_events = [current_omni_platform.Event() for _ in range(2)]
         self._shared_last_use_events = [current_omni_platform.Event() for _ in range(2)]
@@ -2592,6 +2841,7 @@ class DistributedLayerwiseOffloadBackend(OffloadBackend):
         # Resolve the FS group that owns the weight shard dimension.
         if self.weight_shard_group is None:
             self._init_weight_shard_group()
+        self._configure_transport_backend()
 
         modules = ModuleDiscovery.discover(pipeline)
         if not modules.dits:
@@ -2811,7 +3061,7 @@ class DistributedLayerwiseOffloadBackend(OffloadBackend):
             prepared_manifests = [part["manifest"] for part in self._prepared_host_parts.values()]
             unified_buffers = self._allocate_shared_buffers(prepared_manifests)
             unified_chunk_buffers = None
-            if self.weight_shard_size > 1:
+            if self.data_transport_backend is not None and self.data_transport_backend.requires_local_input:
                 unified_chunk_buffers = self._allocate_shared_chunk_buffers(prepared_manifests)
             self._allocate_shared_events()
 
@@ -2921,6 +3171,10 @@ class DistributedLayerwiseOffloadBackend(OffloadBackend):
                         first_error = exc
                 hook.cpu_shards = {}  # drop pinned-memory references
                 hook.cpu_sources = {}  # drop retained mmap views
+
+        if self.data_transport_backend is not None:
+            self.data_transport_backend.close()
+            self.data_transport_backend = None
 
         for blocks in self._blocks:
             for block in blocks:

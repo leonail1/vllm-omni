@@ -49,6 +49,10 @@ from vllm_omni.diffusion.offloader.tensor_utils import (
     make_offload_placeholder,
     set_tensor_storage,
 )
+from vllm_omni.diffusion.offloader.weight_transport_backend import (
+    ReferenceBackend,
+    TransportCapability,
+)
 from vllm_omni.platforms import current_omni_platform
 
 pytestmark = [pytest.mark.diffusion, pytest.mark.cpu, pytest.mark.core_model]
@@ -184,6 +188,15 @@ def _make_prepared_hook(
             "manifest": manifest,
             "fallback_reason": "pageable test shard",
         },
+        data_transport_backend=ReferenceBackend(
+            TransportCapability(
+                world_size=weight_shard_size,
+                rank=weight_shard_rank,
+                global_ranks=tuple(range(weight_shard_size)),
+                same_host=True,
+                p2p_supported=False,
+            )
+        ),
     )
 
 

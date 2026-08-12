@@ -12,6 +12,8 @@ from vllm.logger import init_logger
 
 from vllm_omni.diffusion.data import OmniDiffusionConfig
 
+from .chunked_transport import SourceLayout, TransportBackendKind
+
 logger = init_logger(__name__)
 
 
@@ -56,6 +58,8 @@ class OffloadConfig:
     chunk_size_bytes: int = 64 * 1024 * 1024  # 64 MiB full-chunk target
     dlo_pin_budget_bytes: int | None = None  # None = unlimited
     dlo_pin_failure_policy: str = "fail"  # "fail" | "whole_block_fallback"
+    dlo_transport_backend: str = "auto"
+    dlo_transport_source_layout: str = "fs_sharded_host"
     # Resolved FS group (set by _init_weight_shard_group, not user-configurable)
     weight_shard_size: int = 1
     weight_shard_rank: int = 0
@@ -184,6 +188,26 @@ class OffloadConfig:
                 f"got {dlo_pin_failure_policy!r}"
             )
 
+        dlo_transport_backend = getattr(od_config, "dlo_transport_backend", TransportBackendKind.AUTO.value)
+        try:
+            TransportBackendKind(dlo_transport_backend)
+        except ValueError as exc:
+            choices = ", ".join(backend.value for backend in TransportBackendKind)
+            raise ValueError(f"dlo_transport_backend must be one of {choices}, got {dlo_transport_backend!r}") from exc
+
+        dlo_transport_source_layout = getattr(
+            od_config,
+            "dlo_transport_source_layout",
+            SourceLayout.FS_SHARDED_HOST.value,
+        )
+        try:
+            SourceLayout(dlo_transport_source_layout)
+        except ValueError as exc:
+            choices = ", ".join(layout.value for layout in SourceLayout)
+            raise ValueError(
+                f"dlo_transport_source_layout must be one of {choices}, got {dlo_transport_source_layout!r}"
+            ) from exc
+
         return cls(
             strategy=strategy,
             pin_cpu_memory=pin_cpu_memory,
@@ -194,6 +218,8 @@ class OffloadConfig:
             chunk_size_bytes=chunk_size_bytes,
             dlo_pin_budget_bytes=dlo_pin_budget_bytes,
             dlo_pin_failure_policy=dlo_pin_failure_policy,
+            dlo_transport_backend=dlo_transport_backend,
+            dlo_transport_source_layout=dlo_transport_source_layout,
             weight_shard_size=weight_shard_size,
         )
 
