@@ -89,11 +89,13 @@ def get_blocks_from_dit(model: nn.Module) -> tuple[list[str], list[nn.Module]]:
 
 @dataclass(frozen=True)
 class ChunkOwnedBlock:
-    """One repeated DiT block owned by the chunked offload engine.
+    """One repeated DiT block owned by the chunked FS offload engine.
 
     ``path`` is a stable, unique string id for the block. It is used as the
     pin-budget key by the chunk engine, so it must be identical on every rank
-    and stable across ranks.
+    and stable across the load -> enable() handoff. It is derived from the
+    module's qualified name inside the root object passed to
+    :func:`discover_chunk_owned_blocks`.
     """
 
     module: nn.Module
@@ -102,7 +104,11 @@ class ChunkOwnedBlock:
 
 @dataclass
 class ChunkOwnership:
-    """Repeated blocks owned by the chunked offload engine.
+    """Ownership split between the chunk engine and FSDP.
+
+    Every parameter must have exactly one owner. The blocks listed here are
+    handed to the chunked FS offload engine and are therefore excluded from
+    FSDP wrapping (see ``apply_hsdp_to_model(chunk_owned_blocks=...)``).
 
     Attributes:
         blocks: Chunk-owned repeated blocks, ordered by execution order.
@@ -121,3 +127,63 @@ class ChunkOwnership:
 
     def __bool__(self) -> bool:
         return bool(self.blocks)
+
+
+def _qualified_name_map(root: nn.Module) -> dict[int, str]:
+    """Map ``id(submodule) -> dotted qualified name`` within *root*."""
+    return {id(module): name for name, module in root.named_modules()}
+
+
+def discover_chunk_owned_blocks(pipeline_or_model: nn.Module) -> ChunkOwnership:
+    """Resolve the repeated DiT blocks that the chunk engine owns.
+
+    Accepts either a pipeline (components discovered via ``ModuleDiscovery``)
+    or a bare DiT/transformer module. Blocks are collected from every declared
+    DiT ring, in execution order, deduplicated, and assigned stable 0-based ids.
+
+    Returns an empty :class:`ChunkOwnership` when the model declares no
+    repeated-block attributes, which lets callers degrade to plain FSDP
+    wrapping instead of failing.
+    """
+    name_map = _qualified_name_map(pipeline_or_model)
+
+    # A bare DiT declares the block attrs itself; a pipeline does not.
+    if get_blocks_attr_names(pipeline_or_model):
+        dit_names: list[str] = [""]
+        dits: list[nn.Module] = [pipeline_or_model]
+    else:
+        # Imported lazily and only on the pipeline path: module_collector
+        # imports model-side helpers, and this module is imported by the
+        # offload backends, so a top-level import would create a cycle.
+        from vllm_omni.diffusion.offloader.module_collector import ModuleDiscovery
+
+        discovered = ModuleDiscovery.discover(pipeline_or_model)
+        # Ownership covers every independently discovered DiT block ring.  A
+        # model such as Cosmos3 exposes both an outer video transformer and a
+        # nested language-model transformer; HSDP wraps only the outer module,
+        # but the chunk engine streams both rings.  ``seen`` below deduplicates
+        # aliases and descendants exposed more than once.
+        dit_names = discovered.dit_names
+        dits = discovered.dits
+
+    ownership = ChunkOwnership()
+    seen: set[int] = set()
+    for dit_name, dit in zip(dit_names, dits):
+        _, blocks = get_blocks_from_dit(dit)
+        for block in blocks:
+            key = id(block)
+            if key in seen:
+                # A pipeline may expose the same block twice (e.g. an alias
+                # attribute). One owner means one entry.
+                continue
+            seen.add(key)
+            qualified = name_map.get(key)
+            if qualified is None:
+                # Not reachable from the root we were handed; fall back to a
+                # deterministic name so the pin-budget key stays stable.
+                index = len(ownership.blocks)
+                qualified = f"{dit_name}.blocks.{index}" if dit_name else f"blocks.{index}"
+            ownership.block_ids[key] = len(ownership.blocks)
+            ownership.blocks.append(ChunkOwnedBlock(module=block, path=qualified))
+
+    return ownership

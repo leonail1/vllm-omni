@@ -151,19 +151,26 @@ class OffloadConfig:
                 "the backend will select mmap or standard-loader host storage"
             )
 
-        # HSDP already shards parameters into DTensors. Running distributed
-        # layerwise offload with AllGather on top would shard each local tensor
-        # again and produce incorrect reconstruction. Keep this combination
-        # rejected; HSDP with rank-local DLO remains supported.
-        if enable_distributed_layerwise_offload and use_hsdp and dlo_use_allgather:
-            raise ValueError(
-                "Distributed layerwise offload with AllGather is incompatible with "
-                "HSDP: HSDP parameters are already sharded DTensors, and the offloader "
-                "would double-shard them. Use --dlo-no-use-allgather (standard-loader "
-                "rank-local weights) or disable HSDP."
-            )
+        # HSDP + DLO/AllGather is supported: ownership is split structurally.
+        # The repeated DiT blocks are resolved before HSDP wrapping and handed
+        # to the chunk engine, and those same tensors are added to FSDP's
+        # ignored_params so fully_shard never touches them. Every parameter
+        # therefore has exactly one owner (FSDP *or* the chunk engine), which
+        # is what previously made double-sharding possible.
 
+        # Explicit fully-shard (FS) axis for the chunked weight transport.
+        # This is deliberately NOT dp_size: under HSDP the replicate axis
+        # serves independent requests, so it must never take part in a weight
+        # collective. Only the fully-shard degree does.
         weight_shard_size = dp_size
+        if use_hsdp and dlo_use_allgather:
+            hsdp_shard_size = getattr(parallel_config, "hsdp_shard_size", -1) if parallel_config else -1
+            if not hsdp_shard_size or hsdp_shard_size <= 0:
+                raise ValueError(
+                    "Distributed layerwise offload with AllGather under HSDP requires a "
+                    f"positive parallel_config.hsdp_shard_size, got {hsdp_shard_size}."
+                )
+            weight_shard_size = int(hsdp_shard_size)
 
         chunk_size_mb = int(getattr(od_config, "dlo_chunk_size_mb", 64))
         if chunk_size_mb <= 0:
