@@ -1392,16 +1392,10 @@ class DistributedLayerwiseOffloadBackend(OffloadBackend):
         self.copy_stream = current_omni_platform.Stream()
         self.comm_stream = current_omni_platform.Stream()
 
-        # Weight-shard (FS) group.  Replaces the former (dp_group, dp_size,
-        # rank) triple: the chunked transport always shards along the HSDP
-        # fully-shard dimension.
+        # Weight-shard group used by the chunked transport.
         self.weight_shard_group: torch.distributed.ProcessGroup | None = config.weight_shard_group
         self.weight_shard_cpu_group: Any | None = config.weight_shard_cpu_group
-        # Use the FS degree resolved by OffloadConfig.from_od_config() only.
-        # Under HSDP this is hsdp_shard_size; otherwise it is dp_size passed
-        # through explicitly.  Falling back to dp_size here would silently
-        # wire weight collectives to the replica axis (design §3.2 prohibits
-        # this), so we do not attempt a fallback.
+        # Use only the degree resolved by OffloadConfig.from_od_config().
         self.weight_shard_size: int = max(1, int(getattr(config, "weight_shard_size", 1) or 1))
         self.weight_shard_rank: int = int(getattr(config, "weight_shard_rank", 0) or 0)
         self.weight_shard_ranks: tuple[int, ...] = tuple(range(self.weight_shard_size))
@@ -1656,11 +1650,11 @@ class DistributedLayerwiseOffloadBackend(OffloadBackend):
             )
 
     # ------------------------------------------------------------------ #
-    #  Weight shard (FS) group                                            #
+    #  Weight shard group                                                 #
     # ------------------------------------------------------------------ #
 
     def _init_weight_shard_group(self) -> None:
-        """Resolve the FS group that owns the chunked weight shard dimension."""
+        """Resolve the DP/SP group that owns the chunked weight shards."""
         if self.weight_shard_size <= 1:
             logger.info("Distributed layerwise offload: weight_shard_size=1, running without AllGather")
             self.weight_shard_group = None
@@ -1677,81 +1671,37 @@ class DistributedLayerwiseOffloadBackend(OffloadBackend):
                 "an initialized process group."
             )
 
-        if not self.config.use_hsdp:
-            # Non-HSDP configurations reuse the established DP/SP resolver
-            # (previously _init_dp_group): with DP > 1 the weight collective
-            # runs on the DP group; with DP = 1 but SP > 1 it runs on the SP
-            # group (OffloadConfig derived weight_shard_size from sp_size).
-            from vllm_omni.diffusion.distributed.parallel_state import (
-                get_data_parallel_world_size,
-                get_dp_group,
-            )
+        # With DP > 1 the weight collective runs on the DP group; with DP = 1
+        # but SP > 1 it runs on the SP group.
+        from vllm_omni.diffusion.distributed.parallel_state import (
+            get_data_parallel_world_size,
+            get_dp_group,
+        )
 
-            if get_data_parallel_world_size() > 1:
-                coord = get_dp_group()
-            else:
-                from vllm_omni.diffusion.distributed.parallel_state import get_sp_group
+        if get_data_parallel_world_size() > 1:
+            coord = get_dp_group()
+        else:
+            from vllm_omni.diffusion.distributed.parallel_state import get_sp_group
 
-                coord = get_sp_group()
-                logger.info(
-                    "Distributed layerwise offload: DP=1, using SP group (world_size=%d) for weight sharding",
-                    coord.world_size,
-                )
-            if coord.world_size != self.weight_shard_size:
-                raise ValueError(
-                    "DLO weight shard degree does not match the resolved group: "
-                    f"config={self.weight_shard_size}, group={coord.world_size}"
-                )
-            self.weight_shard_group = coord.device_group
-            self.weight_shard_cpu_group = coord.cpu_group
-            self.weight_shard_rank = coord.rank_in_group
-            self._publish_weight_shard_config()
+            coord = get_sp_group()
             logger.info(
-                "Distributed layerwise offload (non-HSDP): weight_shard_size=%d, rank_in_group=%d, group_ranks=%s",
-                self.weight_shard_size,
-                self.weight_shard_rank,
-                coord.ranks,
+                "Distributed layerwise offload: DP=1, using SP group (world_size=%d) for weight sharding",
+                coord.world_size,
             )
-            return
-
-        # HSDP path. Upstream no longer registers an FS process group in
-        # parallel_state (the HSDP DeviceMesh owns shard groups internally),
-        # so build the FS row ourselves. The HSDP mesh layout is
-        # arange(world).reshape(replicate, shard): each FS row is a
-        # contiguous, replica-major rank range [r//shard*shard, +shard).
-        # Chunk offsets are rank-major within one row, so this layout is
-        # mandatory — a strided row would land rank r's local chunk at the
-        # wrong full-buffer offset.
-        world_size = torch.distributed.get_world_size()
-        global_rank = torch.distributed.get_rank()
-        shard = self.weight_shard_size
-        if world_size % shard != 0:
+        if coord.world_size != self.weight_shard_size:
             raise ValueError(
-                f"DLO weight shard degree {shard} does not divide the world size {world_size}: "
-                "FS rows must be contiguous replica-major ranges"
+                "DLO weight shard degree does not match the resolved group: "
+                f"config={self.weight_shard_size}, group={coord.world_size}"
             )
-
-        # new_group is collective over the world group: every rank creates
-        # every row's groups in the same order, then keeps only its own row.
-        row_groups: dict[int, tuple[Any, Any]] = {}
-        for start in range(0, world_size, shard):
-            row = list(range(start, start + shard))
-            row_groups[start] = (
-                torch.distributed.new_group(ranks=row),
-                torch.distributed.new_group(ranks=row, backend="gloo"),
-            )
-        row_start = global_rank - global_rank % shard
-        self.weight_shard_group, self.weight_shard_cpu_group = row_groups[row_start]
-        self.weight_shard_rank = global_rank % shard
-        self.weight_shard_ranks = tuple(range(row_start, row_start + shard))
+        self.weight_shard_group = coord.device_group
+        self.weight_shard_cpu_group = coord.cpu_group
+        self.weight_shard_rank = coord.rank_in_group
         self._publish_weight_shard_config()
-
         logger.info(
-            "DLO (HSDP): weight_shard_size=%d, rank_in_group=%d, global_rank=%d, row_ranks=%s",
+            "Distributed layerwise offload: weight_shard_size=%d, rank_in_group=%d, group_ranks=%s",
             self.weight_shard_size,
             self.weight_shard_rank,
-            global_rank,
-            list(range(row_start, row_start + shard)),
+            coord.ranks,
         )
 
     def _publish_weight_shard_config(self) -> None:
@@ -2257,95 +2207,8 @@ class DistributedLayerwiseOffloadBackend(OffloadBackend):
         return ownership
 
     def _resolve_chunk_ownership(self, pipeline: nn.Module) -> ChunkOwnership:
-        """Consume the loader ownership handoff and select streamed blocks.
-
-        The loader delegates every repeated block away from FSDP, including a
-        resident prefix.  This backend only builds chunk manifests for blocks
-        in ``_pending_block_groups``.  Filter the loader handoff to that subset
-        while preserving its stable paths and block ids, and fail before any
-        collective if loader and runtime discovery disagree.
-        """
-        loader_ownership = getattr(pipeline, "_dlo_chunk_ownership", None)
-        if loader_ownership is None:
-            if self.config.use_hsdp and self.config.dlo_use_allgather:
-                raise RuntimeError(
-                    "DLO loader ownership handoff is missing under HSDP+AllGather. "
-                    "The loader must call discover_chunk_owned_blocks() and attach "
-                    "_dlo_chunk_ownership to the pipeline before apply_hsdp_to_model(), "
-                    "so that every repeated-block parameter has exactly one owner. "
-                    "Without the handoff, FSDP would also claim those parameters and "
-                    "produce incorrect double-sharded AllGather results."
-                )
-            # Non-HSDP (standard-loader) path: no loader handoff exists, so
-            # build ownership from the runtime block list collected during enable().
-            return self._build_chunk_ownership()
-
-        loader_blocks = list(getattr(loader_ownership, "blocks", ()))
-        loader_block_ids = dict(getattr(loader_ownership, "block_ids", {}))
-        published_block_ids = dict(getattr(pipeline, "_dlo_block_ids", loader_block_ids))
-        if not loader_blocks or not loader_block_ids:
-            raise RuntimeError("DLO loader ownership handoff is empty or missing block_ids")
-        if published_block_ids != loader_block_ids:
-            raise RuntimeError("DLO loader ownership and published block_ids disagree")
-
-        loader_by_module: dict[int, Any] = {}
-        loader_order: list[int] = []
-        for entry in loader_blocks:
-            module_id = id(entry.module)
-            if module_id in loader_by_module:
-                raise RuntimeError(f"DLO loader ownership contains duplicate module path={entry.path!r}")
-            if module_id not in loader_block_ids:
-                raise RuntimeError(f"DLO loader ownership has no block id for path={entry.path!r}")
-            loader_by_module[module_id] = entry
-            loader_order.append(module_id)
-
-        ordered_ids = [loader_block_ids[module_id] for module_id in loader_order]
-        if ordered_ids != list(range(len(loader_order))):
-            raise RuntimeError(
-                f"DLO loader block ids must be consecutive and follow execution order: got={ordered_ids[:16]}"
-            )
-
-        pending_modules = [block for blocks, _group_path in self._pending_block_groups for block in blocks]
-        pending_order = [id(block) for block in pending_modules]
-        if len(pending_order) != len(set(pending_order)):
-            raise RuntimeError("DLO runtime discovery contains duplicate streamed blocks")
-
-        missing = [module_id for module_id in pending_order if module_id not in loader_by_module]
-        if missing:
-            raise RuntimeError(
-                "DLO runtime discovery found streamed blocks that were not delegated by the loader: "
-                f"count={len(missing)}"
-            )
-
-        loader_pending_order = [module_id for module_id in loader_order if module_id in set(pending_order)]
-        if loader_pending_order != pending_order:
-            raise RuntimeError("DLO loader and runtime block execution order disagree")
-
-        resident_ids = {id(block) for block in self._resident_blocks}
-        unclaimed = set(loader_order) - set(pending_order) - resident_ids
-        if unclaimed:
-            raise RuntimeError(
-                "DLO loader delegated blocks that runtime discovery neither streams nor keeps resident: "
-                f"count={len(unclaimed)}"
-            )
-
-        ownership = ChunkOwnership()
-        self._block_ids = {}
-        for module_id in pending_order:
-            entry = loader_by_module[module_id]
-            block_id = loader_block_ids[module_id]
-            ownership.blocks.append(ChunkOwnedBlock(module=entry.module, path=entry.path))
-            ownership.block_ids[module_id] = block_id
-            self._block_ids[module_id] = block_id
-
-        self._chunk_ownership = ownership
-        logger.info(
-            "Accepted DLO loader ownership handoff: delegated=%d streamed=%d resident=%d",
-            len(loader_blocks),
-            len(ownership.blocks),
-            len(resident_ids),
-        )
-        return ownership
+        """Build ownership from the blocks discovered during ``enable()``."""
+        return self._build_chunk_ownership()
 
     def _create_block_hook(
         self,

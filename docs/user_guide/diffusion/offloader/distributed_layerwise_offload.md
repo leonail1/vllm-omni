@@ -147,10 +147,9 @@ must enter each collective.
   outside the Phase A shared-mmap support scope and falls back before model
   mutation to the ordinary TP-aware loader. DLO can stream that runtime layout,
   but it provides no shared-mmap host-memory benefit or guarantee.
-- HSDP plus AllGather is supported through a single-ownership split: the
-  chunk engine streams the repeated DiT blocks, FSDP shards everything else,
-  and DLO's weight collective runs only on the HSDP fully-shard axis. HSDP
-  without AllGather has limited end-to-end validation.
+- HSDP plus DLO AllGather is rejected because both systems would shard the
+  same weights. HSDP with `--dlo-no-use-allgather` remains available through
+  rank-local standard-loader weights, with limited end-to-end validation.
 - Per-tensor online FP8 linears use the ordinary loader and can run with either
   DLO transfer path. With AllGather, every rank temporarily materializes the
   complete FP8 model in host memory before DLO retains only its shard. Other

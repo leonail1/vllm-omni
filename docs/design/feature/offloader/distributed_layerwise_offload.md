@@ -24,7 +24,7 @@ Legend: ✅ supported, ⚠️ compatibility path or limited validation, ❌ unsu
 | **DP** | ✅ Primary path; host weights are sharded across the DP group. | ✅ Each DP rank streams complete rank-local blocks. |
 | **SP** | ✅ When DP=1, DLO uses the SP group for weight sharding. | ✅ SP remains active without a DLO weight collective. |
 | **TP > 1** | ⚠️ Ordinary TP-aware loader only; no direct checkpoint mmap. | ⚠️ Ordinary TP-aware loader only; no direct checkpoint mmap. |
-| **HSDP** | ✅ Supported through the single-ownership split: the chunk engine owns the repeated DiT blocks (excluded from FSDP wrapping), and the weight collective runs only on the FS axis. | ⚠️ Limited end-to-end coverage. |
+| **HSDP** | ❌ Rejected because HSDP and DLO would both shard the same weights. | ⚠️ Limited end-to-end coverage. |
 | **Per-tensor online FP8 linears** | ✅ Ordinary loader finalizes weights and scales before DLO sharding. | ✅ Ordinary loader retains complete rank-local tensors. |
 | **Other online quantization methods** | ❌ Rejected until runtime packing and scale layouts are validated. | ⚠️ Allowed through the ordinary loader; validation is method-specific. |
 | **Model-level or standard layerwise CPU offload** | ❌ Disabled because DLO takes priority. | ❌ Disabled because DLO takes priority. |
@@ -67,20 +67,12 @@ standard distributed groups have been initialized.
 
 The DLO weight-sharding group is selected as follows:
 
-1. Under HSDP with AllGather enabled, use the fully-shard (FS) axis; the
-   shard degree is `hsdp_shard_size`. The HSDP replicate axis serves
-   independent requests and never takes part in a weight collective.
-2. Otherwise, use the existing DP group when `data_parallel_size > 1`.
-3. When DP is one and SP is greater than one, use the SP group.
-4. Otherwise, run rank-locally without a DLO process group.
+1. Use the existing DP group when `data_parallel_size > 1`.
+2. When DP is one and SP is greater than one, use the SP group.
+3. Otherwise, run rank-locally without a DLO process group.
 
-TP is deliberately not used as DLO's AllGather group. HSDP is supported
-because ownership is split structurally before any sharding happens: the
-repeated DiT blocks are resolved before HSDP wrapping and handed to the
-chunk engine, and those same tensors are added to FSDP's `ignored_params` so
-`fully_shard` never touches them. Every parameter therefore has exactly one
-owner — FSDP or the chunk engine — and DLO's weight collectives run only on
-the FS axis.
+TP and HSDP are deliberately not used as DLO AllGather groups. HSDP plus DLO
+AllGather is rejected because both systems would shard the same parameters.
 
 ### The loader owns host-weight planning
 
@@ -228,7 +220,7 @@ This mode means:
 | **DP** | Supported primary path. DLO shards host weights across the DP group and can run DP multi-concurrency. | Supported rank-local path. Compatible TP1 replicas can share checkpoint pages on each node; fallback runtime tensors remain private. |
 | **SP** | Supported in the implementation. With DP=1, DLO uses the SP group for host-weight sharding; SP still shards sequence/activation work. | SP remains active, but DLO keeps standard-loader rank-local weights and adds no SP weight collective. |
 | **TP > 1** | Outside the Phase A shared-mmap support scope. The loader falls back before mutation, preserves TP-local layouts, and DLO may apply DP/SP host sharding to those ordinary runtime tensors. | Outside the Phase A shared-mmap support scope. The ordinary TP-aware loader produces rank-local tensors, which DLO streams without an additional weight collective; DP replicas retain private runtime storage. |
-| **HSDP** | Supported through the single-ownership split. The chunk engine owns the repeated DiT blocks (excluded from FSDP wrapping via `ignored_params`), FSDP owns everything else, and DLO's weight collective runs only on the FS axis (`hsdp_shard_size`). | Accepted by configuration. HSDP owns parameter sharding and its own gathers; DLO only stages rank-local parameters. End-to-end coverage is limited. |
+| **HSDP** | Rejected because HSDP and DLO would both shard the same weights. | Accepted by configuration. HSDP owns parameter sharding and its own gathers; DLO only stages rank-local parameters. End-to-end coverage is limited. |
 
 ### Combined dimensions
 
@@ -238,13 +230,10 @@ This mode means:
 - **DP + TP/SP without AllGather:** standard model loading defines the
   rank-local tensor layout. DLO adds no cross-DP, cross-TP, or cross-SP weight
   collective.
-- **HSDP + AllGather:** supported through the single-ownership split. The
-  chunk engine streams the repeated DiT blocks, FSDP shards everything else,
-  and DLO's weight collective runs on the FS axis whose size is
-  `hsdp_shard_size`. Weight collectives never cross the HSDP replicate axis.
+- **HSDP + AllGather:** rejected to prevent double-sharding HSDP parameters.
 - **HSDP + SP:** HSDP over SP remains a general parallel configuration. With
-  DLO, AllGather uses the FS axis as above; `--dlo-no-use-allgather` instead
-  leaves HSDP responsible for weight materialization and synchronization.
+  DLO, `--dlo-no-use-allgather` leaves HSDP responsible for weight
+  materialization and synchronization.
 - **HSDP + DP or TP:** rejected independently by the diffusion parallel
   configuration.
 
@@ -276,8 +265,7 @@ this phase; see [RFC #6195](https://github.com/vllm-project/vllm-omni/issues/619
 
 Current source-level validation includes:
 
-- HSDP + DLO + AllGather acceptance at configuration level, including FS-axis
-  group resolution and the single-ownership split;
+- HSDP + DLO + AllGather rejection at configuration level;
 - HSDP + DLO without AllGather acceptance at configuration level;
 - loader preflight fallback for TP, HSDP, online quantization, unknown custom
   loaders, missing keys, and shape/dtype mismatches;
