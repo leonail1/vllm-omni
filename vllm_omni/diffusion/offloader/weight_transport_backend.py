@@ -331,6 +331,10 @@ class GroupPersistentBackend(ReferenceBackend):
     def __init__(self, capability: TransportCapability) -> None:
         super().__init__(capability)
         self._graphs: dict[tuple[Any, ...], Any] = {}
+        self._graph_pool = None
+        graph_pool_handle = getattr(torch.npu, "graph_pool_handle", None)
+        if callable(graph_pool_handle):
+            self._graph_pool = graph_pool_handle()
 
     def submit_chunk(
         self,
@@ -364,9 +368,21 @@ class GroupPersistentBackend(ReferenceBackend):
             graph = self._graphs.get(key)
             if graph is None:
                 self.counters.schedule_builds += 1
+                # All ranks must enter capture in the same order. Prime the
+                # HCCL kernel eagerly first, then capture the stable operation
+                # using the shared NPU graph pool.
+                torch.distributed.barrier(group=group)
+                torch.distributed.all_gather_into_tensor(full_output, local_input, group=group)
+                torch.npu.synchronize()
+                torch.distributed.barrier(group=group)
+                torch.npu.synchronize()
                 graph = torch.npu.NPUGraph()
-                with torch.npu.graph(graph, stream=streams.communication):
+                graph_kwargs = {"stream": streams.communication}
+                if self._graph_pool is not None:
+                    graph_kwargs["pool"] = self._graph_pool
+                with torch.npu.graph(graph, **graph_kwargs):
                     torch.distributed.all_gather_into_tensor(full_output, local_input, group=group)
+                torch.npu.synchronize()
                 self._graphs[key] = graph
             else:
                 self.counters.schedule_replays += 1

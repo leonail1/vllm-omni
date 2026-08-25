@@ -2294,20 +2294,40 @@ class TestGroupPersistentBackend:
 
             def replay(self):
                 self.replays += 1
+                calls.append("replay")
 
         @contextmanager
-        def fake_graph(graph, stream=None):
+        def fake_graph(graph, pool=None, stream=None):
+            calls.append(("capture", pool, stream))
             yield graph
 
-        monkeypatch.setattr(torch, "npu", SimpleNamespace(NPUGraph=FakeGraph, graph=fake_graph), raising=False)
+        def fake_synchronize():
+            calls.append("synchronize")
+
+        monkeypatch.setattr(
+            torch,
+            "npu",
+            SimpleNamespace(
+                NPUGraph=FakeGraph,
+                graph=fake_graph,
+                graph_pool_handle=lambda: graph_pool,
+                synchronize=fake_synchronize,
+            ),
+            raising=False,
+        )
         monkeypatch.setattr(current_omni_platform, "stream", dummy_stream)
 
         gather_calls = []
 
         def fake_all_gather(output, source, group=None):
             gather_calls.append((output, source))
+            calls.append("all_gather")
 
         monkeypatch.setattr(dist, "all_gather_into_tensor", fake_all_gather)
+        monkeypatch.setattr(dist, "barrier", lambda group=None: calls.append("barrier"))
+
+        capability = TransportCapability(world_size=2, rank=0, global_ranks=(0, 1), native_persistent=True)
+        backend = GroupPersistentBackend(capability)
 
         specs = [("weight", torch.arange(8, dtype=torch.float32), False)]
         manifest = build_part_manifest(
@@ -2343,5 +2363,19 @@ class TestGroupPersistentBackend:
         assert backend.counters.submitted_chunks == 2
         assert backend.counters.schedule_builds == 1
         assert backend.counters.schedule_replays == 1
-        # The collective ran exactly once, while capturing the graph.
-        assert len(gather_calls) == 1
+        # The first submission primes HCCL eagerly, drains both rendezvous
+        # barriers before capture, captures once, and then replays. The second
+        # submission only replays the cached graph.
+        assert len(gather_calls) == 2
+        assert calls == [
+            "barrier",
+            "all_gather",
+            "synchronize",
+            "barrier",
+            "synchronize",
+            ("capture", graph_pool, streams.communication),
+            "all_gather",
+            "synchronize",
+            "replay",
+            "replay",
+        ]
