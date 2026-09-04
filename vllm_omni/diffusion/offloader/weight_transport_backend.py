@@ -1,12 +1,10 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-
-"""Pluggable data-plane backends for chunked diffusion weight transport."""
-
+"""Chunk data plane: Host-to-device copy, then AllGather on a multi-rank FS group."""
 from __future__ import annotations
 
 from collections.abc import Callable, Sequence
-from contextlib import AbstractContextManager
+from contextlib import AbstractContextManager, contextmanager
 from dataclasses import dataclass, field
 from typing import Any, Protocol
 
@@ -14,11 +12,9 @@ import torch
 
 from vllm_omni.platforms import current_omni_platform
 
-from .chunked_transport import (
-    ChunkMeta,
-    PartManifest,
-    TransportBackendKind,
-)
+from ._chunk_types import ChunkMeta, TransportBackendKind
+
+TraceFactory = Callable[[str], AbstractContextManager[Any]]
 
 
 @dataclass(frozen=True)
@@ -26,12 +22,6 @@ class TransportCapability:
     world_size: int
     rank: int
     global_ranks: tuple[int, ...]
-
-
-@dataclass(frozen=True)
-class SupportResult:
-    supported: bool
-    reason: str | None = None
 
 
 @dataclass(frozen=True)
@@ -68,127 +58,73 @@ class BackendCounters:
     backend_chunks: dict[str, int] = field(default_factory=dict)
 
 
-TraceFactory = Callable[[str], AbstractContextManager[Any]]
-
-
 class WeightTransportBackend(Protocol):
     kind: TransportBackendKind
     requires_local_input: bool
     counters: BackendCounters
 
-    def supports(self, capability: TransportCapability, plan: PartManifest | None = None) -> SupportResult: ...
 
-    def begin_part(self, streams: TransportStreams, prior_last_use: Any | None) -> None: ...
-
-    def submit_chunk(
-        self,
-        *,
-        source: torch.Tensor | None,
-        local_input: torch.Tensor | None,
-        full_output: torch.Tensor,
-        chunk_meta: ChunkMeta,
-        streams: TransportStreams,
-        events: ChunkEvents,
-        group: torch.distributed.ProcessGroup | None,
-        generation: int,
-        non_blocking: bool,
-        trace: TraceFactory,
-    ) -> ChunkCompletion: ...
-
-    def finalize_part(
-        self,
-        completions: Sequence[ChunkCompletion],
-        *,
-        ready_event: Any,
-        streams: TransportStreams,
-    ) -> Any: ...
-
-    def reset_generation(self, generation: int) -> None: ...
-
-    def reset_counters(self) -> None: ...
-
-    def close(self) -> None: ...
+@contextmanager
+def _on_stream(stream: Any):
+    if hasattr(stream, "device"):
+        with current_omni_platform.stream(stream):
+            yield
+    else:
+        yield
 
 
-def _support_backend(
-    backend: TransportBackendKind,
-    capability: TransportCapability,
-) -> SupportResult:
-    if backend is TransportBackendKind.REFERENCE:
-        return SupportResult(True)
-
-    if backend is TransportBackendKind.GROUP_SCATTER_AG:
-        if capability.world_size <= 1:
-            return SupportResult(False, "group_scatter_ag requires an FS group larger than one rank")
-        return SupportResult(True)
-
-    return SupportResult(False, f"unsupported backend: {backend.value}")
-
-
-def select_transport(
-    requested_backend: TransportBackendKind,
-    capability: TransportCapability,
-) -> TransportSelection:
+def select_transport(requested_backend: TransportBackendKind, capability: TransportCapability) -> TransportSelection:
     if requested_backend is TransportBackendKind.AUTO:
         candidate = (
-            TransportBackendKind.GROUP_SCATTER_AG if capability.world_size > 1 else TransportBackendKind.REFERENCE
+            TransportBackendKind.GROUP_SCATTER_AG if capability.world_size > 1
+            else TransportBackendKind.REFERENCE
         )
     else:
         candidate = requested_backend
-
-    support = _support_backend(candidate, capability)
-    if support.supported:
-        return TransportSelection(
-            requested_backend=requested_backend,
-            effective_backend=candidate,
+    if candidate is TransportBackendKind.GROUP_SCATTER_AG and capability.world_size <= 1:
+        raise ValueError(
+            "transport backend=group_scatter_ag is unsupported on this host: "
+            "group_scatter_ag requires an FS group larger than one rank"
         )
+    if candidate not in (TransportBackendKind.REFERENCE, TransportBackendKind.GROUP_SCATTER_AG):
+        raise ValueError(
+            f"transport backend={candidate.value} is unsupported on this host: "
+            f"unsupported backend: {candidate.value}"
+        )
+    return TransportSelection(requested_backend, candidate)
 
-    # An explicitly requested backend that this host cannot run is a hard
-    # configuration error, never a silent fallback.
-    raise ValueError(f"transport backend={candidate.value} is unsupported on this host: {support.reason}")
 
+class ReferenceBackend:
+    """Host-to-device copy; AllGather when the FS group has more than one rank."""
 
-class _BaseBackend:
     kind = TransportBackendKind.REFERENCE
     requires_local_input = True
-    writes_output_on_copy = False
+    _transport_trace_name = "all_gather"
 
     def __init__(self, capability: TransportCapability) -> None:
         self.capability = capability
         self.counters = BackendCounters()
         self._generation = -1
         self._closed = False
-
-    def supports(self, capability: TransportCapability, plan: PartManifest | None = None) -> SupportResult:
-        del plan
-        return _support_backend(self.kind, capability)
+        self.requires_local_input = capability.world_size > 1
+        self.writes_output_on_copy = capability.world_size <= 1
 
     def begin_part(self, streams: TransportStreams, prior_last_use: Any | None) -> None:
         if self._closed:
             raise RuntimeError("weight transport backend is closed")
         self.counters.submitted_parts += 1
-        if prior_last_use is None:
-            return
-        streams.communication.wait_event(prior_last_use)
-        if self.writes_output_on_copy:
-            streams.copy.wait_event(prior_last_use)
+        if prior_last_use is not None:
+            streams.communication.wait_event(prior_last_use)
 
     def _count_chunk(self, host_bytes: int, fabric_bytes: int) -> None:
         self.counters.submitted_chunks += 1
         self.counters.host_h2d_bytes += host_bytes
         self.counters.fabric_bytes += fabric_bytes
-        key = self.kind.value
-        self.counters.backend_chunks[key] = self.counters.backend_chunks.get(key, 0) + 1
+        self.counters.backend_chunks[self.kind.value] = self.counters.backend_chunks.get(self.kind.value, 0) + 1
 
-    def finalize_part(
-        self,
-        completions: Sequence[ChunkCompletion],
-        *,
-        ready_event: Any,
-        streams: TransportStreams,
-    ) -> Any:
+    def finalize_part(self, completions: Sequence[ChunkCompletion], *, ready_event: Any, streams: TransportStreams) -> Any:
         stream = completions[-1].stream if completions else streams.communication
-        with current_omni_platform.stream(stream):
+        with _on_stream(stream):
             ready_event.record(stream)
         return ready_event
 
@@ -203,117 +139,65 @@ class _BaseBackend:
     def close(self) -> None:
         self._closed = True
 
-
-class ReferenceBackend(_BaseBackend):
-    kind = TransportBackendKind.REFERENCE
-    _transport_trace_name = "all_gather"
-
-    def __init__(self, capability: TransportCapability) -> None:
-        super().__init__(capability)
-        self.requires_local_input = capability.world_size > 1
-        self.writes_output_on_copy = capability.world_size <= 1
-
     def submit_chunk(
-        self,
-        *,
-        source: torch.Tensor | None,
-        local_input: torch.Tensor | None,
-        full_output: torch.Tensor,
-        chunk_meta: ChunkMeta,
-        streams: TransportStreams,
-        events: ChunkEvents,
-        group: torch.distributed.ProcessGroup | None,
-        generation: int,
-        non_blocking: bool,
-        trace: TraceFactory,
+        self, *, source: torch.Tensor | None, local_input: torch.Tensor | None, full_output: torch.Tensor,
+        chunk_meta: ChunkMeta, streams: TransportStreams, events: ChunkEvents,
+        group: torch.distributed.ProcessGroup | None, generation: int, non_blocking: bool, trace: TraceFactory,
     ) -> ChunkCompletion:
         del generation
         if source is None:
             raise RuntimeError("reference transport requires a local Host source")
-
         if self.capability.world_size <= 1:
             if source.numel() != chunk_meta.padded_numel:
                 raise RuntimeError("single-rank reference transport requires one full padded Host chunk")
-            with current_omni_platform.stream(streams.copy):
+            with _on_stream(streams.copy):
                 with trace("h2d"):
                     full_output.copy_(source, non_blocking=non_blocking)
                 events.h2d_done.record(streams.copy)
             self._count_chunk(source.numel() * source.element_size(), 0)
             return ChunkCompletion(events.h2d_done, streams.copy)
-
         if local_input is None or group is None:
             raise RuntimeError("reference FS transport requires a local input buffer and process group")
         return self._submit_fs_chunk(
-            source=source,
-            local_input=local_input,
-            full_output=full_output,
-            chunk_meta=chunk_meta,
-            streams=streams,
-            events=events,
-            non_blocking=non_blocking,
-            trace=trace,
-            collective=lambda: torch.distributed.all_gather_into_tensor(full_output, local_input, group=group),
+            source, local_input, full_output, chunk_meta, streams, events, non_blocking, trace,
+            lambda: torch.distributed.all_gather_into_tensor(full_output, local_input, group=group),
         )
 
     def _submit_fs_chunk(
-        self,
-        *,
-        source: torch.Tensor,
-        local_input: torch.Tensor,
-        full_output: torch.Tensor,
-        chunk_meta: ChunkMeta,
-        streams: TransportStreams,
-        events: ChunkEvents,
-        non_blocking: bool,
-        trace: TraceFactory,
-        collective: Callable[[], None],
+        self, source: torch.Tensor, local_input: torch.Tensor, full_output: torch.Tensor,
+        chunk_meta: ChunkMeta, streams: TransportStreams, events: ChunkEvents,
+        non_blocking: bool, trace: TraceFactory, collective: Callable[[], None],
     ) -> ChunkCompletion:
-        """Shared H2D(chunk) -> collective(chunk) schedule for FS-sharded input."""
         if events.input_reusable is not None:
             streams.copy.wait_event(events.input_reusable)
-        with current_omni_platform.stream(streams.copy):
+        with _on_stream(streams.copy):
             with trace("h2d"):
                 local_input.copy_(source, non_blocking=non_blocking)
             events.h2d_done.record(streams.copy)
-
         streams.communication.wait_event(events.h2d_done)
-        with current_omni_platform.stream(streams.communication):
+        with _on_stream(streams.communication):
             with trace(self._transport_trace_name):
                 collective()
             events.transport_done.record(streams.communication)
-
-        element_size = full_output.element_size()
-        fabric_bytes = 0
-        if self.capability.rank == 0:
-            fabric_bytes = chunk_meta.padded_numel * element_size * (self.capability.world_size - 1)
-        self._count_chunk(source.numel() * source.element_size(), fabric_bytes)
+        fabric = (
+            chunk_meta.padded_numel * full_output.element_size() * (self.capability.world_size - 1)
+            if self.capability.rank == 0 else 0
+        )
+        self._count_chunk(source.numel() * source.element_size(), fabric)
         return ChunkCompletion(events.transport_done, streams.communication)
 
 
 class GroupScatterAllGatherBackend(ReferenceBackend):
-    """Safe H2D plus all-gather implementation for FS-sharded Host input.
-
-    This is intentionally the reference scheduling contract.  Some HCCL
-    versions do not support multiple outstanding all-gathers on one process
-    group when ordering is represented only with caller-stream events.
-    Keeping each collective's normal completion semantics prevents an input
-    slot from being overwritten while HCCL still reads it.
-    """
+    """Same Host-to-device + AllGather schedule as ReferenceBackend on a multi-rank FS group."""
 
     kind = TransportBackendKind.GROUP_SCATTER_AG
 
 
-def create_transport_backend(
-    selection: TransportSelection,
-    capability: TransportCapability,
-) -> WeightTransportBackend:
-    backend_type: type[_BaseBackend]
+def create_transport_backend(selection: TransportSelection, capability: TransportCapability) -> WeightTransportBackend:
     if selection.effective_backend is TransportBackendKind.REFERENCE:
-        backend_type = ReferenceBackend
-    elif selection.effective_backend is TransportBackendKind.GROUP_SCATTER_AG:
-        backend_type = GroupScatterAllGatherBackend
-    else:
-        raise RuntimeError(
-            f"effective transport backend {selection.effective_backend.value} has no validated implementation"
-        )
-    return backend_type(capability)
+        return ReferenceBackend(capability)
+    if selection.effective_backend is TransportBackendKind.GROUP_SCATTER_AG:
+        return GroupScatterAllGatherBackend(capability)
+    raise RuntimeError(
+        f"effective transport backend {selection.effective_backend.value} has no validated implementation"
+    )
