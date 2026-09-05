@@ -13,6 +13,7 @@ import ctypes as ct
 import os
 from contextlib import ExitStack, contextmanager
 from math import prod
+from pathlib import Path
 
 import torch
 import torch.distributed as dist
@@ -82,6 +83,9 @@ class _Runtime:
             resources.callback(self, release, result.value)
         return result.value
 
+    def copy(self, destination, source, count, stream, kind=3):
+        self("aclrtMemcpyAsync", destination, count, source, count, kind, stream)
+
 
 class WeightTransport:
     def __init__(self, cpu_group, chunk_bytes, *, slot_bytes=None):
@@ -119,10 +123,10 @@ class WeightTransport:
         rt("aclrtMemset", self.gate, 64, 0, 64)
         key = ct.create_string_buffer(65)
         rt("aclrtIpcMemGetExportKey", self.storage, 2 * self.width + 64, key, len(key), 0)
-        self.key = key.value
-        rt.resources.callback(rt, "aclrtIpcMemClose", self.key)
+        memory_key = key.value
+        rt.resources.callback(rt, "aclrtIpcMemClose", memory_key)
         allowed = (ct.c_int32 * (self.size - 1))(*[p for i, (p, _) in enumerate(pids) if i != self.rank])
-        rt("aclrtIpcMemSetImportPid", self.key, allowed, len(allowed))
+        rt("aclrtIpcMemSetImportPid", memory_key, allowed, len(allowed))
         self.notifies = [rt.handle("aclrtCreateNotify", 0) for _ in range(4 * self.size)]
         notify_keys = []
         for index, notify in enumerate(self.notifies):
@@ -134,7 +138,7 @@ class WeightTransport:
                 sender_pid = ct.c_int32(pids[sender][0])
                 rt("aclrtNotifySetImportPid", notify, ct.byref(sender_pid), 1)
             notify_keys.append(value)
-        keys = self.exchange((self.key, notify_keys))
+        keys = self.exchange((memory_key, notify_keys))
         self.peers, self.remote_notifies = [], []
         for rank, (memory_key, notification_keys) in enumerate(keys):
             self.peers.append(self.storage if rank == self.rank else rt.handle("aclrtIpcMemImportByKey", memory_key, 1))
@@ -225,7 +229,7 @@ class WeightTransport:
                 slot = index % 2
                 for peer in range(size):
                     rt("aclrtWaitAndResetNotify", self.notifies[2 * size + slot * size + peer], self.producer, 0)
-                rt("aclrtMemcpyAsync", self.storage + slot * self.width, count, source, count, 1, self.producer)
+                rt.copy(self.storage + slot * self.width, source, count, self.producer, kind=1)
                 for peer in range(size):
                     rt("aclrtRecordNotify", self.remote_notifies[peer][slot * size + self.rank], self.producer)
                 rt("aclrtValueWait", self.gate, 0, 1, self.main)
@@ -234,15 +238,7 @@ class WeightTransport:
                 for peer, stream in enumerate(self.readers):
                     rt("aclrtWaitAndResetNotify", self.chunk_notifies[peer], stream, 0)
                     rt("aclrtWaitAndResetNotify", self.notifies[slot * size + peer], stream, 0)
-                    rt(
-                        "aclrtMemcpyAsync",
-                        output + peer * count,
-                        count,
-                        self.peers[peer] + slot * self.width,
-                        count,
-                        3,
-                        stream,
-                    )
+                    rt.copy(output + peer * count, self.peers[peer] + slot * self.width, count, stream)
                     rt("aclrtRecordNotify", self.remote_notifies[peer][2 * size + slot * size + self.rank], stream)
                     rt("aclrtRecordNotify", self.chunk_notifies[size + peer], stream)
                     rt("aclrtWaitAndResetNotify", self.chunk_notifies[size + peer], self.main, 0)
@@ -273,6 +269,29 @@ def initialize_transport(device_group, cpu_group, chunk_bytes):
     if os.getenv("VLLM_OMNI_DLO_SDMA") == "1":
         if device_group in _TRANSPORTS:
             raise RuntimeError("A weight transport already owns this process group")
+        import torch_npu
+        from torch.utils.cpp_extension import load
+
+        # Build once in PyTorch's shared extension cache; its file lock serializes
+        # worker startup. Only the explicitly enabled transport needs a compiler.
+        npu = Path(torch_npu.__file__).parent
+        cann = Path(os.environ["ASCEND_HOME_PATH"])
+        load(
+            name="vllm_omni_sdma",
+            sources=[str(Path(__file__).with_suffix(".cpp"))],
+            extra_include_paths=[str(npu / "include"), str(cann / "include")],
+            extra_cflags=["-O2"],
+            extra_ldflags=[
+                f"-L{npu / 'lib'}",
+                f"-Wl,-rpath,{npu / 'lib'}",
+                "-ltorch_npu",
+                f"-L{cann / 'lib64'}",
+                f"-Wl,-rpath,{cann / 'lib64'}",
+                "-lascendcl",
+            ],
+            with_cuda=False,
+            is_python_module=False,
+        )
         _TRANSPORTS[device_group] = WeightTransport(cpu_group, chunk_bytes)
 
 
@@ -287,28 +306,29 @@ def close_transport(group):
         del _TRANSPORTS[group]
 
 
-@contextmanager
-def attention_communication():
-    """Admit attention once its inputs are ready, then resume weight chunks."""
-    transports = list(_TRANSPORTS.values())
-    if not transports:
-        yield
-        return
+def _attention_transports():
+    transports = [value for value in _TRANSPORTS.values() if value.device == torch.npu.current_device()]
     stream = torch.npu.current_stream()
-    transports = [value for value in transports if value.device == torch.npu.current_device()]
-    native_stream = stream.npu_stream
     for transport in transports:
         previous = transport.attention_stream
         if previous is not None and previous != stream:
             transport.rt("aclrtRecordEvent", transport.go, previous.npu_stream)
-            transport.rt("aclrtStreamWaitEvent", native_stream, transport.go)
+            transport.rt("aclrtStreamWaitEvent", stream.npu_stream, transport.go)
         transport.attention_stream = stream
-        transport.rt("aclrtValueWrite", transport.gate, 1, 0, native_stream)
+    return transports
+
+
+@contextmanager
+def attention_communication():
+    """Admit attention once its inputs are ready, then resume weight chunks."""
+    transports = _attention_transports() if _TRANSPORTS else []
+    for transport in transports:
+        transport.rt("aclrtValueWrite", transport.gate, 1, 0, torch.npu.current_stream().npu_stream)
     try:
         yield
     finally:
         for transport in transports:
-            transport.rt("aclrtValueWrite", transport.gate, 0, 0, stream.npu_stream)
+            transport.rt("aclrtValueWrite", transport.gate, 0, 0, torch.npu.current_stream().npu_stream)
 
 
 def _attention_plan(source, size, rank, input_splits, output_splits, uniform_input, uniform_output):
@@ -329,12 +349,10 @@ def _attention_plan(source, size, rank, input_splits, output_splits, uniform_inp
 
 def _direct_attention(channel, output, source, counts, offsets):
     rt, size = channel.rt, channel.size
-    torch_stream = torch.npu.current_stream()
-    stream = torch_stream.npu_stream
-    source.record_stream(torch_stream)
-    output.record_stream(torch_stream)
     key = (tuple(counts), tuple(offsets))
     if key not in channel.plans:
+        # Finish queued host submissions before capturing a new native graph.
+        torch.npu.current_stream().npu_stream
         main = channel.main
         with channel.capture_graph() as model:
             for peer in range(size):
@@ -345,15 +363,7 @@ def _direct_attention(channel, output, source, counts, offsets):
                 rt("aclrtStreamWaitEvent", reader, channel.go)
                 rt("aclrtWaitAndResetNotify", channel.notifies[peer], reader, 0)
                 if counts[peer]:
-                    rt(
-                        "aclrtMemcpyAsync",
-                        destination,
-                        counts[peer],
-                        channel.peers[peer] + offsets[peer],
-                        counts[peer],
-                        3,
-                        reader,
-                    )
+                    rt.copy(destination, channel.peers[peer] + offsets[peer], counts[peer], reader)
                 rt("aclrtRecordNotify", channel.remote_notifies[peer][2 * size + channel.rank], reader)
                 rt("aclrtRecordEvent", channel.done[peer], reader)
                 rt("aclrtStreamWaitEvent", main, channel.done[peer])
@@ -363,13 +373,10 @@ def _direct_attention(channel, output, source, counts, offsets):
             for peer in range(size):
                 rt("aclrtWaitAndResetNotify", channel.notifies[2 * size + peer], main, 0)
         channel.plans[key] = (model.value, None, ())
-    count = source.numel() * source.element_size()
-    if count:
-        rt("aclrtMemcpyAsync", channel.storage, count, source.data_ptr(), count, 3, stream)
-    rt("aclmdlRIExecuteAsync", channel.plans[key][0], stream)
-    count = sum(counts)
-    if count:
-        rt("aclrtMemcpyAsync", output.data_ptr(), count, channel.result.data_ptr(), count, 3, stream)
+    gates = [transport.gate for transport in _attention_transports()]
+    torch.ops.vllm_omni_sdma.attention(
+        source, output, channel.plans[key][0], channel.storage, channel.result.data_ptr(), gates
+    )
 
 
 def all_to_all_single(
@@ -421,13 +428,11 @@ def all_to_all_single(
         destination = output
         if not output.is_contiguous() or torch_npu.get_npu_format(output) not in (0, 2):
             destination = torch.empty(output.shape, dtype=output.dtype, device=output.device)
+        _direct_attention(channel, destination, source, plan[0], plan[1])
+        if destination is not output:
+            output.copy_(destination)
+        return None
     with attention_communication():
-        if channel is not None:
-            _direct_attention(channel, destination, source, plan[0], plan[1])
-        else:
-            return dist.all_to_all_single(
-                output, input, output_split_sizes=output_split_sizes, input_split_sizes=input_split_sizes, group=group
-            )
-    if destination is not output:
-        output.copy_(destination)
-    return None
+        return dist.all_to_all_single(
+            output, input, output_split_sizes=output_split_sizes, input_split_sizes=input_split_sizes, group=group
+        )

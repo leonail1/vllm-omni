@@ -35,6 +35,9 @@ classifiers = [
 
 [project.optional-dependencies]
 
+# Opt-in Ascend SDMA transport compiles its host submission adapter.
+sdma = ["ninja>=1.11"]
+
 dev = [
     "pytest==9.1.1",
     "pytest-asyncio==1.4.0",
@@ -164,6 +167,7 @@ include = ["vllm_omni*"]
 
 [tool.setuptools.package-data]
 "vllm_omni" = ["_version.py", "py.typed"]
+"vllm_omni.diffusion.distributed" = ["sdma_transport.cpp"]
 
 [tool.setuptools_scm]
 # no extra settings needed, presence enables setuptools-scm
