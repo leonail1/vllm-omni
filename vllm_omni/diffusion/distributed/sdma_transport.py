@@ -3,7 +3,8 @@
 """Ascend same-host weight prefetch with device-side chunk admission.
 
 Ready notifications protect producer-to-reader visibility. Reader acknowledgements
-protect the two source slots across chunks and graph replays. All transfers use
+protect two source windows across graph replays. Each window batches four
+producer notifications while admission remains one full-output chunk. All transfers use
 SDMA; the admission wait is a runtime task rather than a resident vector kernel.
 """
 
@@ -95,6 +96,8 @@ class WeightTransport:
             raise ValueError("SDMA weight prefetch requires a 2–4 MiB full-output chunk")
         self.width = slot_bytes or (chunk_bytes + self.size - 1) // self.size
         self.width = (self.width + 255) // 256 * 256
+        self.window_chunks = 4 if slot_bytes is None else 1
+        self.slot_width = self.width * self.window_chunks
         self.device = torch.npu.current_device()
         self.rt = rt = _Runtime()
         self.plans = {}
@@ -118,11 +121,11 @@ class WeightTransport:
         pids = self.exchange((pid.value, os.uname().nodename))
         if len({host for _, host in pids}) != 1:
             raise ValueError("SDMA weight prefetch requires all group members on one host")
-        self.storage = rt.handle("aclrtMalloc", 2 * self.width + 64, 0)
-        self.gate = self.storage + 2 * self.width
+        self.storage = rt.handle("aclrtMalloc", 2 * self.slot_width + 64, 0)
+        self.gate = self.storage + 2 * self.slot_width
         rt("aclrtMemset", self.gate, 64, 0, 64)
         key = ct.create_string_buffer(65)
-        rt("aclrtIpcMemGetExportKey", self.storage, 2 * self.width + 64, key, len(key), 0)
+        rt("aclrtIpcMemGetExportKey", self.storage, 2 * self.slot_width + 64, key, len(key), 0)
         memory_key = key.value
         rt.resources.callback(rt, "aclrtIpcMemClose", memory_key)
         allowed = (ct.c_int32 * (self.size - 1))(*[p for i, (p, _) in enumerate(pids) if i != self.rank])
@@ -219,29 +222,40 @@ class WeightTransport:
     def capture(self, chunks):
         rt, size = self.rt, self.size
         if any(count <= 0 or count > self.width for _, _, count in chunks):
-            raise ValueError("Weight chunk must fit the shared source slot")
+            raise ValueError("Weight chunk must fit its portion of the shared window")
         with self.capture_graph() as model:
             rt("aclrtRecordEvent", self.start, self.main)
             rt("aclrtStreamWaitEvent", self.producer, self.start)
             for reader in self.readers:
                 rt("aclrtStreamWaitEvent", reader, self.start)
-            for index, (source, output, count) in enumerate(chunks):
+            for index, begin in enumerate(range(0, len(chunks), self.window_chunks)):
+                batch = chunks[begin : begin + self.window_chunks]
                 slot = index % 2
+                base = slot * self.slot_width
                 for peer in range(size):
                     rt("aclrtWaitAndResetNotify", self.notifies[2 * size + slot * size + peer], self.producer, 0)
-                rt.copy(self.storage + slot * self.width, source, count, self.producer, kind=1)
+                offset = 0
+                for source, output, count in batch:
+                    rt.copy(self.storage + base + offset, source, count, self.producer, kind=1)
+                    offset += count
                 for peer in range(size):
                     rt("aclrtRecordNotify", self.remote_notifies[peer][slot * size + self.rank], self.producer)
-                rt("aclrtValueWait", self.gate, 0, 1, self.main)
-                for peer in range(size):
-                    rt("aclrtRecordNotify", self.chunk_notifies[peer], self.main)
-                for peer, stream in enumerate(self.readers):
-                    rt("aclrtWaitAndResetNotify", self.chunk_notifies[peer], stream, 0)
-                    rt("aclrtWaitAndResetNotify", self.notifies[slot * size + peer], stream, 0)
-                    rt.copy(output + peer * count, self.peers[peer] + slot * self.width, count, stream)
-                    rt("aclrtRecordNotify", self.remote_notifies[peer][2 * size + slot * size + self.rank], stream)
-                    rt("aclrtRecordNotify", self.chunk_notifies[size + peer], stream)
-                    rt("aclrtWaitAndResetNotify", self.chunk_notifies[size + peer], self.main, 0)
+                for peer, reader in enumerate(self.readers):
+                    rt("aclrtWaitAndResetNotify", self.notifies[slot * size + peer], reader, 0)
+                offset = 0
+                for source, output, count in batch:
+                    # Each full-output chunk retains its admission and completion barrier.
+                    rt("aclrtValueWait", self.gate, 0, 1, self.main)
+                    for peer in range(size):
+                        rt("aclrtRecordNotify", self.chunk_notifies[peer], self.main)
+                    for peer, reader in enumerate(self.readers):
+                        rt("aclrtWaitAndResetNotify", self.chunk_notifies[peer], reader, 0)
+                        rt.copy(output + peer * count, self.peers[peer] + base + offset, count, reader)
+                        rt("aclrtRecordNotify", self.chunk_notifies[size + peer], reader)
+                        rt("aclrtWaitAndResetNotify", self.chunk_notifies[size + peer], self.main, 0)
+                    offset += count
+                for peer, reader in enumerate(self.readers):
+                    rt("aclrtRecordNotify", self.remote_notifies[peer][2 * size + slot * size + self.rank], reader)
             for peer, reader in enumerate(self.readers):
                 rt("aclrtRecordEvent", self.done[peer], reader)
                 rt("aclrtStreamWaitEvent", self.main, self.done[peer])
