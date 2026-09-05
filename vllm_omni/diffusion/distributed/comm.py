@@ -10,6 +10,8 @@ from torch import Tensor
 
 from vllm_omni.platforms import current_omni_platform
 
+from .sdma_transport import all_to_all_single
+
 __all__ = ["all_to_all_4D", "all_to_all_5D", "SeqAllToAll4D", "SeqAllToAll5D", "RingComm"]
 
 
@@ -48,7 +50,7 @@ def all_to_all_4D(
         # (P, seq_len/P, bs, hc/P, hs) scatter seqlen -all2all-> (P, seq_len/P, bs, hc/P, hs) scatter head
 
         if seq_world_size > 1:
-            dist.all_to_all_single(output, input_t, group=group)
+            all_to_all_single(output, input_t, group=group)
             if use_sync:
                 current_omni_platform.synchronize()
         else:
@@ -83,7 +85,7 @@ def all_to_all_4D(
         # https://pytorch.org/docs/stable/distributed.html#torch.distributed.all_to_all_single
         # (P, bs x hc/P, seqlen/P, hs) scatter seqlen -all2all-> (P, bs x seq_len/P, hc/P, hs) scatter head
         if seq_world_size > 1:
-            dist.all_to_all_single(output, input_t, group=group)
+            all_to_all_single(output, input_t, group=group)
             if use_sync:
                 current_omni_platform.synchronize()
         else:
@@ -155,7 +157,7 @@ def all_to_all_5D(
         # https://pytorch.org/docs/stable/distributed.html#torch.distributed.all_to_all_single
         # (P, seq_len/P, 3, bs, hc/P, hs) scatter seqlen -all2all-> (P, seq_len/P, 3, bs, hc/P, hs) scatter head
         if seq_world_size > 1:
-            dist.all_to_all_single(output, input_t, group=group)
+            all_to_all_single(output, input_t, group=group)
             if use_sync:
                 current_omni_platform.synchronize()
         else:
@@ -190,7 +192,7 @@ def all_to_all_5D(
         # https://pytorch.org/docs/stable/distributed.html#torch.distributed.all_to_all_single
         # (P, bs x hc/P, seqlen/P, hs) scatter seqlen -all2all-> (P, bs x seq_len/P, hc/P, hs) scatter head
         if seq_world_size > 1:
-            dist.all_to_all_single(output, input_t, group=group)
+            all_to_all_single(output, input_t, group=group)
             if use_sync:
                 current_omni_platform.synchronize()
         else:

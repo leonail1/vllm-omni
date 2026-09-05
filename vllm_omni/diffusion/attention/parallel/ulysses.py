@@ -13,6 +13,7 @@ from vllm_omni.diffusion.attention.backends.abstract import AttentionMetadata
 from vllm_omni.diffusion.attention.parallel.base import ParallelAttentionContext
 from vllm_omni.diffusion.distributed.comm import SeqAllToAll4D
 from vllm_omni.diffusion.distributed.group_coordinator import SequenceParallelGroupCoordinator
+from vllm_omni.diffusion.distributed.sdma_transport import all_to_all_single
 from vllm_omni.diffusion.forward_context import get_ulysses_mode
 
 
@@ -84,7 +85,7 @@ def _ulysses_all_to_all_any_qkv(
     s_global = int(sum(output_split_sizes))
 
     out = torch.empty((s_global, bsz, head_cnt_local, head_dim), device=x.device, dtype=x.dtype)
-    dist.all_to_all_single(
+    all_to_all_single(
         out,
         x_t,
         output_split_sizes=output_split_sizes,
@@ -125,7 +126,7 @@ def _ulysses_all_to_all_any_o(
     output_split_sizes = [s_local] * world_size
 
     out = torch.empty((world_size * s_local, bsz, head_cnt_local, head_dim), device=x.device, dtype=x.dtype)
-    dist.all_to_all_single(
+    all_to_all_single(
         out,
         x_t,
         output_split_sizes=output_split_sizes,

@@ -35,6 +35,7 @@ from vllm_omni.diffusion.model_loader.host_weight_plan import (
 from vllm_omni.host_weight_runtime import HostWeightLease
 from vllm_omni.platforms import current_omni_platform
 
+from ..distributed.sdma_transport import close_transport, get_transport, initialize_transport
 from .base import OffloadBackend, OffloadConfig
 from .block_discovery import get_blocks_from_dit
 from .chunked_transport import PartManifest, build_part_manifest, pack_local_shard
@@ -681,7 +682,12 @@ class DistributedLayerwiseOffloadHook(ModelHook):
         else:
             shard_bufs = self.gpu_shard_buffers[slot]
             assert shard_bufs is not None, f"gpu_shard_buffers[{slot}] not allocated"
-            if self.manifest is None:
+            transport = get_transport(self.dp_group)
+            if self.manifest is not None and transport is not None:
+                transport.prefetch(self.manifest, self.cpu_shards, gpu_weights, self.copy_stream, self.comm_stream)
+                with current_omni_platform.stream(self.comm_stream):
+                    evt.record(self.comm_stream)
+            elif self.manifest is None:
                 gpu_shards: dict[torch.dtype, torch.Tensor] = {}
                 with current_omni_platform.stream(self.copy_stream):
                     for dtype, cpu_shard in self.cpu_shards.items():
@@ -1466,6 +1472,7 @@ class DistributedLayerwiseOffloadBackend(OffloadBackend):
             )
 
         self.dp_group = coord.device_group
+        initialize_transport(self.dp_group, coord.cpu_group, self.config.chunk_size_bytes)
         self.rank = coord.rank_in_group
         self.dp_size = coord.world_size
 
@@ -2131,6 +2138,7 @@ class DistributedLayerwiseOffloadBackend(OffloadBackend):
         if self._using_rank_local_mmap or has_registration:
             current_omni_platform.synchronize()
 
+        close_transport(self.dp_group)
         for blocks in self._blocks:
             for block in blocks:
                 remove_distributed_block_hook(block)
