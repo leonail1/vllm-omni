@@ -742,23 +742,8 @@ class OmniServeCommand(CLISubcommand):
             "--dlo-chunk-size-mb",
             type=int,
             default=64,
-            help="Full-chunk target size in MiB for the chunked DLO weight transport "
-            "(each chunk is one H2D + AllGather pipeline unit).",
-        )
-        omni_config_group.add_argument(
-            "--dlo-pin-budget-gb",
-            type=float,
-            default=None,
-            help="Pinned host memory budget in GB for distributed layerwise offload (default: unlimited).",
-        )
-        omni_config_group.add_argument(
-            "--dlo-pin-failure-policy",
-            type=str,
-            default="fail",
-            choices=("fail", "whole_block_fallback"),
-            help="Policy when the pinned host budget is exceeded: 'fail' aborts at "
-            "load time; 'whole_block_fallback' degrades the engine to pageable "
-            "whole-block transport.",
+            help="Full-chunk target size in MiB for distributed layerwise offload "
+            "(each chunk is one host-to-device copy + AllGather unit).",
         )
         omni_config_group.add_argument(
             "--host-weight-runtime-mode",
