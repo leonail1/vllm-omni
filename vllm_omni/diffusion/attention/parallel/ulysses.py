@@ -91,6 +91,7 @@ def _ulysses_all_to_all_any_qkv(
         output_split_sizes=output_split_sizes,
         input_split_sizes=input_split_sizes,
         group=pg,
+        uniform_input=True,
     )
     if use_sync:
         from vllm_omni.platforms import current_omni_platform
@@ -132,6 +133,7 @@ def _ulysses_all_to_all_any_o(
         output_split_sizes=output_split_sizes,
         input_split_sizes=input_split_sizes,
         group=pg,
+        uniform_output=True,
     )
     if use_sync:
         from vllm_omni.platforms import current_omni_platform
