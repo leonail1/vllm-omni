@@ -104,6 +104,7 @@ class WeightTransport:
         self.ranks = tuple(dist.get_process_group_ranks(cpu_group))
         self.attention = None
         self.attention_stream = None
+        self.prefetch_stream = None
         self.result = None
         try:
             self._open()
@@ -156,8 +157,8 @@ class WeightTransport:
         self.main, self.producer, *self.readers = [
             rt.handle("aclrtCreateStreamWithConfig", 0, 1) for _ in range(self.size + 2)
         ]
-        self.go, self.start, self.producer_end, self.entry, self.exit, *self.done = [
-            rt.handle("aclrtCreateEventExWithFlag", 1) for _ in range(self.size + 5)
+        self.go, self.start, self.producer_end, *self.done = [
+            rt.handle("aclrtCreateEventExWithFlag", 1) for _ in range(self.size + 3)
         ]
         self.chunk_notifies = [rt.handle("aclrtCreateNotify", 0) for _ in range(2 * self.size)]
         for notify in self.notifies[2 * self.size :]:
@@ -172,7 +173,9 @@ class WeightTransport:
     def prefetch(self, manifest, cpu_shards, outputs, copy_stream, comm_stream):
         buffers = tuple((cpu_shards[item.dtype], outputs[item.dtype]) for item in manifest.dtypes)
         key = (id(manifest), tuple((source.data_ptr(), output.data_ptr()) for source, output in buffers))
-        if key not in self.plans:
+        if buffers and key not in self.plans:
+            # Capture only after previous host submissions have reached the runtime.
+            torch.npu.current_stream().npu_stream
             chunks = []
             for item, (source, output) in zip(manifest.dtypes, buffers, strict=True):
                 if not source.is_pinned():
@@ -196,14 +199,13 @@ class WeightTransport:
                         )
                     )
             self.plans[key] = (self.capture(chunks), manifest, buffers)
-        rt = self.rt
-        # Accessing npu_stream drains PyTorch's host submission queue. Native
-        # events then preserve the existing copy-stream / compute dependency.
-        rt("aclrtRecordEvent", self.entry, copy_stream.npu_stream)
-        rt("aclrtStreamWaitEvent", self.main, self.entry)
-        rt("aclmdlRIExecuteAsync", self.plans[key][0], self.main)
-        rt("aclrtRecordEvent", self.exit, self.main)
-        rt("aclrtStreamWaitEvent", comm_stream.npu_stream, self.exit)
+        comm_stream.wait_stream(copy_stream)
+        if self.prefetch_stream is not None and self.prefetch_stream != comm_stream:
+            comm_stream.wait_stream(self.prefetch_stream)
+        self.prefetch_stream = comm_stream
+        if buffers:
+            with torch.npu.stream(comm_stream):
+                torch.ops.vllm_omni_sdma.replay(None, [output for _, output in buffers], self.plans[key][0], 0, 0, [])
 
     @contextmanager
     def capture_graph(self):
@@ -388,8 +390,8 @@ def _direct_attention(channel, output, source, counts, offsets):
                 rt("aclrtWaitAndResetNotify", channel.notifies[2 * size + peer], main, 0)
         channel.plans[key] = (model.value, None, ())
     gates = [transport.gate for transport in _attention_transports()]
-    torch.ops.vllm_omni_sdma.attention(
-        source, output, channel.plans[key][0], channel.storage, channel.result.data_ptr(), gates
+    torch.ops.vllm_omni_sdma.replay(
+        source, [output], channel.plans[key][0], channel.storage, channel.result.data_ptr(), gates
     )
 
 
