@@ -277,7 +277,7 @@ def _attention_plan(source, size, rank, input_splits, output_splits, uniform_inp
         return counts, [rank * count for count in counts], size * max(counts)
     if uniform_output:
         offset = sum(input_splits[:rank]) * row_bytes
-        return [count * row_bytes for count in output_splits], [offset] * size, sum(input_splits) * row_bytes
+        return [count * row_bytes for count in output_splits], [offset] * size, size * max(input_splits) * row_bytes
     return None
 
 
@@ -287,32 +287,45 @@ def _direct_attention(channel, output, source, counts, offsets):
     stream = torch_stream.npu_stream
     source.record_stream(torch_stream)
     output.record_stream(torch_stream)
-    for peer in range(size):
-        rt("aclrtWaitAndResetNotify", channel.notifies[2 * size + peer], stream, 0)
+    key = (tuple(counts), tuple(offsets))
+    if key not in channel.plans:
+        main = channel.main
+        rt("aclmdlRICaptureBegin", main, 1)
+        for peer in range(size):
+            rt("aclrtRecordNotify", channel.remote_notifies[peer][channel.rank], main)
+        rt("aclrtRecordEvent", channel.go, main)
+        destination = channel.result.data_ptr()
+        for peer, reader in enumerate(channel.readers):
+            rt("aclrtStreamWaitEvent", reader, channel.go)
+            rt("aclrtWaitAndResetNotify", channel.notifies[peer], reader, 0)
+            if counts[peer]:
+                rt(
+                    "aclrtMemcpyAsync",
+                    destination,
+                    counts[peer],
+                    channel.peers[peer] + offsets[peer],
+                    counts[peer],
+                    3,
+                    reader,
+                )
+            rt("aclrtRecordNotify", channel.remote_notifies[peer][2 * size + channel.rank], reader)
+            rt("aclrtRecordEvent", channel.done[peer], reader)
+            rt("aclrtStreamWaitEvent", main, channel.done[peer])
+            destination += counts[peer]
+        # A completed replay releases our source pool on every peer. This
+        # protects the next invocation's staging copy on the caller stream.
+        for peer in range(size):
+            rt("aclrtWaitAndResetNotify", channel.notifies[2 * size + peer], main, 0)
+        model = _V()
+        rt("aclmdlRICaptureEnd", main, ct.byref(model))
+        channel.plans[key] = (model.value, None, ())
     count = source.numel() * source.element_size()
     if count:
         rt("aclrtMemcpyAsync", channel.storage, count, source.data_ptr(), count, 3, stream)
-    for peer in range(size):
-        rt("aclrtRecordNotify", channel.remote_notifies[peer][channel.rank], stream)
-    rt("aclrtRecordEvent", channel.go, stream)
-    destination = output.data_ptr()
-    for peer, reader in enumerate(channel.readers):
-        rt("aclrtStreamWaitEvent", reader, channel.go)
-        rt("aclrtWaitAndResetNotify", channel.notifies[peer], reader, 0)
-        if counts[peer]:
-            rt(
-                "aclrtMemcpyAsync",
-                destination,
-                counts[peer],
-                channel.peers[peer] + offsets[peer],
-                counts[peer],
-                3,
-                reader,
-            )
-        rt("aclrtRecordNotify", channel.remote_notifies[peer][2 * size + channel.rank], reader)
-        rt("aclrtRecordEvent", channel.done[peer], reader)
-        rt("aclrtStreamWaitEvent", stream, channel.done[peer])
-        destination += counts[peer]
+    rt("aclmdlRIExecuteAsync", channel.plans[key][0], stream)
+    count = sum(counts)
+    if count:
+        rt("aclrtMemcpyAsync", output.data_ptr(), count, channel.result.data_ptr(), count, 3, stream)
 
 
 def all_to_all_single(
@@ -340,6 +353,11 @@ def all_to_all_single(
             if plan is not None and plan[2] <= 32 * 1024**2:
                 if owner.attention is None:
                     owner.attention = WeightTransport(owner.cpu_group, 4 * 1024**2, slot_bytes=16 * 1024**2)
+                    owner.attention.result = torch.empty(32 * 1024**2, dtype=torch.uint8, device=input.device)
+                    child = owner.attention
+                    for notify in child.notifies[2 * child.size : 3 * child.size]:
+                        child.rt("aclrtWaitAndResetNotify", notify, child.producer, 0)
+                    child.rt("aclrtSynchronizeStream", child.producer)
                 channel = owner.attention
     if channel is not None:
         source = input.contiguous()
