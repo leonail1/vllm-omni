@@ -11,7 +11,7 @@ from __future__ import annotations
 
 import ctypes as ct
 import os
-from contextlib import contextmanager
+from contextlib import ExitStack, contextmanager
 from math import prod
 
 import torch
@@ -24,6 +24,7 @@ _TRANSPORTS = {}
 class _Runtime:
     def __init__(self):
         self.lib = ct.CDLL("libascendcl.so")
+        self.resources, self.imports = ExitStack(), ExitStack()
         signatures = {
             "aclrtMalloc": [ct.POINTER(_V), _Z, ct.c_int],
             "aclrtFree": [_V],
@@ -67,6 +68,18 @@ class _Runtime:
     def handle(self, name, *args):
         result = _V()
         self(name, ct.byref(result), *args)
+        if name == "aclrtIpcMemImportByKey":
+            self.imports.callback(self, "aclrtIpcMemClose", args[0])
+        else:
+            release = {
+                "aclrtMalloc": "aclrtFree",
+                "aclrtCreateNotify": "aclrtDestroyNotify",
+                "aclrtNotifyImportByKey": "aclrtDestroyNotify",
+                "aclrtCreateStreamWithConfig": "aclrtDestroyStream",
+                "aclrtCreateEventExWithFlag": "aclrtDestroyEvent",
+            }[name]
+            resources = self.imports if name == "aclrtNotifyImportByKey" else self.resources
+            resources.callback(self, release, result.value)
         return result.value
 
 
@@ -83,17 +96,31 @@ class WeightTransport:
         self.plans = {}
         self.ranks = tuple(dist.get_process_group_ranks(cpu_group))
         self.attention = None
-        self.storage = rt.handle("aclrtMalloc", 2 * self.width + 64, 0)
-        self.gate = self.storage + 2 * self.width
-        rt("aclrtMemset", self.gate, 64, 0, 64)
+        self.attention_stream = None
+        self.result = None
+        try:
+            self._open()
+        except BaseException:
+            try:
+                rt.imports.close()
+            finally:
+                rt.resources.close()
+            raise
+
+    def _open(self):
+        rt = self.rt
         pid = ct.c_int32()
         rt("aclrtDeviceGetBareTgid", ct.byref(pid))
         pids = self.exchange((pid.value, os.uname().nodename))
         if len({host for _, host in pids}) != 1:
             raise ValueError("SDMA weight prefetch requires all group members on one host")
+        self.storage = rt.handle("aclrtMalloc", 2 * self.width + 64, 0)
+        self.gate = self.storage + 2 * self.width
+        rt("aclrtMemset", self.gate, 64, 0, 64)
         key = ct.create_string_buffer(65)
         rt("aclrtIpcMemGetExportKey", self.storage, 2 * self.width + 64, key, len(key), 0)
         self.key = key.value
+        rt.resources.callback(rt, "aclrtIpcMemClose", self.key)
         allowed = (ct.c_int32 * (self.size - 1))(*[p for i, (p, _) in enumerate(pids) if i != self.rank])
         rt("aclrtIpcMemSetImportPid", self.key, allowed, len(allowed))
         self.notifies = [rt.handle("aclrtCreateNotify", 0) for _ in range(4 * self.size)]
@@ -107,9 +134,9 @@ class WeightTransport:
                 sender_pid = ct.c_int32(pids[sender][0])
                 rt("aclrtNotifySetImportPid", notify, ct.byref(sender_pid), 1)
             notify_keys.append(value)
-        self.keys = self.exchange((self.key, notify_keys))
+        keys = self.exchange((self.key, notify_keys))
         self.peers, self.remote_notifies = [], []
-        for rank, (memory_key, notification_keys) in enumerate(self.keys):
+        for rank, (memory_key, notification_keys) in enumerate(keys):
             self.peers.append(self.storage if rank == self.rank else rt.handle("aclrtIpcMemImportByKey", memory_key, 1))
             self.remote_notifies.append(
                 self.notifies
@@ -143,8 +170,17 @@ class WeightTransport:
             for item, (source, output) in zip(manifest.dtypes, buffers, strict=True):
                 if not source.is_pinned():
                     raise ValueError("Captured SDMA prefetch requires pinned host weights")
+                if source.dtype != output.dtype or not source.is_contiguous() or not output.is_contiguous():
+                    raise ValueError("SDMA prefetch requires contiguous matching-dtype buffers")
+                if output.device.type != "npu" or output.device.index != self.device:
+                    raise ValueError("Weight output must belong to the transport device")
                 element_size = source.element_size()
                 for chunk in item.chunks:
+                    if not (
+                        0 <= chunk.cpu_offset <= source.numel() - chunk.local_numel
+                        and 0 <= chunk.full_offset <= output.numel() - self.size * chunk.local_numel
+                    ):
+                        raise ValueError("Weight chunk exceeds its source or output buffer")
                     chunks.append(
                         (
                             source.data_ptr() + chunk.cpu_offset * element_size,
@@ -162,47 +198,59 @@ class WeightTransport:
         rt("aclrtRecordEvent", self.exit, self.main)
         rt("aclrtStreamWaitEvent", comm_stream.npu_stream, self.exit)
 
+    @contextmanager
+    def capture_graph(self):
+        model = _V()
+        self.rt("aclmdlRICaptureBegin", self.main, 1)
+        try:
+            yield model
+            self.rt("aclmdlRICaptureEnd", self.main, ct.byref(model))
+        except BaseException:
+            if not model.value:
+                self.rt.lib.aclmdlRICaptureEnd(self.main, ct.byref(model))
+            if model.value:
+                self.rt.lib.aclmdlRIDestroy(model)
+            raise
+
     def capture(self, chunks):
         rt, size = self.rt, self.size
-        rt("aclmdlRICaptureBegin", self.main, 1)
-        rt("aclrtRecordEvent", self.start, self.main)
-        rt("aclrtStreamWaitEvent", self.producer, self.start)
-        for reader in self.readers:
-            rt("aclrtStreamWaitEvent", reader, self.start)
-        for index, (source, output, count) in enumerate(chunks):
-            if count > self.width:
-                raise ValueError("Weight chunk exceeds the shared source slot")
-            slot = index % 2
-            for peer in range(size):
-                rt("aclrtWaitAndResetNotify", self.notifies[2 * size + slot * size + peer], self.producer, 0)
-            rt("aclrtMemcpyAsync", self.storage + slot * self.width, count, source, count, 1, self.producer)
-            for peer in range(size):
-                rt("aclrtRecordNotify", self.remote_notifies[peer][slot * size + self.rank], self.producer)
-            rt("aclrtValueWait", self.gate, 0, 1, self.main)
-            for peer in range(size):
-                rt("aclrtRecordNotify", self.chunk_notifies[peer], self.main)
-            for peer, stream in enumerate(self.readers):
-                rt("aclrtWaitAndResetNotify", self.chunk_notifies[peer], stream, 0)
-                rt("aclrtWaitAndResetNotify", self.notifies[slot * size + peer], stream, 0)
-                rt(
-                    "aclrtMemcpyAsync",
-                    output + peer * count,
-                    count,
-                    self.peers[peer] + slot * self.width,
-                    count,
-                    3,
-                    stream,
-                )
-                rt("aclrtRecordNotify", self.remote_notifies[peer][2 * size + slot * size + self.rank], stream)
-                rt("aclrtRecordNotify", self.chunk_notifies[size + peer], stream)
-                rt("aclrtWaitAndResetNotify", self.chunk_notifies[size + peer], self.main, 0)
-        for peer, reader in enumerate(self.readers):
-            rt("aclrtRecordEvent", self.done[peer], reader)
-            rt("aclrtStreamWaitEvent", self.main, self.done[peer])
-        rt("aclrtRecordEvent", self.producer_end, self.producer)
-        rt("aclrtStreamWaitEvent", self.main, self.producer_end)
-        model = _V()
-        rt("aclmdlRICaptureEnd", self.main, ct.byref(model))
+        if any(count <= 0 or count > self.width for _, _, count in chunks):
+            raise ValueError("Weight chunk must fit the shared source slot")
+        with self.capture_graph() as model:
+            rt("aclrtRecordEvent", self.start, self.main)
+            rt("aclrtStreamWaitEvent", self.producer, self.start)
+            for reader in self.readers:
+                rt("aclrtStreamWaitEvent", reader, self.start)
+            for index, (source, output, count) in enumerate(chunks):
+                slot = index % 2
+                for peer in range(size):
+                    rt("aclrtWaitAndResetNotify", self.notifies[2 * size + slot * size + peer], self.producer, 0)
+                rt("aclrtMemcpyAsync", self.storage + slot * self.width, count, source, count, 1, self.producer)
+                for peer in range(size):
+                    rt("aclrtRecordNotify", self.remote_notifies[peer][slot * size + self.rank], self.producer)
+                rt("aclrtValueWait", self.gate, 0, 1, self.main)
+                for peer in range(size):
+                    rt("aclrtRecordNotify", self.chunk_notifies[peer], self.main)
+                for peer, stream in enumerate(self.readers):
+                    rt("aclrtWaitAndResetNotify", self.chunk_notifies[peer], stream, 0)
+                    rt("aclrtWaitAndResetNotify", self.notifies[slot * size + peer], stream, 0)
+                    rt(
+                        "aclrtMemcpyAsync",
+                        output + peer * count,
+                        count,
+                        self.peers[peer] + slot * self.width,
+                        count,
+                        3,
+                        stream,
+                    )
+                    rt("aclrtRecordNotify", self.remote_notifies[peer][2 * size + slot * size + self.rank], stream)
+                    rt("aclrtRecordNotify", self.chunk_notifies[size + peer], stream)
+                    rt("aclrtWaitAndResetNotify", self.chunk_notifies[size + peer], self.main, 0)
+            for peer, reader in enumerate(self.readers):
+                rt("aclrtRecordEvent", self.done[peer], reader)
+                rt("aclrtStreamWaitEvent", self.main, self.done[peer])
+            rt("aclrtRecordEvent", self.producer_end, self.producer)
+            rt("aclrtStreamWaitEvent", self.main, self.producer_end)
         return model.value
 
     def close(self):
@@ -215,21 +263,10 @@ class WeightTransport:
             rt("aclmdlRIDestroy", model)
         self.plans.clear()
         dist.barrier(group=self.cpu_group)
-        for rank, (key, _) in enumerate(self.keys):
-            if rank != self.rank:
-                rt("aclrtIpcMemClose", key)
-                for notify in self.remote_notifies[rank]:
-                    if notify is not None:
-                        rt("aclrtDestroyNotify", notify)
+        rt.imports.close()
         dist.barrier(group=self.cpu_group)
-        for notify in [*self.notifies, *self.chunk_notifies]:
-            rt("aclrtDestroyNotify", notify)
-        rt("aclrtIpcMemClose", self.key)
-        for event in [self.go, self.start, self.producer_end, self.entry, self.exit, *self.done]:
-            rt("aclrtDestroyEvent", event)
-        for stream in [self.main, self.producer, *self.readers]:
-            rt("aclrtDestroyStream", stream)
-        rt("aclrtFree", self.storage)
+        rt.resources.close()
+        self.result = None
 
 
 def initialize_transport(device_group, cpu_group, chunk_bytes):
@@ -258,8 +295,15 @@ def attention_communication():
         yield
         return
     stream = torch.npu.current_stream()
+    transports = [value for value in transports if value.device == torch.npu.current_device()]
+    native_stream = stream.npu_stream
     for transport in transports:
-        transport.rt("aclrtValueWrite", transport.gate, 1, 0, stream.npu_stream)
+        previous = transport.attention_stream
+        if previous is not None and previous != stream:
+            transport.rt("aclrtRecordEvent", transport.go, previous.npu_stream)
+            transport.rt("aclrtStreamWaitEvent", native_stream, transport.go)
+        transport.attention_stream = stream
+        transport.rt("aclrtValueWrite", transport.gate, 1, 0, native_stream)
     try:
         yield
     finally:
@@ -270,6 +314,8 @@ def attention_communication():
 def _attention_plan(source, size, rank, input_splits, output_splits, uniform_input, uniform_output):
     row_bytes = prod(source.shape[1:]) * source.element_size()
     if input_splits is None and output_splits is None:
+        if not source.ndim or source.shape[0] % size:
+            raise ValueError("Equal all-to-all requires a divisible leading dimension")
         count = source.numel() * source.element_size() // size
         return [count] * size, [rank * count] * size, size * count
     if uniform_input:
@@ -290,34 +336,32 @@ def _direct_attention(channel, output, source, counts, offsets):
     key = (tuple(counts), tuple(offsets))
     if key not in channel.plans:
         main = channel.main
-        rt("aclmdlRICaptureBegin", main, 1)
-        for peer in range(size):
-            rt("aclrtRecordNotify", channel.remote_notifies[peer][channel.rank], main)
-        rt("aclrtRecordEvent", channel.go, main)
-        destination = channel.result.data_ptr()
-        for peer, reader in enumerate(channel.readers):
-            rt("aclrtStreamWaitEvent", reader, channel.go)
-            rt("aclrtWaitAndResetNotify", channel.notifies[peer], reader, 0)
-            if counts[peer]:
-                rt(
-                    "aclrtMemcpyAsync",
-                    destination,
-                    counts[peer],
-                    channel.peers[peer] + offsets[peer],
-                    counts[peer],
-                    3,
-                    reader,
-                )
-            rt("aclrtRecordNotify", channel.remote_notifies[peer][2 * size + channel.rank], reader)
-            rt("aclrtRecordEvent", channel.done[peer], reader)
-            rt("aclrtStreamWaitEvent", main, channel.done[peer])
-            destination += counts[peer]
-        # A completed replay releases our source pool on every peer. This
-        # protects the next invocation's staging copy on the caller stream.
-        for peer in range(size):
-            rt("aclrtWaitAndResetNotify", channel.notifies[2 * size + peer], main, 0)
-        model = _V()
-        rt("aclmdlRICaptureEnd", main, ct.byref(model))
+        with channel.capture_graph() as model:
+            for peer in range(size):
+                rt("aclrtRecordNotify", channel.remote_notifies[peer][channel.rank], main)
+            rt("aclrtRecordEvent", channel.go, main)
+            destination = channel.result.data_ptr()
+            for peer, reader in enumerate(channel.readers):
+                rt("aclrtStreamWaitEvent", reader, channel.go)
+                rt("aclrtWaitAndResetNotify", channel.notifies[peer], reader, 0)
+                if counts[peer]:
+                    rt(
+                        "aclrtMemcpyAsync",
+                        destination,
+                        counts[peer],
+                        channel.peers[peer] + offsets[peer],
+                        counts[peer],
+                        3,
+                        reader,
+                    )
+                rt("aclrtRecordNotify", channel.remote_notifies[peer][2 * size + channel.rank], reader)
+                rt("aclrtRecordEvent", channel.done[peer], reader)
+                rt("aclrtStreamWaitEvent", main, channel.done[peer])
+                destination += counts[peer]
+            # A completed replay releases our source pool on every peer. This
+            # protects the next invocation's staging copy on the caller stream.
+            for peer in range(size):
+                rt("aclrtWaitAndResetNotify", channel.notifies[2 * size + peer], main, 0)
         channel.plans[key] = (model.value, None, ())
     count = source.numel() * source.element_size()
     if count:
@@ -344,13 +388,24 @@ def all_to_all_single(
 
         ranks = tuple(dist.get_process_group_ranks(group or dist.group.WORLD))
         owner = next((value for value in _TRANSPORTS.values() if value.ranks == ranks), None)
-        if owner is not None and input.device.type == "npu" and output.device == input.device:
+        if (
+            owner is not None
+            and input.device.type == "npu"
+            and output.device == input.device
+            and input.device.index == owner.device
+        ):
             plan = _attention_plan(
                 input, owner.size, owner.rank, input_split_sizes, output_split_sizes, uniform_input, uniform_output
             )
             # The supported Ulysses layouts give every rank the same global
             # capacity check, including variable and empty sequence shards.
             if plan is not None and plan[2] <= 32 * 1024**2:
+                if (
+                    input.dtype != output.dtype
+                    or sum(plan[0]) != output.numel() * output.element_size()
+                    or input.numel() * input.element_size() > plan[2]
+                ):
+                    raise ValueError("All-to-all buffers do not match the split layout")
                 if owner.attention is None:
                     owner.attention = WeightTransport(owner.cpu_group, 4 * 1024**2, slot_bytes=16 * 1024**2)
                     owner.attention.result = torch.empty(32 * 1024**2, dtype=torch.uint8, device=input.device)
