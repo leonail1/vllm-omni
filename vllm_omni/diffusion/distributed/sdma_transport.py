@@ -125,6 +125,7 @@ class WeightTransport:
         self.go, self.start, self.producer_end, self.entry, self.exit, *self.done = [
             rt.handle("aclrtCreateEventExWithFlag", 1) for _ in range(self.size + 5)
         ]
+        self.chunk_notifies = [rt.handle("aclrtCreateNotify", 0) for _ in range(2 * self.size)]
         for notify in self.notifies[2 * self.size :]:
             rt("aclrtRecordNotify", notify, self.producer)
         rt("aclrtSynchronizeStream", self.producer)
@@ -166,6 +167,8 @@ class WeightTransport:
         rt("aclmdlRICaptureBegin", self.main, 1)
         rt("aclrtRecordEvent", self.start, self.main)
         rt("aclrtStreamWaitEvent", self.producer, self.start)
+        for reader in self.readers:
+            rt("aclrtStreamWaitEvent", reader, self.start)
         for index, (source, output, count) in enumerate(chunks):
             if count > self.width:
                 raise ValueError("Weight chunk exceeds the shared source slot")
@@ -176,9 +179,10 @@ class WeightTransport:
             for peer in range(size):
                 rt("aclrtRecordNotify", self.remote_notifies[peer][slot * size + self.rank], self.producer)
             rt("aclrtValueWait", self.gate, 0, 1, self.main)
-            rt("aclrtRecordEvent", self.go, self.main)
+            for peer in range(size):
+                rt("aclrtRecordNotify", self.chunk_notifies[peer], self.main)
             for peer, stream in enumerate(self.readers):
-                rt("aclrtStreamWaitEvent", stream, self.go)
+                rt("aclrtWaitAndResetNotify", self.chunk_notifies[peer], stream, 0)
                 rt("aclrtWaitAndResetNotify", self.notifies[slot * size + peer], stream, 0)
                 rt(
                     "aclrtMemcpyAsync",
@@ -190,8 +194,11 @@ class WeightTransport:
                     stream,
                 )
                 rt("aclrtRecordNotify", self.remote_notifies[peer][2 * size + slot * size + self.rank], stream)
-                rt("aclrtRecordEvent", self.done[peer], stream)
-                rt("aclrtStreamWaitEvent", self.main, self.done[peer])
+                rt("aclrtRecordNotify", self.chunk_notifies[size + peer], stream)
+                rt("aclrtWaitAndResetNotify", self.chunk_notifies[size + peer], self.main, 0)
+        for peer, reader in enumerate(self.readers):
+            rt("aclrtRecordEvent", self.done[peer], reader)
+            rt("aclrtStreamWaitEvent", self.main, self.done[peer])
         rt("aclrtRecordEvent", self.producer_end, self.producer)
         rt("aclrtStreamWaitEvent", self.main, self.producer_end)
         model = _V()
@@ -215,7 +222,7 @@ class WeightTransport:
                     if notify is not None:
                         rt("aclrtDestroyNotify", notify)
         dist.barrier(group=self.cpu_group)
-        for notify in self.notifies:
+        for notify in [*self.notifies, *self.chunk_notifies]:
             rt("aclrtDestroyNotify", notify)
         rt("aclrtIpcMemClose", self.key)
         for event in [self.go, self.start, self.producer_end, self.entry, self.exit, *self.done]:
