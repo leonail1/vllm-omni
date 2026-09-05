@@ -2132,6 +2132,7 @@ class DistributedLayerwiseOffloadBackend(OffloadBackend):
             and not has_registration
             and not has_carrier
             and not has_partial_hooks
+            and get_transport(self.dp_group) is None
         ):
             return
 
@@ -2255,6 +2256,8 @@ class DistributedLayerwiseOffloadBackend(OffloadBackend):
         """
         max_shard_sizes: dict[torch.dtype, int] = {}
         for hook in hooks:
+            if hook.manifest is not None and get_transport(hook.dp_group) is not None:
+                continue
             if hook.manifest is not None:
                 for dtype_manifest in hook.manifest.dtypes:
                     # Two in-flight chunks per output slot (H2D overlaps AllGather).

@@ -75,7 +75,7 @@ class WeightTransport:
         self.rank, self.size = dist.get_rank(cpu_group), dist.get_world_size(cpu_group)
         if not 2 * 1024**2 <= chunk_bytes <= 4 * 1024**2:
             raise ValueError("SDMA weight prefetch requires a 2–4 MiB full-output chunk")
-        self.width = (chunk_bytes + self.size - 1) // self.size
+        self.width = (64 * 1024**2 + self.size - 1) // self.size
         self.width = (self.width + 255) // 256 * 256
         self.device = torch.npu.current_device()
         self.rt = rt = _Runtime()
@@ -132,23 +132,23 @@ class WeightTransport:
         return values
 
     def prefetch(self, manifest, cpu_shards, outputs, copy_stream, comm_stream):
-        chunks = []
-        for dtype_manifest in manifest.dtypes:
-            source, output = cpu_shards[dtype_manifest.dtype], outputs[dtype_manifest.dtype]
-            if not source.is_pinned():
-                raise ValueError("Captured SDMA prefetch requires pinned host weights")
-            element_size = source.element_size()
-            for chunk in dtype_manifest.chunks:
-                chunks.append(
-                    (
-                        source.data_ptr() + chunk.cpu_offset * element_size,
-                        output.data_ptr() + chunk.full_offset * element_size,
-                        chunk.local_numel * element_size,
-                    )
-                )
-        key = tuple(chunks)
+        buffers = tuple((cpu_shards[item.dtype], outputs[item.dtype]) for item in manifest.dtypes)
+        key = (id(manifest), tuple((source.data_ptr(), output.data_ptr()) for source, output in buffers))
         if key not in self.plans:
-            self.plans[key] = (self.capture(chunks), cpu_shards, outputs)
+            chunks = []
+            for item, (source, output) in zip(manifest.dtypes, buffers, strict=True):
+                if not source.is_pinned():
+                    raise ValueError("Captured SDMA prefetch requires pinned host weights")
+                element_size = source.element_size()
+                for chunk in item.chunks:
+                    chunks.append(
+                        (
+                            source.data_ptr() + chunk.cpu_offset * element_size,
+                            output.data_ptr() + chunk.full_offset * element_size,
+                            chunk.local_numel * element_size,
+                        )
+                    )
+            self.plans[key] = (self.capture(chunks), manifest, buffers)
         rt = self.rt
         # Accessing npu_stream drains PyTorch's host submission queue. Native
         # events then preserve the existing copy-stream / compute dependency.
@@ -159,39 +159,71 @@ class WeightTransport:
         rt("aclrtStreamWaitEvent", comm_stream.npu_stream, self.exit)
 
     def capture(self, chunks):
-        rt, size = self.rt, self.size
-        rt("aclmdlRICaptureBegin", self.main, 1)
-        rt("aclrtRecordEvent", self.start, self.main)
-        rt("aclrtStreamWaitEvent", self.producer, self.start)
-        for index, (source, output, count) in enumerate(chunks):
+        batches = []
+        end = used = 0
+        for chunk in chunks:
+            source, _, count = chunk
             if count > self.width:
                 raise ValueError("Weight chunk exceeds the shared source slot")
-            slot = index % 2
-            for peer in range(size):
-                rt("aclrtWaitAndResetNotify", self.notifies[2 * size + slot * size + peer], self.producer, 0)
-            rt("aclrtMemcpyAsync", self.storage + slot * self.width, count, source, count, 1, self.producer)
-            for peer in range(size):
-                rt("aclrtRecordNotify", self.remote_notifies[peer][slot * size + self.rank], self.producer)
-            rt("aclrtValueWait", self.gate, 0, 1, self.main)
-            rt("aclrtRecordEvent", self.go, self.main)
-            for peer, stream in enumerate(self.readers):
-                rt("aclrtStreamWaitEvent", stream, self.go)
-                rt("aclrtWaitAndResetNotify", self.notifies[slot * size + peer], stream, 0)
+            if not batches or source != end or used + count > self.width:
+                batches.append([])
+                used = 0
+            batches[-1].append(chunk)
+            end, used = source + count, used + count
+        rt, size = self.rt, self.size
+        model = _V()
+        rt("aclmdlRICaptureBegin", self.main, 1)
+        try:
+            rt("aclrtRecordEvent", self.start, self.main)
+            rt("aclrtStreamWaitEvent", self.producer, self.start)
+            for index, batch in enumerate(batches):
+                slot = index % 2
+                batch_size = sum(chunk[2] for chunk in batch)
+                for peer in range(size):
+                    rt("aclrtWaitAndResetNotify", self.notifies[2 * size + slot * size + peer], self.producer, 0)
                 rt(
                     "aclrtMemcpyAsync",
-                    output + peer * count,
-                    count,
-                    self.peers[peer] + slot * self.width,
-                    count,
-                    3,
-                    stream,
+                    self.storage + slot * self.width,
+                    batch_size,
+                    batch[0][0],
+                    batch_size,
+                    1,
+                    self.producer,
                 )
-                rt("aclrtRecordNotify", self.remote_notifies[peer][2 * size + slot * size + self.rank], stream)
-                rt("aclrtRecordEvent", self.done[peer], stream)
-                rt("aclrtStreamWaitEvent", self.main, self.done[peer])
-        rt("aclrtRecordEvent", self.producer_end, self.producer)
-        rt("aclrtStreamWaitEvent", self.main, self.producer_end)
-        model = _V()
+                for peer in range(size):
+                    rt("aclrtRecordNotify", self.remote_notifies[peer][slot * size + self.rank], self.producer)
+                offset = slot * self.width
+                for chunk_index, (_, output, count) in enumerate(batch):
+                    rt("aclrtValueWait", self.gate, 0, 1, self.main)
+                    rt("aclrtRecordEvent", self.go, self.main)
+                    for peer, stream in enumerate(self.readers):
+                        rt("aclrtStreamWaitEvent", stream, self.go)
+                        if chunk_index == 0:
+                            rt("aclrtWaitAndResetNotify", self.notifies[slot * size + peer], stream, 0)
+                        rt(
+                            "aclrtMemcpyAsync",
+                            output + peer * count,
+                            count,
+                            self.peers[peer] + offset,
+                            count,
+                            3,
+                            stream,
+                        )
+                        if chunk_index == len(batch) - 1:
+                            rt(
+                                "aclrtRecordNotify",
+                                self.remote_notifies[peer][2 * size + slot * size + self.rank],
+                                stream,
+                            )
+                        rt("aclrtRecordEvent", self.done[peer], stream)
+                        rt("aclrtStreamWaitEvent", self.main, self.done[peer])
+                    offset += count
+            rt("aclrtRecordEvent", self.producer_end, self.producer)
+            rt("aclrtStreamWaitEvent", self.main, self.producer_end)
+        except BaseException:
+            rt("aclmdlRICaptureEnd", self.main, ct.byref(model))
+            rt("aclmdlRIDestroy", model)
+            raise
         rt("aclmdlRICaptureEnd", self.main, ct.byref(model))
         return model.value
 
