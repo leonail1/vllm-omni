@@ -76,8 +76,8 @@ from .tensor_utils import (
 )
 
 if TYPE_CHECKING:
+    from .submodule.common.head_bucket_adapter import HeadBucketAdapter
     from .submodule.head_adapter_factory import HeadAdapterFactory
-    from .submodule.models.minimax_h3.h3_bucket_adapter import H3BucketAdapter
 
 logger = init_logger(__name__)
 
@@ -1120,7 +1120,7 @@ class DistributedLayerwiseOffloadBackend(OffloadBackend):
         # Generic Block-level chunk transport is shared by chunk and head-split.
         # Head adapters only change Attention's data path; they do not own
         # weight residency or an Attention/FFN prefetch schedule.
-        self._head_adapters: list[H3BucketAdapter] = []
+        self._head_adapters: list[HeadBucketAdapter] = []
         self._head_adapter_factory: HeadAdapterFactory | None = None
         self._all_hook_groups: list[list[DistributedLayerwiseOffloadHook]] = []
         self._resident_blocks: list[nn.Module] = []
@@ -1890,15 +1890,18 @@ class DistributedLayerwiseOffloadBackend(OffloadBackend):
                 logger.info("All blocks for %s are resident; no streaming hooks required", component.path)
                 continue
 
-            from .submodule.common.model_support import supports_block_group
+            from .submodule.head_adapter_factory import HeadAdapterFactory, supports_block_group
 
             # Install model-specific head adapters before the generic block
             # hook packs weights. The hook below owns the entire Block;
             # there is deliberately no Attention/FFN weight prefetch path.
-            if self.config.submodule_prefetch and supports_block_group(streaming):
-                if self.config.attention_head_buckets and self._head_adapter_factory is None:
+            if (
+                self.config.submodule_prefetch
+                and self.config.attention_head_buckets
+                and supports_block_group(streaming)
+            ):
+                if self._head_adapter_factory is None:
                     from ..distributed.parallel_state import get_sp_group
-                    from .submodule.head_adapter_factory import HeadAdapterFactory
 
                     attention_group = get_sp_group().ulysses_group
                     if attention_group is self.dp_group:
@@ -1907,9 +1910,8 @@ class DistributedLayerwiseOffloadBackend(OffloadBackend):
                         attention_group,
                         self.config.attention_head_buckets,
                     )
-                if self._head_adapter_factory is not None:
-                    for block in streaming:
-                        self._head_adapters.extend(self._head_adapter_factory(block))
+                for block in streaming:
+                    self._head_adapters.extend(self._head_adapter_factory(block))
 
             self._install_hook_group(streaming, DIT_COMPONENT, use_dit_mmap=True)
         if self._resident_blocks:

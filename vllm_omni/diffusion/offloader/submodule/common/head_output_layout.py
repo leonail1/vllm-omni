@@ -1,15 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
-"""Write each rank-major head bucket directly into a complete BSND output."""
-
-
-def assemble_bsnd_bucket(destination, recv, first_head):
-    batch, tokens, heads, dim = destination.shape
-    world, recv_batch, recv_tokens, width, recv_dim = recv.shape
-    if (batch, tokens, dim) != (recv_batch, recv_tokens, recv_dim):
-        raise ValueError("Bucket output shape does not match its destination")
-    target = destination.view(batch, tokens, world, heads // world, dim)
-    target[:, :, :, first_head : first_head + width, :].copy_(recv.permute(1, 2, 0, 3, 4))
+"""Write each rank-major head bucket directly into a complete token/head output."""
 
 
 def assemble_output_bucket(destination, recv, first_head):

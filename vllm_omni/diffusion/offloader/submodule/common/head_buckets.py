@@ -3,10 +3,12 @@
 """Rank-major head bucket metadata, independent of communication backend.
 
 A bucket contains a head slice for EACH destination rank, not just one
-contiguous range of global heads. No tensor/device allocation happens here.
+contiguous range of global heads. Weights are packed on CPU before device transfer.
 """
 
 from dataclasses import dataclass
+
+import torch
 
 
 @dataclass(frozen=True)
@@ -63,3 +65,20 @@ class HeadBucketPlan:
         q_width = self.query_heads * self.head_dim
         kv_width = self.kv_heads * self.head_dim
         return q + tuple(q_width + i for i in kv) + tuple(q_width + kv_width + i for i in kv)
+
+    def pack_qkv(self, tensor, *, restore=False):
+        """Reorder dense CPU QKV weights/bias; restore reverses bucket packing."""
+        rows = torch.tensor([i for b in range(self.buckets) for i in self.qkv_indices(b)])
+        if tensor.device.type != "cpu" or not tensor.is_floating_point():
+            raise ValueError("Pack dense CPU floating-point weights before device transfer")
+        if tensor.ndim not in (1, 2) or tensor.shape[0] != rows.numel():
+            raise ValueError("Expected [all Q rows; all K rows; all V rows]")
+        if restore:
+            return torch.empty_like(tensor).index_copy_(0, rows, tensor)
+        return tensor.index_select(0, rows)
+
+    def qkv_view(self, packed, bucket):
+        """Device forwards only slice contiguous, prepacked bucket rows."""
+        heads = self.head_ranges(bucket, kv=True)[0]
+        stride = self.world_size * (self.query_heads // self.kv_heads + 2) * self.head_dim
+        return packed.narrow(0, heads.start * stride, len(heads) * stride)
