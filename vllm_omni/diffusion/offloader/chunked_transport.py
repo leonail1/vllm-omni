@@ -86,10 +86,6 @@ def round_up(value: int, alignment: int) -> int:
     return ceil_div(value, alignment) * alignment
 
 
-def is_chunk_transport_supported(tensor: torch.Tensor) -> bool:
-    return tensor.ndim > 0
-
-
 def _full_chunk_numel(
     dtype: torch.dtype, weight_shard_size: int, chunk_size_bytes: int, alignment_bytes: int
 ) -> tuple[int, int]:
@@ -205,8 +201,7 @@ def build_part_manifest(
         raise ValueError(f"weight_shard_rank={weight_shard_rank} is outside [0, {weight_shard_size})")
     grouped: OrderedDict[torch.dtype, list[TensorSpec]] = OrderedDict()
     for name, tensor, is_buffer in tensor_specs:
-        if is_chunk_transport_supported(tensor):
-            grouped.setdefault(tensor.dtype, []).append((name, tensor, is_buffer))
+        grouped.setdefault(tensor.dtype, []).append((name, tensor, is_buffer))
     dtype_manifests: list[DTypeManifest] = []
     for dtype, dtype_specs in grouped.items():
         offset = 0

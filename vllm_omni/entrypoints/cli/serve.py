@@ -848,6 +848,13 @@ class OmniServeCommand(CLISubcommand):
             "(each chunk is one host-to-device copy + AllGather unit).",
         )
         omni_config_group.add_argument(
+            "--dlo-attention-head-buckets",
+            type=int,
+            default=0,
+            help="Overlap attention AlltoAll with computation using this many head buckets "
+            "(0 disables; currently supports dense MiniMax H3 on NPU with DLO).",
+        )
+        omni_config_group.add_argument(
             "--host-weight-runtime-mode",
             choices=("disabled", "preferred", "required"),
             default="disabled",

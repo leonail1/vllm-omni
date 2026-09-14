@@ -1892,14 +1892,8 @@ class DistributedLayerwiseOffloadBackend(OffloadBackend):
 
             from .submodule.head_adapter_factory import HeadAdapterFactory, supports_block_group
 
-            # Install model-specific head adapters before the generic block
-            # hook packs weights. The hook below owns the entire Block;
-            # there is deliberately no Attention/FFN weight prefetch path.
-            if (
-                self.config.submodule_prefetch
-                and self.config.attention_head_buckets
-                and supports_block_group(streaming)
-            ):
+            # Reorder QKV before the block hook packs its weights.
+            if self.config.attention_head_buckets and supports_block_group(streaming):
                 if self._head_adapter_factory is None:
                     from ..distributed.parallel_state import get_sp_group
 
