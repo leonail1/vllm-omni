@@ -71,6 +71,8 @@ class OffloadConfig:
     dlo_use_allgather: bool = True
     dlo_resident_layers: int = 0  # leading DiT layers kept on device
     chunk_size_bytes: int = 64 * 1024 * 1024
+    submodule_prefetch: bool = False
+    attention_head_buckets: int = 0
     # Optional per-worker ceiling for registering an HWR mmap. Zero means no
     # additional ceiling; pin_cpu_memory controls whether registration is tried.
     dlo_host_registration_limit_gib: float = 0.0

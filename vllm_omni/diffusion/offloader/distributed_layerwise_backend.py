@@ -22,8 +22,9 @@ import threading
 import time
 import weakref
 from collections.abc import Sequence
+from functools import partial
 from itertools import chain
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import torch
 import torch.distributed
@@ -73,6 +74,10 @@ from .tensor_utils import (
 from .tensor_utils import (
     dtype_size as _dtype_size,
 )
+
+if TYPE_CHECKING:
+    from .submodule.head_adapter_factory import HeadAdapterFactory
+    from .submodule.models.minimax_h3.h3_bucket_adapter import H3BucketAdapter
 
 logger = init_logger(__name__)
 
@@ -476,22 +481,22 @@ class DistributedLayerwiseOffloadHook(ModelHook):
 
         return cpu_shards, dtype_metadata
 
+    def _buffer_numel(self, dtype: torch.dtype, metas: list[dict[str, Any]]) -> int:
+        total = sum(meta["numel"] for meta in metas)
+        if self.dp_size > 1:
+            if self.manifest is not None:
+                for item in self.manifest.dtypes:
+                    if item.dtype == dtype:
+                        return item.padded_numel
+            total = ((total + self.dp_size - 1) // self.dp_size) * self.dp_size
+        return total
+
     def _allocate_device_buffers(self) -> None:
         """Pre-allocate exactly two device buffers (one per slot)."""
         for slot in range(2):
             gpu_weights: dict[torch.dtype, torch.Tensor] = {}
             for dtype, metas in self.metadata.items():
-                total_numel = sum(m["numel"] for m in metas)
-                # AllGather output = dp_size * shard_size (padded)
-                padded = total_numel
-                if self.dp_size > 1:
-                    if self.manifest is not None:
-                        dtype_manifest = next(dm for dm in self.manifest.dtypes if dm.dtype == dtype)
-                        padded = dtype_manifest.padded_numel
-                    else:
-                        shard_sz = (total_numel + self.dp_size - 1) // self.dp_size
-                        padded = shard_sz * self.dp_size
-                gpu_weights[dtype] = torch.empty(padded, dtype=dtype, device=self.device)
+                gpu_weights[dtype] = torch.empty(self._buffer_numel(dtype, metas), dtype=dtype, device=self.device)
             self.gpu_buffers[slot] = gpu_weights
 
     @property
@@ -1112,6 +1117,11 @@ class DistributedLayerwiseOffloadBackend(OffloadBackend):
         self.dp_size = config.dp_size
         self.rank = 0
         self._blocks: list[list[nn.Module]] = []
+        # Generic Block-level chunk transport is shared by chunk and head-split.
+        # Head adapters only change Attention's data path; they do not own
+        # weight residency or an Attention/FFN prefetch schedule.
+        self._head_adapters: list[H3BucketAdapter] = []
+        self._head_adapter_factory: HeadAdapterFactory | None = None
         self._all_hook_groups: list[list[DistributedLayerwiseOffloadHook]] = []
         self._resident_blocks: list[nn.Module] = []
         self._resident_layer_group: PinnedResidentLayerGroup | None = None
@@ -1880,6 +1890,27 @@ class DistributedLayerwiseOffloadBackend(OffloadBackend):
                 logger.info("All blocks for %s are resident; no streaming hooks required", component.path)
                 continue
 
+            from .submodule.common.model_support import supports_block_group
+
+            # Install model-specific head adapters before the generic block
+            # hook packs weights. The hook below owns the entire Block;
+            # there is deliberately no Attention/FFN weight prefetch path.
+            if self.config.submodule_prefetch and supports_block_group(streaming):
+                if self.config.attention_head_buckets and self._head_adapter_factory is None:
+                    from ..distributed.parallel_state import get_sp_group
+                    from .submodule.head_adapter_factory import HeadAdapterFactory
+
+                    attention_group = get_sp_group().ulysses_group
+                    if attention_group is self.dp_group:
+                        raise ValueError("Weight and attention collectives require distinct communicators")
+                    self._head_adapter_factory = HeadAdapterFactory(
+                        attention_group,
+                        self.config.attention_head_buckets,
+                    )
+                if self._head_adapter_factory is not None:
+                    for block in streaming:
+                        self._head_adapters.extend(self._head_adapter_factory(block))
+
             self._install_hook_group(streaming, DIT_COMPONENT, use_dit_mmap=True)
         if self._resident_blocks:
             self._resident_layer_group = PinnedResidentLayerGroup(
@@ -2023,6 +2054,7 @@ class DistributedLayerwiseOffloadBackend(OffloadBackend):
             or self._staged_components
             or self._resident_layer_group is not None
             or self._residency_pipeline_ref is not None
+            or self._head_adapters
         )
         if (
             not self.enabled
@@ -2122,6 +2154,18 @@ class DistributedLayerwiseOffloadBackend(OffloadBackend):
         cleanup_error = lifecycle_error or registration_error
         if cleanup_error is not None:
             raise cleanup_error
+        if self._head_adapters:
+            adapter_error = run_cleanup_steps(
+                (
+                    "restoring a head-split adapter",
+                    partial(adapter.close, restore_weights=not skipped_allgather),
+                )
+                for adapter in self._head_adapters
+            )
+            if adapter_error is not None:
+                raise adapter_error
+            self._head_adapters.clear()
+        self._head_adapter_factory = None
 
         release_error = run_cleanup_steps([("releasing DLO mmap handles", self._release_mmap_handles)])
 
@@ -2159,21 +2203,8 @@ class DistributedLayerwiseOffloadBackend(OffloadBackend):
         """
         max_sizes: dict[torch.dtype, int] = {}
         for hook in hooks:
-            dp = hook.dp_size
             for dtype, metas in hook.metadata.items():
-                total = sum(m["numel"] for m in metas)
-                # AllGather output = dp * ceil(total/dp) (padded for equal shards)
-                if dp > 1:
-                    if hook.manifest is not None:
-                        dtype_manifest = next(
-                            (dm for dm in hook.manifest.dtypes if dm.dtype == dtype),
-                            None,
-                        )
-                        total = (
-                            dtype_manifest.padded_numel if dtype_manifest is not None else ((total + dp - 1) // dp) * dp
-                        )
-                    else:
-                        total = ((total + dp - 1) // dp) * dp
+                total = hook._buffer_numel(dtype, metas)
                 if dtype not in max_sizes or total > max_sizes[dtype]:
                     max_sizes[dtype] = total
 
