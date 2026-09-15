@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """Physical-layout packing across chunk and rank boundaries."""
 
+import weakref
 from unittest.mock import patch
 
 import pytest
@@ -36,8 +37,9 @@ def test_pack_materializes_once_and_preserves_strides(layout, world):
         with patch.object(transport, "_flat_physical", wraps=transport._flat_physical) as materialize:
             shards.append(transport.pack_local_shard(specs, manifest))
         # A transposed tensor spans many chunks; packing must copy it only once.
-        assert materialize.call_count == len(specs)
-        assert {id(call.args[0]) for call in materialize.call_args_list} == {id(t) for _, t, _ in specs}
+        sources = [id(call.args[0]) for call in materialize.call_args_list]
+        assert len(sources) == len(set(sources))
+        assert sources.count(id(specs[0][1])) == 1
         manifests.append(manifest)
 
     original = {name: tensor for name, tensor, _ in specs}
@@ -53,3 +55,33 @@ def test_pack_materializes_once_and_preserves_strides(layout, world):
 
     contiguous = original["contiguous"]
     assert transport._flat_physical(contiguous, contiguous.numel()).data_ptr() == contiguous.data_ptr()
+
+
+@pytest.mark.parametrize("layout", list(transport.WeightLayout))
+def test_pack_skips_unowned_tensors_and_releases_temporary(layout):
+    specs = [(str(i), torch.arange(64, dtype=torch.float32).reshape(8, 8).t(), False) for i in range(4)]
+    manifest = transport.build_part_manifest(
+        specs,
+        block_id=0,
+        part_id="attention",
+        weight_shard_size=4,
+        weight_shard_rank=0,
+        chunk_size_bytes=256,
+        alignment_bytes=1,
+        layout=layout,
+    )
+    previous: weakref.ReferenceType[torch.Tensor] | None = None
+    original = transport._flat_physical
+
+    def materialize(source, size):
+        nonlocal previous
+        assert previous is None or previous() is None, "Previous tensor's temporary is still retained"
+        flat = original(source, size)
+        previous = weakref.ref(flat)
+        return flat
+
+    with patch.object(transport, "_flat_physical", side_effect=materialize) as wrapped:
+        transport.pack_local_shard(specs, manifest)
+    # Chunk layout owns a slice of every tensor; whole-block rank 0 owns only tensor 0.
+    assert wrapped.call_count == (4 if layout is transport.WeightLayout.CHUNK_MAJOR else 1)
+    assert previous is not None and previous() is None
