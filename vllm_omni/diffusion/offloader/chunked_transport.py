@@ -134,7 +134,7 @@ def _copy_flat_range(
         overlap_begin, overlap_end = max(source_begin, tensor_begin), min(source_end, tensor_end)
         if overlap_begin >= overlap_end:
             continue
-        source = _flat_physical(sources[tensor_meta.name], tensor_meta.numel)
+        source = sources[tensor_meta.name]
         count = overlap_end - overlap_begin
         dst = dst_offset + overlap_begin - source_begin
         destination[dst : dst + count].copy_(
@@ -160,6 +160,8 @@ def pack_local_shard(
         if local.device.type != "cpu":
             raise ValueError(f"shard allocator returned non-CPU tensor: {local.device}")
         local.zero_()
+        # Preserve physical strides once per tensor, not once per overlapping chunk.
+        flat_sources = {meta.name: _flat_physical(sources[meta.name], meta.numel) for meta in dm.tensors}
         if manifest.layout is WeightLayout.WHOLE_BLOCK:
             chunk = dm.chunks[0]
             begin = rank * chunk.local_numel
@@ -169,7 +171,7 @@ def pack_local_shard(
                 source_begin=begin,
                 source_end=min(begin + chunk.local_numel, dm.total_numel),
                 tensor_metas=dm.tensors,
-                sources=sources,
+                sources=flat_sources,
             )
         else:
             for chunk in dm.chunks:
@@ -180,8 +182,9 @@ def pack_local_shard(
                     source_begin=begin,
                     source_end=min(begin + chunk.local_numel, chunk.full_offset + chunk.valid_numel),
                     tensor_metas=dm.tensors,
-                    sources=sources,
+                    sources=flat_sources,
                 )
+        del flat_sources  # Release this dtype's temporary storage before packing the next.
         packed[dm.dtype] = local
     return packed
 
