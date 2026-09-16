@@ -203,9 +203,9 @@ class OffloadConfig:
                 "component in diffusion_offload_config, or disable HSDP."
             )
 
-        chunk_size_mb = int(getattr(od_config, "dlo_chunk_size_mb", 64))
-        if chunk_size_mb <= 0:
-            raise ValueError(f"dlo_chunk_size_mb must be > 0, got {chunk_size_mb}")
+        chunk_size_mb = od_config.dlo_chunk_size_mb
+        if type(chunk_size_mb) is not int or chunk_size_mb <= 0:
+            raise ValueError(f"dlo_chunk_size_mb must be a positive integer, got {chunk_size_mb!r}")
         chunk_size_bytes = chunk_size_mb * 1024 * 1024
 
         return cls(

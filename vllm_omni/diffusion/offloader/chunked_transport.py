@@ -13,6 +13,8 @@ from enum import Enum
 
 import torch
 
+from .tensor_utils import flatten_physical_storage, physical_storage_numel
+
 
 def dtype_element_size(dtype: torch.dtype) -> int:
     return torch.empty((), dtype=dtype).element_size()
@@ -86,10 +88,6 @@ def round_up(value: int, alignment: int) -> int:
     return ceil_div(value, alignment) * alignment
 
 
-def is_chunk_transport_supported(tensor: torch.Tensor) -> bool:
-    return tensor.ndim > 0
-
-
 def _full_chunk_numel(
     dtype: torch.dtype, weight_shard_size: int, chunk_size_bytes: int, alignment_bytes: int
 ) -> tuple[int, int]:
@@ -108,20 +106,6 @@ def _full_chunk_numel(
     return full_chunk_numel, alignment_numel
 
 
-def _storage_numel(tensor: torch.Tensor) -> int:
-    if tensor.numel() == 0:
-        return 0
-    return 1 + sum((size - 1) * st for size, st in zip(tensor.shape, tensor.stride()))
-
-
-def _flat_physical(source: torch.Tensor, storage_numel: int) -> torch.Tensor:
-    if source.is_contiguous():
-        return source.reshape(-1)
-    flat = torch.empty(storage_numel, dtype=source.dtype, device=source.device)
-    torch.as_strided(flat, size=source.shape, stride=source.stride()).copy_(source)
-    return flat
-
-
 def _copy_flat_range(
     destination: torch.Tensor,
     *,
@@ -138,7 +122,7 @@ def _copy_flat_range(
         overlap_begin, overlap_end = max(source_begin, tensor_begin), min(source_end, tensor_end)
         if overlap_begin >= overlap_end:
             continue
-        source = _flat_physical(sources[tensor_meta.name], tensor_meta.numel)
+        source = flatten_physical_storage(sources[tensor_meta.name], tensor_meta.numel)
         count = overlap_end - overlap_begin
         dst = dst_offset + overlap_begin - source_begin
         destination[dst : dst + count].copy_(
@@ -205,14 +189,14 @@ def build_part_manifest(
         raise ValueError(f"weight_shard_rank={weight_shard_rank} is outside [0, {weight_shard_size})")
     grouped: OrderedDict[torch.dtype, list[TensorSpec]] = OrderedDict()
     for name, tensor, is_buffer in tensor_specs:
-        if is_chunk_transport_supported(tensor):
-            grouped.setdefault(tensor.dtype, []).append((name, tensor, is_buffer))
+        # Scalars (for example FP8 weight scales) are transported too.
+        grouped.setdefault(tensor.dtype, []).append((name, tensor, is_buffer))
     dtype_manifests: list[DTypeManifest] = []
     for dtype, dtype_specs in grouped.items():
         offset = 0
         tensor_metas: list[TensorMeta] = []
         for name, tensor, is_buffer in dtype_specs:
-            numel = _storage_numel(tensor)
+            numel = physical_storage_numel(tensor)
             tensor_metas.append(
                 TensorMeta(name, offset, numel, tuple(tensor.shape), is_buffer, stride=tuple(tensor.stride()))
             )
