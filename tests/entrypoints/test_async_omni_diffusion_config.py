@@ -512,7 +512,6 @@ def test_invalid_diffusion_offload_config_fails_before_model_loading(monkeypatch
     load_model.assert_not_called()
 
 
-
 def test_serve_cli_forwards_nondefault_dlo_chunk_size():
     parser = TrackingArgumentParser()
     subparsers = parser.add_subparsers(dest="command")

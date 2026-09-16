@@ -1724,4 +1724,3 @@ def test_dlo_chunk_size_rejects_non_positive_values(chunk_size_mb):
         omni_config_module._DiffusionConfigProjection(dlo_chunk_size_mb=chunk_size_mb)
     with pytest.raises(ValueError, match="dlo_chunk_size_mb must be a positive integer"):
         OmniDiffusionConfig(dlo_chunk_size_mb=chunk_size_mb)
-
