@@ -488,7 +488,6 @@ class StageDeployConfig:
     dlo_use_allgather: bool | None = None
     dlo_chunk_size_mb: int | None = None
     dlo_resident_layers: int | None = None
-    dlo_chunk_size_mb: int | None = None
     dlo_attention_head_buckets: int | None = None
     host_weight_runtime_mode: str | None = None
     host_weight_runtime_root: str | None = None

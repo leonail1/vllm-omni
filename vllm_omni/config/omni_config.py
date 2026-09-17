@@ -795,7 +795,6 @@ class _DiffusionConfigProjection:
     dlo_use_allgather: bool = True
     dlo_chunk_size_mb: int = Field(default=64, gt=0, strict=True)
     dlo_resident_layers: int = Field(default=0, ge=0)
-    dlo_chunk_size_mb: int = Field(default=64, gt=0)
     dlo_attention_head_buckets: int = Field(default=0, ge=0)
     host_weight_runtime_mode: Literal["disabled", "preferred", "required"] = "disabled"
     host_weight_runtime_root: str | None = None

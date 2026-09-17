@@ -587,7 +587,6 @@ class OrchestratorArgs:
     dlo_use_allgather: bool = True
     dlo_chunk_size_mb: int = 64
     dlo_resident_layers: int = 0
-    dlo_chunk_size_mb: int = 64
     dlo_attention_head_buckets: int = 0
     host_weight_runtime_mode: str = "disabled"
     host_weight_runtime_root: str | None = None
