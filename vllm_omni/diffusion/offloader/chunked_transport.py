@@ -13,6 +13,8 @@ from enum import Enum
 
 import torch
 
+from .tensor_utils import flatten_physical_storage, physical_storage_numel
+
 
 def dtype_element_size(dtype: torch.dtype) -> int:
     return torch.empty((), dtype=dtype).element_size()
@@ -104,20 +106,6 @@ def _full_chunk_numel(
     return full_chunk_numel, alignment_numel
 
 
-def _storage_numel(tensor: torch.Tensor) -> int:
-    if tensor.numel() == 0:
-        return 0
-    return 1 + sum((size - 1) * st for size, st in zip(tensor.shape, tensor.stride()))
-
-
-def _flat_physical(source: torch.Tensor, storage_numel: int) -> torch.Tensor:
-    if source.is_contiguous():
-        return source.reshape(-1)
-    flat = torch.empty(storage_numel, dtype=source.dtype, device=source.device)
-    torch.as_strided(flat, size=source.shape, stride=source.stride()).copy_(source)
-    return flat
-
-
 def pack_local_shard(
     tensor_specs: Sequence[TensorSpec],
     manifest: PartManifest,
@@ -151,7 +139,7 @@ def pack_local_shard(
                 if overlap_begin >= overlap_end:
                     continue
                 if flat is None:
-                    flat = _flat_physical(sources[meta.name], meta.numel)
+                    flat = flatten_physical_storage(sources[meta.name], meta.numel)
                 dst = chunk.cpu_offset + overlap_begin - begin
                 local[dst : dst + overlap_end - overlap_begin].copy_(
                     flat[overlap_begin - meta.offset : overlap_end - meta.offset]
@@ -176,13 +164,14 @@ def build_part_manifest(
         raise ValueError(f"weight_shard_rank={weight_shard_rank} is outside [0, {weight_shard_size})")
     grouped: OrderedDict[torch.dtype, list[TensorSpec]] = OrderedDict()
     for name, tensor, is_buffer in tensor_specs:
+        # Scalars (for example FP8 weight scales) are transported too.
         grouped.setdefault(tensor.dtype, []).append((name, tensor, is_buffer))
     dtype_manifests: list[DTypeManifest] = []
     for dtype, dtype_specs in grouped.items():
         offset = 0
         tensor_metas: list[TensorMeta] = []
         for name, tensor, is_buffer in dtype_specs:
-            numel = _storage_numel(tensor)
+            numel = physical_storage_numel(tensor)
             tensor_metas.append(
                 TensorMeta(name, offset, numel, tuple(tensor.shape), is_buffer, stride=tuple(tensor.stride()))
             )

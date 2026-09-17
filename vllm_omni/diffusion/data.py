@@ -894,6 +894,7 @@ class OmniDiffusionConfig:
     # This avoids AllGather synchronization, while host memory follows the
     # loader's existing rank-local layout instead of adding a second DP shard.
     dlo_use_allgather: bool = True
+    dlo_chunk_size_mb: int = 64
     # Leading main-DiT blocks kept resident by distributed layerwise offload.
     dlo_resident_layers: int = 0
     dlo_chunk_size_mb: int = 64
@@ -1140,6 +1141,9 @@ class OmniDiffusionConfig:
         )
 
     def __post_init__(self):
+        if type(self.dlo_chunk_size_mb) is not int or self.dlo_chunk_size_mb <= 0:
+            raise ValueError(f"dlo_chunk_size_mb must be a positive integer, got {self.dlo_chunk_size_mb!r}")
+
         from vllm_omni.diffusion.offloader.config import (
             OffloadStrategy,
             materialize_legacy_offload_flags,
