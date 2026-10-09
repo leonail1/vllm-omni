@@ -6,6 +6,8 @@ import pytest
 import torch
 from torch import nn
 
+from tests.diffusion.offloader.helpers import patch_offload_runtime
+from vllm_omni.diffusion.offloader import distributed_layerwise_backend as dist_backend
 from vllm_omni.diffusion.offloader.chunked_transport import build_part_manifest, pack_local_shard
 from vllm_omni.diffusion.offloader.tensor_utils import flatten_physical_storage, physical_storage_numel
 
@@ -102,3 +104,38 @@ def test_chunk_manifest_uses_physical_storage_helpers():
         flatten_physical_storage(sliced),
         sliced.new_tensor([1.0, 0.0, 3.0, 0.0, 5.0, 0.0, 7.0, 0.0, 9.0]),
     )
+
+
+@pytest.mark.parametrize("kind", ["parameter", "buffer"])
+@pytest.mark.parametrize("change", ["dtype", "shape", "stride"])
+def test_chunked_hook_validates_transformed_metadata(monkeypatch, kind, change):
+    patch_offload_runtime(monkeypatch, dist_backend.current_omni_platform)
+    block = nn.Module()
+    values = torch.arange(16, dtype=torch.float32).reshape(4, 4)
+    if kind == "parameter":
+        block.register_parameter("weight", nn.Parameter(values.clone()))
+    else:
+        block.register_buffer("weight", values.clone())
+    transforms = {
+        "dtype": lambda tensor: tensor.to(torch.float64),
+        "shape": lambda tensor: tensor.reshape(2, 8),
+        "stride": lambda tensor: tensor.t(),
+    }
+    hook = dist_backend.DistributedLayerwiseOffloadHook(
+        next_block=block,
+        device=torch.device("cpu"),
+        dp_group=object(),
+        dp_size=2,
+        rank=0,
+        pin_memory=False,
+        tensor_transforms={id(block.weight): transforms[change]},
+    )
+    if change == "stride":
+        hook.initialize_hook(nn.Module())
+        assert hook.metadata[torch.float32][0]["shape"] == values.shape
+        assert hook.metadata[torch.float32][0]["stride"] == values.t().stride()
+    else:
+        with pytest.raises(ValueError, match="chunked weight transform changed tensor metadata for 'weight'"):
+            hook.initialize_hook(nn.Module())
+        # Rejected transforms must fail before the original weights are cleared.
+        torch.testing.assert_close(block.weight, values)

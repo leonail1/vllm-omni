@@ -168,6 +168,11 @@ class DistributedLayerwiseOffloadHook(ModelHook):
         self.manifest: PartManifest | None = None
         self._h2d_done_events = [current_omni_platform.Event(), current_omni_platform.Event()]
         self._ag_done_events = [current_omni_platform.Event(), current_omni_platform.Event()]
+        # Hook-local events protect chunk-input reuse within this hook. Across
+        # hooks, post_forward queues the ready-event wait on the compute stream,
+        # and prefetch_layer carries it into the copy stream via wait_stream.
+        # Group-first pre_forward must also wait for its previous hook's weights
+        # before starting compute or prefetching into the shared buffers.
         self._chunk_reuse_events: list[Any | None] = [None, None]
 
         self.copy_stream = copy_stream or current_omni_platform.Stream()
@@ -382,7 +387,14 @@ class DistributedLayerwiseOffloadHook(ModelHook):
             local = target.to_local() if hasattr(target, "to_local") else target
             transform = self.tensor_transforms.get(id(target))
             if callable(transform):
+                dtype, shape = local.dtype, tuple(local.shape)
                 local = transform(local)
+                if local.dtype != dtype or tuple(local.shape) != shape:
+                    raise ValueError(
+                        "chunked weight transform changed tensor metadata for "
+                        f"{name!r}: expected dtype={dtype}, shape={shape}, "
+                        f"got dtype={local.dtype}, shape={tuple(local.shape)}"
+                    )
             specs.append((name, local, name in bufs))
         alignment_bytes = 256 if self.device.type != "cpu" else 1
         manifest = build_part_manifest(
