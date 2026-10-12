@@ -7,8 +7,9 @@ import torch
 from torch import nn
 
 from tests.diffusion.offloader.helpers import patch_offload_runtime
+from vllm_omni.diffusion.offloader import chunked_transport
 from vllm_omni.diffusion.offloader import distributed_layerwise_backend as dist_backend
-from vllm_omni.diffusion.offloader.chunked_transport import build_part_manifest, pack_local_shard
+from vllm_omni.diffusion.offloader.chunked_transport import WeightLayout, build_part_manifest, pack_local_shard
 from vllm_omni.diffusion.offloader.tensor_utils import flatten_physical_storage, physical_storage_numel
 
 pytestmark = [pytest.mark.diffusion, pytest.mark.cpu, pytest.mark.core_model]
@@ -16,7 +17,8 @@ pytestmark = [pytest.mark.diffusion, pytest.mark.cpu, pytest.mark.core_model]
 
 @pytest.mark.parametrize("world_size", [2, 4])
 @pytest.mark.parametrize("chunk_bytes", [32, 64])
-def test_chunk_roundtrip_preserves_scalars_strides_and_padding(world_size, chunk_bytes):
+@pytest.mark.parametrize("layout", list(WeightLayout))
+def test_chunk_roundtrip_preserves_scalars_strides_and_padding(mocker, world_size, chunk_bytes, layout):
     # Offset slice with holes: logical flattening loses the stride, while
     # uninitialized physical holes would make transmitted bytes nondeterministic.
     backing = torch.arange(100, dtype=torch.float32)
@@ -38,10 +40,17 @@ def test_chunk_roundtrip_preserves_scalars_strides_and_padding(world_size, chunk
             weight_shard_rank=rank,
             chunk_size_bytes=chunk_bytes,
             alignment_bytes=4,
+            layout=layout,
         )
         for rank in range(world_size)
     ]
-    shards = [pack_local_shard(specs, manifest) for manifest in manifests]
+    flatten = mocker.spy(chunked_transport, "flatten_physical_storage")
+    shards = []
+    for manifest in manifests:
+        flatten.reset_mock()
+        shards.append(pack_local_shard(specs, manifest))
+        # A transposed weight spanning multiple chunks must be repacked only once.
+        assert sum(call.args[0] is weight for call in flatten.call_args_list) == 1
     assert len({manifest.digest for manifest in manifests}) == 1
 
     names = {meta.name for dm in manifests[0].dtypes for meta in dm.tensors}

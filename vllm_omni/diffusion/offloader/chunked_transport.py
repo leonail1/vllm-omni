@@ -7,7 +7,7 @@ from __future__ import annotations
 import hashlib
 import json
 from collections import OrderedDict
-from collections.abc import Callable, Iterable, Sequence
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from enum import Enum
 
@@ -106,30 +106,6 @@ def _full_chunk_numel(
     return full_chunk_numel, alignment_numel
 
 
-def _copy_flat_range(
-    destination: torch.Tensor,
-    *,
-    dst_offset: int,
-    source_begin: int,
-    source_end: int,
-    tensor_metas: Iterable[TensorMeta],
-    sources: dict[str, torch.Tensor],
-) -> None:
-    if source_end <= source_begin:
-        return
-    for tensor_meta in tensor_metas:
-        tensor_begin, tensor_end = tensor_meta.offset, tensor_meta.offset + tensor_meta.numel
-        overlap_begin, overlap_end = max(source_begin, tensor_begin), min(source_end, tensor_end)
-        if overlap_begin >= overlap_end:
-            continue
-        source = flatten_physical_storage(sources[tensor_meta.name], tensor_meta.numel)
-        count = overlap_end - overlap_begin
-        dst = dst_offset + overlap_begin - source_begin
-        destination[dst : dst + count].copy_(
-            source[overlap_begin - tensor_begin : overlap_begin - tensor_begin + count]
-        )
-
-
 def pack_local_shard(
     tensor_specs: Sequence[TensorSpec],
     manifest: PartManifest,
@@ -148,28 +124,25 @@ def pack_local_shard(
         if local.device.type != "cpu":
             raise ValueError(f"shard allocator returned non-CPU tensor: {local.device}")
         local.zero_()
-        if manifest.layout is WeightLayout.WHOLE_BLOCK:
-            chunk = dm.chunks[0]
-            begin = rank * chunk.local_numel
-            _copy_flat_range(
-                local,
-                dst_offset=0,
-                source_begin=begin,
-                source_end=min(begin + chunk.local_numel, dm.total_numel),
-                tensor_metas=dm.tensors,
-                sources=sources,
-            )
-        else:
+        for tensor_meta in dm.tensors:
+            tensor_begin = tensor_meta.offset
+            tensor_end = tensor_begin + tensor_meta.numel
+            source = None
             for chunk in dm.chunks:
                 begin = chunk.full_offset + rank * chunk.local_numel
-                _copy_flat_range(
-                    local,
-                    dst_offset=chunk.cpu_offset,
-                    source_begin=begin,
-                    source_end=min(begin + chunk.local_numel, chunk.full_offset + chunk.valid_numel),
-                    tensor_metas=dm.tensors,
-                    sources=sources,
+                end = min(begin + chunk.local_numel, chunk.full_offset + chunk.valid_numel)
+                overlap_begin, overlap_end = max(begin, tensor_begin), min(end, tensor_end)
+                if overlap_begin >= overlap_end:
+                    continue
+                # Materialize only once per tensor, and only when this rank needs it.
+                if source is None:
+                    source = flatten_physical_storage(sources[tensor_meta.name], tensor_meta.numel)
+                count = overlap_end - overlap_begin
+                dst = chunk.cpu_offset + overlap_begin - begin
+                local[dst : dst + count].copy_(
+                    source[overlap_begin - tensor_begin : overlap_begin - tensor_begin + count]
                 )
+            del source
         packed[dm.dtype] = local
     return packed
 
