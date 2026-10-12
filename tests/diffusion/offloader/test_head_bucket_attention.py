@@ -38,7 +38,7 @@ def _sdpa(q, k, v, ends):
 
 
 def _cpu_stream_shims(monkeypatch):
-    # Patch only in spawned workers; the parent and other tests remain untouched.
+    # Scope CPU shims with monkeypatch so other tests remain untouched.
     stream = SimpleNamespace(device="cpu", npu_stream=1, wait_event=lambda event: None)
     api = getattr(torch, "npu", SimpleNamespace())
     monkeypatch.setattr(torch, "npu", api, raising=False)
@@ -189,6 +189,41 @@ def _worker(rank, world, init_method, device_type):
                         )
                     if device_type == "npu":
                         torch.npu.synchronize()
+                    if (buckets, bias, padded, use_rope) == (2, False, True, False):
+                        from vllm_omni.diffusion.offloader.distributed_layerwise_backend import (
+                            DistributedLayerwiseOffloadBackend,
+                        )
+                        from vllm_omni.diffusion.offloader.submodule.head_adapter_factory import HeadAdapterFactory
+
+                        module, adapter, reference = layers[0]
+                        linear = F.linear
+
+                        def fail_output(x, weight, bias=None):
+                            if rank == 0 and weight is module.out_proj.weight:
+                                raise RuntimeError("rank-local output failure")
+                            return linear(x, weight, bias)
+
+                        # Fail only rank 0 after its collectives have completed.
+                        with pytest.MonkeyPatch.context() as failure:
+                            failure.setattr(F, "linear", fail_output)
+                            if rank == 0:
+                                with pytest.raises(RuntimeError, match="rank-local"):
+                                    module(x, **kwargs)
+                            else:
+                                module(x, **kwargs)
+                        assert adapter.workspace._poisoned == (rank == 0)
+                        factory = HeadAdapterFactory(dist.group.WORLD, buckets)
+                        factory.workspaces = shared
+                        backend = object.__new__(DistributedLayerwiseOffloadBackend)
+                        backend.device, backend._head_adapter_factory = device, factory
+                        backend.prepare_for_request()
+                        assert not adapter.workspace._poisoned
+                        torch.testing.assert_close(
+                            module(x, **kwargs),
+                            _reference(reference, x, rope, ends, rank, world),
+                            rtol=rtol,
+                            atol=atol,
+                        )
                     for module, adapter, _ in layers:
                         module.cpu()
                         adapter.close()

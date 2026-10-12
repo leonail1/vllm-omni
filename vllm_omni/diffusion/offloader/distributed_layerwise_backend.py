@@ -1135,6 +1135,15 @@ class DistributedLayerwiseOffloadBackend(OffloadBackend):
         self._mmap_transforms_by_tensor_id: dict[int, Any] = {}
         self._poisoned_reason: str | None = None
 
+    def prepare_for_request(self) -> None:
+        if self._head_adapter_factory is not None:
+            # Every rank resets, including ranks whose previous forward succeeded.
+            # Keep device synchronization at the request boundary, not per block.
+            if self.device.type != "cpu":
+                current_omni_platform.synchronize()
+            for workspace in self._head_adapter_factory.workspaces.values():
+                workspace.reset_after_synchronize()
+
     def load_resident_layers(self) -> None:
         """Load the model-declared leading blocks for the denoise stage."""
         if self._resident_layer_group is not None:

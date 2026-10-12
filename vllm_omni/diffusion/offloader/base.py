@@ -267,3 +267,6 @@ class OffloadBackend(ABC):
 
     def is_enabled(self) -> bool:
         return self.enabled
+
+    def prepare_for_request(self) -> None:
+        """Reset request-owned state before any model work on every rank."""

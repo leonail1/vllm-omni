@@ -33,20 +33,26 @@ class H3BucketAdapter(HeadBucketAdapter):
         sp_seq_lens=None,
         video_layout=None,
         vsa_prefix_segments=(),
+        vdn_window=None,
     ):
         m = self.module
         if getattr(m, "to_gate_compress", None) is not None:
             raise ValueError("H3 head-split supports dense attention, not FastH3 VSA")
+        if getattr(getattr(m, "attention", None), "use_ring", False):
+            raise ValueError("H3 head-split does not support Ring/USP attention")
+        if vdn_window is not None:
+            raise ValueError("H3 head-split does not support VDN attention")
         if num_requests != 1 or packed_total != self.plan.world_size * x.shape[0]:
             raise ValueError("Only equal SP shards of one packed request are supported")
         if not 0 < max_seqlen <= packed_total:
             raise ValueError("Invalid packed valid length")
         if sp_seq_lens is not None and any(length != x.shape[0] for length in sp_seq_lens):
             raise ValueError("Uneven sequence shards need a separate collective plan")
-        # Preserve real/padding document boundaries without reading device scalars.
+        # Validate the original boundaries before scheduling any collectives.
         seq_ends = [packed_total] if max_seqlen == packed_total else [max_seqlen, packed_total]
         if cu_seqlens.ndim != 1 or cu_seqlens.numel() != len(seq_ends) + 1:
             raise ValueError("H3 TND requires the original single-request real/padding boundaries")
+        self.workspace.validate_boundaries(cu_seqlens, seq_ends)
 
         def prepare_qk(q, k):
             if rope_table is None:

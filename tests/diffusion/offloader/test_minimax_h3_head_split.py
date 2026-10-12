@@ -7,6 +7,7 @@ import torch
 from torch import nn
 
 from vllm_omni.diffusion.offloader.submodule.common.head_buckets import HeadBucketPlan
+from vllm_omni.diffusion.offloader.submodule.common.head_workspace_cache import HeadWorkspaceCache
 
 pytestmark = [pytest.mark.core_model, pytest.mark.diffusion, pytest.mark.cpu]
 
@@ -39,7 +40,9 @@ class TinyAttention(nn.Module):
 
 @pytest.fixture
 def adapter_class(monkeypatch, mocker):
-    pytest.importorskip("torch_npu")
+    from tests.diffusion.offloader.test_head_bucket_attention import _cpu_stream_shims
+
+    _cpu_stream_shims(monkeypatch)
     from vllm_omni.diffusion.offloader.submodule.models.minimax_h3.h3_bucket_adapter import H3BucketAdapter
 
     monkeypatch.setattr(torch.distributed, "get_world_size", lambda group: 4)
@@ -87,6 +90,7 @@ def test_new_dense_call_contract_accepts_vsa_metadata(adapter_class):
             packed_total=8,
             num_requests=2,
             vsa_prefix_segments=(1,),
+            vdn_window=None,
         )
     adapter.close()
 
@@ -98,6 +102,96 @@ def test_vsa_gate_is_rejected_before_mutation(adapter_class):
     with pytest.raises(ValueError, match="FastH3 VSA"):
         adapter_class(module, object(), buckets=4)
     torch.testing.assert_close(module.qkv_proj.weight, expected, rtol=0, atol=0)
+
+
+@pytest.mark.parametrize(
+    "bounds,valid,total", [([1, 8], 8, 8), ([0, 7], 8, 8), ([0, 4, 8], 5, 8), ([0, 10, 100], 50, 100)]
+)
+def test_invalid_tnd_boundaries_do_not_launch_collectives(adapter_class, mocker, bounds, valid, total):
+    adapter = adapter_class(TinyAttention(), object(), buckets=4)
+    run = mocker.patch.object(adapter, "run")
+    with pytest.raises(ValueError, match="boundaries"):
+        adapter.forward(
+            torch.zeros(total // 4, 7),
+            rope_table=None,
+            cu_seqlens=torch.tensor(bounds),
+            max_seqlen=valid,
+            packed_total=total,
+        )
+    run.assert_not_called()
+
+
+def test_ring_attention_is_rejected_before_collectives(adapter_class, mocker):
+    module = TinyAttention()
+    module.attention = mocker.Mock(use_ring=True)
+    adapter = adapter_class(module, object(), buckets=4)
+    run = mocker.patch.object(adapter, "run")
+    with pytest.raises(ValueError, match="Ring"):
+        adapter.forward(
+            torch.zeros(2, 7), rope_table=None, cu_seqlens=torch.tensor([0, 8]), max_seqlen=8, packed_total=8
+        )
+    run.assert_not_called()
+
+
+def test_boundary_validation_is_shared_and_invalidated_by_mutation(adapter_class, mocker):
+    shared: dict[HeadBucketPlan, HeadWorkspaceCache] = {}
+    adapters = [adapter_class(TinyAttention(), object(), buckets=4, workspaces=shared) for _ in range(2)]
+    for adapter in adapters:
+        mocker.patch.object(adapter, "run")
+    bounds = torch.tensor([0, 5, 8])
+    read = mocker.spy(bounds, "tolist")
+    kwargs = dict(rope_table=None, cu_seqlens=bounds, max_seqlen=5, packed_total=8, vdn_window=None)
+    for adapter in adapters:
+        adapter.forward(torch.zeros(2, 7), **kwargs)
+    assert read.call_count == 1
+    bounds[1] = 4
+    with pytest.raises(ValueError, match="boundaries"):
+        adapters[0].forward(torch.zeros(2, 7), **kwargs)
+
+
+def test_vdn_attention_is_rejected_before_collectives(adapter_class, mocker):
+    adapter = adapter_class(TinyAttention(), object(), buckets=4)
+    run = mocker.patch.object(adapter, "run")
+    with pytest.raises(ValueError, match="VDN"):
+        adapter.forward(
+            torch.zeros(2, 7),
+            rope_table=None,
+            cu_seqlens=torch.tensor([0, 8]),
+            max_seqlen=8,
+            packed_total=8,
+            vdn_window=object(),
+        )
+    run.assert_not_called()
+
+
+def test_request_boundary_synchronizes_before_replacing_all_workspaces(monkeypatch, mocker):
+    from vllm_omni.diffusion.offloader import distributed_layerwise_backend as backend_module
+
+    caches = [HeadWorkspaceCache(), HeadWorkspaceCache()]
+    stream = mocker.Mock(device="npu:0", npu_stream=1)
+    allocate = mocker.Mock(side_effect=lambda: mocker.Mock())
+    for cache in caches:
+        with cache.lease(1, allocate, stream=stream):
+            pass
+    with pytest.raises(ValueError):
+        with caches[0].lease(1, allocate, stream=stream):
+            raise ValueError("failed forward")
+
+    def synchronize():
+        assert allocate.call_count == 2
+        assert all(cache._entries for cache in caches)
+
+    sync = mocker.Mock(side_effect=synchronize)
+    monkeypatch.setattr(backend_module.current_omni_platform, "synchronize", sync, raising=False)
+    backend = object.__new__(backend_module.DistributedLayerwiseOffloadBackend)
+    backend.device = torch.device("privateuseone")
+    backend._head_adapter_factory = mocker.Mock(workspaces=dict(enumerate(caches)))
+    backend.prepare_for_request()
+    sync.assert_called_once()
+    for cache in caches:
+        with cache.lease(1, allocate, stream=stream):
+            pass
+    assert allocate.call_count == 4
 
 
 def test_workspace_reuse_eviction_and_stream_guard(mocker):
