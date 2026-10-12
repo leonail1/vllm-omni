@@ -46,7 +46,7 @@ from vllm_omni.diffusion.sched.interface import (
 from vllm_omni.diffusion.worker.diffusion_model_runner import DiffusionModelRunner
 from vllm_omni.diffusion.worker.diffusion_worker import DiffusionWorker
 from vllm_omni.diffusion.worker.input_batch import InputBatch
-from vllm_omni.diffusion.worker.utils import RunnerOutput, StepRequestState
+from vllm_omni.diffusion.worker.utils import BatchRunnerOutput, RunnerOutput, StepRequestState
 from vllm_omni.errors import OmniClientError
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams
 from vllm_omni.platforms import current_omni_platform
@@ -616,7 +616,8 @@ def test_make_batch_explicit_mapping_still_selects_and_orders_states():
 
 
 @pytest.mark.cpu
-def test_step_profiler_reports_denoise_step_as_diffuse():
+def test_step_profiler_reports_denoise_step_as_diffuse(monkeypatch):
+    monkeypatch.setattr(current_omni_platform, "synchronize", lambda: None)
     pipeline = _AutoDenoiseProfilerPipeline()
 
     assert pipeline.denoise_step() == "ok"
@@ -628,6 +629,13 @@ def test_step_profiler_reports_denoise_step_as_diffuse():
 @pytest.mark.cpu
 class TestRunner:
     """DiffusionModelRunner.execute_stepwise"""
+
+    @pytest.fixture(autouse=True)
+    def mock_platform_memory(self, monkeypatch):
+        monkeypatch.setattr(model_runner_module.current_omni_platform, "is_available", lambda: True)
+        monkeypatch.setattr(model_runner_module.current_omni_platform, "reset_peak_memory_stats", lambda: None)
+        monkeypatch.setattr(model_runner_module.current_omni_platform, "max_memory_reserved", lambda: 0)
+        monkeypatch.setattr(model_runner_module.current_omni_platform, "max_memory_allocated", lambda: 0)
 
     @pytest.mark.parametrize(
         ("diffusion_kv_mode", "should_cleanup"),
@@ -1315,6 +1323,36 @@ class TestWorker:
         DiffusionWorker.execute_stepwise(worker, next_batch)
         assert "req-1" not in worker._step_lora_state
         assert worker._step_lora_state == {"req-2": (lora_request, 1.0)}
+
+    @pytest.mark.parametrize("error", [None, "decode failed"])
+    def test_terminal_output_retires_lora_state_without_another_wave(self, error):
+        terminal = RunnerOutput("done", finished=True, result=DiffusionOutput(error=error))
+        # A decoded chunk is not necessarily the final output of its request.
+        chunk = RunnerOutput("streaming", finished=False, result=DiffusionOutput(output=torch.ones(1)))
+        expected = BatchRunnerOutput.from_list([terminal, chunk])
+        worker = _make_step_worker(expected_output=expected)
+        scheduled = _make_batch_scheduler_output([_make_engine_request(rid) for rid in ("done", "streaming")])
+
+        output = worker.execute_stepwise(scheduled)
+
+        assert output is expected
+        assert worker._step_lora_state == {"streaming": (None, 1.0)}
+        assert torch.equal(chunk.result.output, torch.ones(1))
+
+    def test_runner_exception_retires_only_scheduled_lora_state(self):
+        worker = _make_step_worker()
+        worker._step_lora_state["unscheduled"] = (None, 0.5)
+
+        def fail(_):
+            raise RuntimeError("denoise failed")
+
+        worker.model_runner.execute_stepwise = fail
+        scheduled = _make_batch_scheduler_output([_make_engine_request(rid) for rid in ("first", "second")])
+
+        with pytest.raises(RuntimeError, match="denoise failed"):
+            worker.execute_stepwise(scheduled)
+
+        assert worker._step_lora_state == {"unscheduled": (None, 0.5)}
 
 
 @pytest.mark.cpu

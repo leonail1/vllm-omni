@@ -8,11 +8,12 @@ import math
 from collections.abc import Iterable
 from dataclasses import dataclass
 from types import SimpleNamespace
-from typing import Any, Self, cast
+from typing import TYPE_CHECKING, Any, cast
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from typing_extensions import Self
 from vllm.distributed import (
     get_tensor_model_parallel_rank,
     get_tensor_model_parallel_world_size,
@@ -35,6 +36,9 @@ from vllm_omni.experimental.ar_diffusion.kv_cache.paged_attention import (
     ar_diffusion_paged_attention,
     paged_write_attn,
 )
+
+if TYPE_CHECKING:
+    from vllm.model_executor.layers.quantization.base_config import QuantizationConfig
 
 
 @dataclass
@@ -170,6 +174,7 @@ class LingBotSelfAttention(nn.Module):
         num_heads: int,
         *,
         eps: float = 1e-6,
+        quant_config: QuantizationConfig | None = None,
         prefix: str = "",
     ) -> None:
         super().__init__()
@@ -188,6 +193,7 @@ class LingBotSelfAttention(nn.Module):
             head_size=self.head_dim,
             total_num_heads=num_heads,
             bias=True,
+            quant_config=quant_config,
             prefix=_projection_prefix(prefix, "qkv"),
         )
         self.num_local_heads = self.qkv.num_heads
@@ -205,6 +211,7 @@ class LingBotSelfAttention(nn.Module):
             bias=True,
             input_is_parallel=True,
             return_bias=False,
+            quant_config=quant_config,
             prefix=_projection_prefix(prefix, "o"),
         )
         self.norm_q = _LingBotRMSNorm(self.tp_inner_dim, eps)
@@ -416,6 +423,7 @@ class LingBotCrossAttention(nn.Module):
         num_heads: int,
         *,
         eps: float = 1e-6,
+        quant_config: QuantizationConfig | None = None,
         prefix: str = "",
     ) -> None:
         super().__init__()
@@ -443,6 +451,7 @@ class LingBotCrossAttention(nn.Module):
             bias=True,
             gather_output=False,
             return_bias=False,
+            quant_config=quant_config,
             prefix=_projection_prefix(prefix, "q"),
         )
         self.k = ColumnParallelLinear(
@@ -451,6 +460,7 @@ class LingBotCrossAttention(nn.Module):
             bias=True,
             gather_output=False,
             return_bias=False,
+            quant_config=quant_config,
             prefix=_projection_prefix(prefix, "k"),
         )
         self.v = ColumnParallelLinear(
@@ -459,6 +469,7 @@ class LingBotCrossAttention(nn.Module):
             bias=True,
             gather_output=False,
             return_bias=False,
+            quant_config=quant_config,
             prefix=_projection_prefix(prefix, "v"),
         )
         self.o = RowParallelLinear(
@@ -467,6 +478,7 @@ class LingBotCrossAttention(nn.Module):
             bias=True,
             input_is_parallel=True,
             return_bias=False,
+            quant_config=quant_config,
             prefix=_projection_prefix(prefix, "o"),
         )
         self.norm_q = _LingBotRMSNorm(self.tp_inner_dim, eps)
@@ -528,6 +540,7 @@ class LingBotAttentionBlock(nn.Module):
         ffn_dim: int | None = None,
         cross_attn_norm: bool = True,
         eps: float = 1e-6,
+        quant_config: QuantizationConfig | None = None,
         prefix: str = "",
     ) -> None:
         super().__init__()
@@ -538,12 +551,14 @@ class LingBotAttentionBlock(nn.Module):
             dim,
             num_heads,
             eps=eps,
+            quant_config=quant_config,
             prefix=_projection_prefix(prefix, "self_attn"),
         )
         self.cross_attn = LingBotCrossAttention(
             dim,
             num_heads,
             eps=eps,
+            quant_config=quant_config,
             prefix=_projection_prefix(prefix, "cross_attn"),
         )
         self.norm2 = LayerNorm(dim, eps=eps, elementwise_affine=False)
@@ -555,6 +570,7 @@ class LingBotAttentionBlock(nn.Module):
                 bias=True,
                 gather_output=False,
                 return_bias=False,
+                quant_config=quant_config,
                 prefix=_projection_prefix(prefix, "ffn.0"),
             ),
             nn.GELU(approximate="tanh"),
@@ -564,6 +580,7 @@ class LingBotAttentionBlock(nn.Module):
                 bias=True,
                 input_is_parallel=True,
                 return_bias=False,
+                quant_config=quant_config,
                 prefix=_projection_prefix(prefix, "ffn.2"),
             ),
         )
@@ -574,6 +591,7 @@ class LingBotAttentionBlock(nn.Module):
             bias=True,
             gather_output=False,
             return_bias=False,
+            quant_config=quant_config,
             prefix=_projection_prefix(prefix, "cam_injector_layer1"),
         )
         self.cam_injector_layer2 = RowParallelLinear(
@@ -582,6 +600,7 @@ class LingBotAttentionBlock(nn.Module):
             bias=True,
             input_is_parallel=True,
             return_bias=False,
+            quant_config=quant_config,
             prefix=_projection_prefix(prefix, "cam_injector_layer2"),
         )
         self.cam_scale_layer = nn.Linear(dim, dim)
@@ -823,7 +842,7 @@ class CausalLingBotWorldTransformer3DModel(nn.Module):
         num_frames_per_block: int = 3,
         sliding_window_num_frames: int = 18,
         local_attn_size: int = -1,
-        quant_config: object | None = None,
+        quant_config: QuantizationConfig | None = None,
         prefix: str = "",
     ) -> None:
         super().__init__()
@@ -853,11 +872,6 @@ class CausalLingBotWorldTransformer3DModel(nn.Module):
         ):
             if field_value is not None:
                 raise ValueError(f"{field_name} must be None because LingBot World v2 has no image embedding path.")
-        if quant_config is not None:
-            raise RuntimeError(
-                "quant_config is not supported by the LingBot World transformer; construct the unquantized model."
-            )
-
         dim = num_attention_heads * attention_head_dim
         self.dim = dim
         self.config = SimpleNamespace(
@@ -898,6 +912,7 @@ class CausalLingBotWorldTransformer3DModel(nn.Module):
             bias=True,
             gather_output=False,
             return_bias=False,
+            quant_config=quant_config,
             prefix=_projection_prefix(prefix, "c2ws_hidden_states_layer1"),
         )
         self.c2ws_hidden_states_layer2 = RowParallelLinear(
@@ -906,6 +921,7 @@ class CausalLingBotWorldTransformer3DModel(nn.Module):
             bias=True,
             input_is_parallel=True,
             return_bias=False,
+            quant_config=quant_config,
             prefix=_projection_prefix(prefix, "c2ws_hidden_states_layer2"),
         )
         self.text_embedding = nn.Sequential(
@@ -930,6 +946,7 @@ class CausalLingBotWorldTransformer3DModel(nn.Module):
                     ffn_dim=ffn_dim,
                     cross_attn_norm=cross_attn_norm,
                     eps=eps,
+                    quant_config=quant_config,
                     prefix=_projection_prefix(prefix, f"blocks.{index}"),
                 )
                 for index in range(num_layers)
@@ -976,7 +993,7 @@ class CausalLingBotWorldTransformer3DModel(nn.Module):
         cls,
         config: dict[str, Any],
         *,
-        quant_config: Any | None = None,
+        quant_config: QuantizationConfig | None = None,
         prefix: str = "",
     ) -> Self:
         checkpoint_contract = {

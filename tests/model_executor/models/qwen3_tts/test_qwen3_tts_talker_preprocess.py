@@ -389,6 +389,38 @@ def test_decode_batch_preprocess_matches_decode_state_updates(mrv2):
     assert updates[1]["hidden_states"]["trailing_text"].numel() == 0
 
 
+def test_decode_batch_zero_fills_missing_last_hidden(monkeypatch):
+    tts_pad = torch.full((1, 4), -1.0, dtype=torch.bfloat16)
+    model = _make_minimal_talker(tts_pad_embed=tts_pad)
+
+    def fake_embed_input_ids(input_ids):
+        return input_ids.to(torch.float32).reshape(-1, 1, 1).expand(-1, 1, 4)
+
+    model.embed_input_ids = fake_embed_input_ids
+    warnings: list[tuple[object, ...]] = []
+    monkeypatch.setattr(
+        "vllm_omni.model_executor.models.qwen3_tts.qwen3_tts_talker.logger.warning_once",
+        lambda *args, **kwargs: warnings.append(args),
+    )
+    trailing = torch.arange(8, dtype=torch.float32).reshape(2, 4)
+
+    _, _, past_hidden, _, _ = model.preprocess_decode_batch(
+        input_ids=torch.tensor([101], dtype=torch.long),
+        req_infos=[
+            {
+                "text": ["hello"],
+                "task_type": ["CustomVoice"],
+                "hidden_states": {"trailing_text": trailing},
+                "meta": {"talker_text_offset": 0},
+            }
+        ],
+    )
+
+    assert torch.equal(past_hidden.cpu(), torch.zeros((1, 4), dtype=torch.bfloat16))
+    assert len(warnings) == 1
+    assert "zero-filling" in str(warnings[0][0])
+
+
 def _stub_text_embedding(device_param: torch.nn.Parameter):
     """Build a lambda that emulates ``nn.Embedding`` for the ``_device()`` helper.
 
@@ -811,3 +843,72 @@ def test_ref_audio_artifact_only_cache_miss_fails_fast():
                 REF_AUDIO_CACHE_KEY: ["missing-ref"],
             },
         )
+
+
+def test_evicted_ref_audio_cache_key_with_payload_recomputes_artifacts():
+    """A serving-side artifact key whose engine entry was evicted is only a cache miss."""
+    builder = _make_minimal_builder()
+    builder._ref_audio_artifact_cache_max_entries = 1
+    device_param = torch.nn.Parameter(torch.empty(0))
+    builder._text_embedding = _stub_text_embedding(device_param)
+    builder._text_projection = lambda embeds: embeds
+    builder._codec_embed = lambda ids: torch.zeros((*ids.shape, 4), device=ids.device)
+
+    class FakeTokenizer:
+        def __call__(self, *_args, **_kwargs):
+            return {"input_ids": torch.arange(8, dtype=torch.long).reshape(1, -1)}
+
+    builder._text_tokenizer = FakeTokenizer()
+    builder._generate_icl_prompt = lambda **kwargs: (
+        torch.ones((1, 2, 4), device=kwargs["ref_code"].device),
+        torch.ones((1, 4), device=kwargs["ref_code"].device),
+    )
+    ref_audio = np.arange(1024, dtype=np.float32)
+    builder.normalize_ref_audio = lambda _raw: (ref_audio, 16000)
+    encoded = []
+    builder._encode_ref_audio_batch_fn = lambda wavs, _sr, *, device: [
+        encoded.append(len(w)) or torch.ones((2, 2), dtype=torch.long) for w in wavs
+    ]
+    builder.extract_speaker_embedding = lambda _wav, _sr: torch.ones(4, dtype=torch.bfloat16)
+
+    stale = {"ref_code": torch.zeros((3, 2), dtype=torch.long), "ref_spk_embedding": torch.zeros(4)}
+    builder.put_ref_audio_artifacts("ref-a", **stale)
+    builder.put_ref_audio_artifacts("ref-b", **stale)
+    assert builder.get_ref_audio_artifacts("ref-a") is None
+
+    _prompt, _trailing, ref_code_len, ref_code = builder.build_prompt_embeds(
+        task_type="Base",
+        info_dict={
+            "text": ["hello"],
+            "ref_audio": ["ref.wav"],
+            "ref_ids": torch.arange(8, dtype=torch.long).reshape(1, -1),
+            "non_streaming_mode": [False],
+            REF_AUDIO_CACHE_KEY: ["ref-a"],
+        },
+    )
+
+    assert encoded == [1024]
+    assert ref_code_len == 2
+    assert torch.equal(ref_code, torch.ones((2, 2), dtype=torch.long))
+    refilled = builder.get_ref_audio_artifacts("ref-a")
+    assert refilled is not None
+    assert torch.equal(refilled["ref_code"], ref_code)
+
+
+def test_serving_ref_audio_wire_form_survives_engine_ipc_and_normalizes():
+    from vllm.v1.serial_utils import MsgpackDecoder, MsgpackEncoder
+
+    from vllm_omni.engine import AdditionalInformationPayload
+    from vllm_omni.engine.serialization import deserialize_additional_information, serialize_additional_information
+    from vllm_omni.entrypoints.openai.tts_adapters.qwen3_tts import _ref_audio_wire_waveform
+
+    wav = np.random.default_rng(0).standard_normal(24000).astype(np.float32)
+    wire = serialize_additional_information({"ref_audio": [[_ref_audio_wire_waveform(wav), 24000]]})
+    decoded = MsgpackDecoder(AdditionalInformationPayload).decode(MsgpackEncoder().encode(wire))
+    info = deserialize_additional_information(decoded)
+
+    out_wav, out_sr = _make_minimal_builder().normalize_ref_audio(info["ref_audio"][0])
+
+    assert out_sr == 24000
+    assert out_wav.dtype == np.float32
+    assert np.array_equal(out_wav, wav)

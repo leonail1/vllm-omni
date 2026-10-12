@@ -15,7 +15,10 @@ import pytest
 from pytest_mock import MockerFixture
 from vllm.v1.engine.utils import EngineZmqAddresses
 
-from vllm_omni.config.omni_config import VllmOmniDiffusionStageConfig
+from vllm_omni.config.omni_config import (
+    VllmOmniDiffusionStageConfig,
+    normalize_and_validate_diffusion_engine_ingress_kwargs,
+)
 from vllm_omni.config.resolver import OmniConfigResolution
 from vllm_omni.engine.stage_engine_startup import StageReplicaResources
 from vllm_omni.engine.stage_runtime import StageEngineLaunch
@@ -78,6 +81,25 @@ def test_serve_parser_accepts_no_async_chunk_and_marks_it_explicit() -> None:
     assert "api_server_count" not in explicit
 
 
+@pytest.mark.parametrize("option", ["vae_fast_path", "vae_encode_fast_path"])
+def test_serve_parser_accepts_vae_fast_path(option: str) -> None:
+    parser = TrackingArgumentParser()
+    subparsers = parser.add_subparsers(dest="subcommand")
+    OmniServeCommand().subparser_init(subparsers)
+
+    args = parser.parse_args(["serve", "fake-model", "--omni"])
+    assert getattr(args, option) == "lossless"
+    assert option not in args.get_explicit_kwargs_dict()
+
+    flag = "--" + option.replace("_", "-")
+    args = parser.parse_args(["serve", "fake-model", "--omni", flag, "channels_last"])
+    assert getattr(args, option) == "channels_last"
+    assert args.get_explicit_kwargs_dict()[option] == "channels_last"
+
+    with pytest.raises(SystemExit):
+        parser.parse_args(["serve", "fake-model", "--omni", flag, "fast"])
+
+
 def _parse_serve_args(argv: list[str]) -> TrackingNamespace:
     """Parse a ``serve`` argv through the real Omni parser, returning the
     TrackingNamespace (with ``explicit_keys``) that ``validate`` receives."""
@@ -85,6 +107,61 @@ def _parse_serve_args(argv: list[str]) -> TrackingNamespace:
     subparsers = parser.add_subparsers(dest="subcommand")
     OmniServeCommand().subparser_init(subparsers)
     return parser.parse_args(argv)
+
+
+@pytest.mark.parametrize(
+    "flags",
+    [
+        [],
+        ["--log-stats"],
+        ["--api-server-count", "2"],
+    ],
+)
+def test_serve_rejects_log_stats_without_stage_metrics(flags: list[str]) -> None:
+    args = _parse_serve_args(["serve", "fake-model", "--omni", "--no-collect-stage-metrics", *flags])
+
+    with pytest.raises(ValueError, match="--no-collect-stage-metrics requires --disable-log-stats"):
+        OmniServeCommand().validate(args)
+
+
+@pytest.mark.parametrize(
+    "flags",
+    [
+        ["--disable-log-stats"],
+        ["--log-stats", "--disable-log-stats"],
+        ["--headless"],
+        ["--headless", "--log-stats"],
+        ["--headless", "--log-stats", "--disable-log-stats"],
+    ],
+)
+def test_serve_accepts_disabled_stage_metrics_when_logging_is_disabled_or_headless(
+    flags: list[str], mocker: MockerFixture
+) -> None:
+    mocker.patch("vllm_omni.diffusion.utils.hf_utils.is_diffusion_model", return_value=False)
+    mocker.patch("vllm_omni.entrypoints.cli.serve.validate_parsed_serve_args")
+    args = _parse_serve_args(["serve", "fake-model", "--omni", "--no-collect-stage-metrics", *flags])
+
+    OmniServeCommand().validate(args)
+
+
+def test_no_guardrails_is_only_forwarded_as_model_config(mocker: MockerFixture) -> None:
+    """The CLI alias must not reach the strict diffusion config validator."""
+    parser = TrackingArgumentParser()
+    subparsers = parser.add_subparsers(dest="subparser")
+    OmniServeCommand().subparser_init(subparsers)
+    args = parser.parse_args(["serve", "fake-model", "--omni", "--no-guardrails"])
+    assert args.get_explicit_kwargs_dict()["no_guardrails"] is True
+
+    # Keep the real CLI parser and config validator, but do not start a server.
+    args.headless = True
+    mocker.patch.dict("os.environ", {"VLLM_DISABLE_LOG_LOGO": "1"})
+    mocker.patch("vllm_omni.entrypoints.cli.serve.run_headless")
+    OmniServeCommand.cmd(args)
+
+    explicit = args.get_explicit_kwargs_dict()
+    normalized = normalize_and_validate_diffusion_engine_ingress_kwargs(explicit, stage_id=0)
+    assert normalized["model_config"]["guardrails"] is False
+    assert "no_guardrails" not in explicit
 
 
 def test_omni_serve_requires_model_when_none_provided() -> None:
