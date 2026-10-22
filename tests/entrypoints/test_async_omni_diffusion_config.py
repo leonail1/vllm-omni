@@ -147,14 +147,15 @@ def test_default_diffusion_factory_rejects_unowned_field(field_name, value):
         StageConfigFactory.create_default_diffusion({field_name: value})
 
 
-def test_legacy_default_stage_build_accepts_engine_adapter_metadata(monkeypatch):
+def test_legacy_default_stage_build_accepts_engine_adapter_metadata(monkeypatch, tmp_path):
     from vllm_omni.config.config_factory import StageConfigFactory
     from vllm_omni.config.yaml_util import create_config
     from vllm_omni.engine import stage_init_utils
 
+    model_path = str(tmp_path)
     stage_dict = StageConfigFactory.create_default_diffusion(
         {
-            "model": "unused",
+            "model": model_path,
             "api_key": "frontend-owned",
         }
     )[0]
@@ -163,9 +164,9 @@ def test_legacy_default_stage_build_accepts_engine_adapter_metadata(monkeypatch)
     metadata = SimpleNamespace(stage_id=0, cfg_kv_collect_func=None, default_sampling_params=None)
     monkeypatch.setattr(stage_init_utils.current_omni_platform, "get_device_count", lambda: 1)
 
-    config = stage_init_utils.build_diffusion_config("unused", stage_cfg, metadata)
+    config = stage_init_utils.build_diffusion_config(model_path, stage_cfg, metadata)
 
-    assert config.model == "unused"
+    assert config.model == model_path
 
 
 def test_default_cache_config_used_when_missing():
@@ -824,13 +825,13 @@ def test_default_stage_config_includes_quantization_config():
 
 
 @pytest.mark.parametrize("typed", [False, True], ids=["legacy", "typed"])
-def test_default_diffusion_factory_preserves_engine_quantization(typed, monkeypatch):
+def test_default_diffusion_factory_preserves_engine_quantization(typed, monkeypatch, tmp_path):
     monkeypatch.setattr(OmniDiffusionConfig, "_resolve_master_port", lambda _self: 29500)
     monkeypatch.setattr(OmniDiffusionConfig, "enrich_config", lambda _self: None)
     kwargs = {"quantization": "fp8"}
 
     if typed:
-        stage = StageConfigFactory.create_typed_default_diffusion("generic-diffusion", kwargs).stage_configs[0]
+        stage = StageConfigFactory.create_typed_default_diffusion(str(tmp_path), kwargs).stage_configs[0]
         config = stage.diffusion_config
         config.enrich_config()
     else:
