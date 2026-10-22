@@ -25,6 +25,7 @@ from vllm_omni.diffusion.models.cosmos3.transformer_cosmos3 import Cosmos3VFMTra
 from vllm_omni.diffusion.models.helios.helios_transformer import HeliosTransformer3DModel
 from vllm_omni.diffusion.models.longcat_image.longcat_image_transformer import LongCatImageTransformer2DModel
 from vllm_omni.diffusion.models.ltx2.ltx2_transformer import LTX2VideoTransformer3DModel
+from vllm_omni.diffusion.models.wan2_2.pipeline_wan2_2 import build_wan_scheduler
 from vllm_omni.platforms import current_omni_platform
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
@@ -257,6 +258,31 @@ def test_wan22_custom_enabler_passes_taylorseer_calibrator(
         assert modifier._context_kwargs["calibrator_config"] is calibrator_config
 
 
+@pytest.mark.parametrize("boundary_ratio", [None, 0.875])
+def test_wan22_step_split_matches_shifted_denoise_schedule(boundary_ratio):
+    """The per-expert Cache-DiT step counts must follow the schedule forward() runs.
+
+    forward() applies the flow shift in set_timesteps and falls back to boundary
+    0.875 when the server pins none; an unshifted probe or a missing fallback
+    sizes the experts' contexts for the wrong number of steps.
+    """
+    pipeline = SimpleNamespace(
+        boundary_ratio=boundary_ratio,
+        scheduler=build_wan_scheduler("unipc", 5.0),
+        transformer=torch.nn.Linear(1, 1),
+        _sample_solver="unipc",
+        _flow_shift=5.0,
+    )
+
+    num_high_noise_steps, num_low_noise_steps = cd_model_specific._split_wan22_inference_steps(pipeline, 40)
+
+    reference = build_wan_scheduler("unipc", 5.0)
+    reference.set_timesteps(40, device="cpu", shift=5.0)
+    expected_high_noise_steps = int((reference.timesteps >= 0.875 * 1000).sum())
+    assert (num_high_noise_steps, num_low_noise_steps) == (expected_high_noise_steps, 40 - expected_high_noise_steps)
+    assert num_low_noise_steps > 0
+
+
 @patch("vllm_omni.diffusion.cache.cachedit.backend.BlockAdapter")
 @patch("vllm_omni.diffusion.cache.cachedit.backend.cache_dit")
 def test_cosmos3_cache_dit_wraps_gen_layers(mock_cache_dit, mock_block_adapter):
@@ -374,7 +400,7 @@ def test_summary_with_no_transformer_is_nonfatal():
     current_omni_platform.is_rocm(),
     reason="vLLM ROCm custom ops lack CPU fallback",
 )
-def test_mammothmoda2_cache_dit_runs_end_to_end_on_tiny_model(request: pytest.FixtureRequest):
+def test_mammothmoda2_cache_dit_runs_end_to_end_on_tiny_model(init_fake_tp_group, request: pytest.FixtureRequest):
     """A tiny MammothModa2 DiT runs through Cache-DiT with paired CFG forwards.
 
     Exercises the Pattern_3 contract end to end: after enabling the custom
@@ -384,8 +410,11 @@ def test_mammothmoda2_cache_dit_runs_end_to_end_on_tiny_model(request: pytest.Fi
     """
     from cache_dit import BlockAdapter
 
+    from tests.diffusion.models.mammoth_moda2.helpers import initialize_block_weights
     from vllm_omni.diffusion.models.mammoth_moda2.mammothmoda2_dit_model import Transformer2DModel
     from vllm_omni.diffusion.models.mammoth_moda2.rope_real import RotaryPosEmbedReal
+
+    torch.manual_seed(0)
 
     # MammothModa2 attention resolves through the shared Omni attention layer,
     # which picks the platform-default backend at construction time. Pin
@@ -404,6 +433,7 @@ def test_mammothmoda2_cache_dit_runs_end_to_end_on_tiny_model(request: pytest.Fi
             axes_lens=(300, 512, 512),
             text_feat_dim=16,
         )
+    initialize_block_weights(model)
     model.eval()
 
     MammothModa2Pipeline = type("MammothModa2DiTPipeline", (), {})
